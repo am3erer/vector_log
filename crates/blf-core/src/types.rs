@@ -489,7 +489,27 @@ pub struct RestorePoints {
     pub restore_points: Vec<RestorePoint>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldValue {
+    U8(u8),
+    U16(u16),
+    U32(u32),
+    U64(u64),
+    I32(i32),
+    F64(f64),
+    Bytes(Vec<u8>),
+    U16Vec(Vec<u16>),
+    U64Vec(Vec<u64>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinObject {
+    pub object_type: ObjectType,
+    pub header: ObjectHeader,
+    pub fields: Vec<(String, FieldValue)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Object {
     CanMessage(CanMessage),
     CanMessage2(CanMessage2),
@@ -500,6 +520,7 @@ pub enum Object {
     CanFdErrorFrame64(CanFdErrorFrame64),
     AppText(AppText),
     RestorePointContainer(RestorePointContainer),
+    Lin(LinObject),
 }
 
 impl Object {
@@ -514,6 +535,7 @@ impl Object {
             Object::CanFdErrorFrame64(_) => ObjectType::CanFdError64,
             Object::AppText(_) => ObjectType::AppText,
             Object::RestorePointContainer(_) => ObjectType::Unknown115,
+            Object::Lin(object) => object.object_type,
         }
     }
 }

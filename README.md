@@ -34,8 +34,11 @@ while True:
     obj = reader.read()
     if obj is None:
         break
-    print(obj["class"], obj["objectType"])
+    print(type(obj).__name__, obj.object_type)
 reader.close()
 ```
 
-The Python binding currently returns dictionaries. Typed Python classes matching the C++ class names are a follow-up after the P0 core is stable.
+The Python binding now returns typed classes named after the C++ objects, such as `CanMessage`, `CanMessage2`, `CanFdMessage64`, and LIN classes. Convenience APIs include:
+
+- `reader.read_batch(max_objects)`
+- `reader.can_messages()`

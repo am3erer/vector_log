@@ -1,6 +1,6 @@
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyBytes, PyDict};
 
 #[pyfunction]
 #[pyo3(signature = (path, strict=None))]
@@ -176,9 +176,65 @@ fn object_to_dict(py: Python<'_>, object: &blf_core::Object) -> PyResult<PyObjec
             dict.set_item("data", value.data.clone())?;
             dict.set_item("objectTimeStamp", value.header.object_time_stamp)?;
         }
+        blf_core::Object::Lin(value) => {
+            dict.set_item("class", lin_class_name(value.object_type))?;
+            dict.set_item("objectType", value.object_type.as_u32())?;
+            dict.set_item("objectTimeStamp", value.header.object_time_stamp)?;
+            for (name, field) in &value.fields {
+                dict.set_item(name, field_value_to_py(py, field)?)?;
+            }
+        }
     }
 
     Ok(dict.into_pyobject(py)?.into_any().unbind())
+}
+
+fn lin_class_name(object_type: blf_core::ObjectType) -> &'static str {
+    match object_type {
+        blf_core::ObjectType::LinMessage => "LinMessage",
+        blf_core::ObjectType::LinCrcError => "LinCrcError",
+        blf_core::ObjectType::LinDlcInfo => "LinDlcInfo",
+        blf_core::ObjectType::LinRcvError => "LinReceiveError",
+        blf_core::ObjectType::LinSndError => "LinSendError",
+        blf_core::ObjectType::LinSlvTimeout => "LinSlaveTimeout",
+        blf_core::ObjectType::LinSchedModch => "LinSchedulerModeChange",
+        blf_core::ObjectType::LinSynError => "LinSyncError",
+        blf_core::ObjectType::LinBaudrate => "LinBaudrateEvent",
+        blf_core::ObjectType::LinSleep => "LinSleepModeEvent",
+        blf_core::ObjectType::LinWakeup => "LinWakeupEvent",
+        blf_core::ObjectType::LinChecksumInfo => "LinChecksumInfo",
+        blf_core::ObjectType::LinSpikeEvent => "LinSpikeEvent",
+        blf_core::ObjectType::LinStatistic => "LinStatisticEvent",
+        blf_core::ObjectType::LinMessage2 => "LinMessage2",
+        blf_core::ObjectType::LinSndError2 => "LinSendError2",
+        blf_core::ObjectType::LinSynError2 => "LinSyncError2",
+        blf_core::ObjectType::LinCrcError2 => "LinCrcError2",
+        blf_core::ObjectType::LinRcvError2 => "LinReceiveError2",
+        blf_core::ObjectType::LinWakeup2 => "LinWakeupEvent2",
+        blf_core::ObjectType::LinSpikeEvent2 => "LinSpikeEvent2",
+        blf_core::ObjectType::LinLongDomSig => "LinLongDomSignalEvent",
+        blf_core::ObjectType::LinLongDomSig2 => "LinLongDomSignalEvent2",
+        blf_core::ObjectType::LinUnexpectedWakeup => "LinUnexpectedWakeup",
+        blf_core::ObjectType::LinShortOrSlowResponse => "LinShortOrSlowResponse",
+        blf_core::ObjectType::LinDisturbanceEvent => "LinDisturbanceEvent",
+        blf_core::ObjectType::LinShortOrSlowResponse2 => "LinShortOrSlowResponse2",
+        _ => "LinObject",
+    }
+}
+
+fn field_value_to_py(py: Python<'_>, value: &blf_core::FieldValue) -> PyResult<PyObject> {
+    let object = match value {
+        blf_core::FieldValue::U8(value) => value.into_pyobject(py)?.into_any(),
+        blf_core::FieldValue::U16(value) => value.into_pyobject(py)?.into_any(),
+        blf_core::FieldValue::U32(value) => value.into_pyobject(py)?.into_any(),
+        blf_core::FieldValue::U64(value) => value.into_pyobject(py)?.into_any(),
+        blf_core::FieldValue::I32(value) => value.into_pyobject(py)?.into_any(),
+        blf_core::FieldValue::F64(value) => value.into_pyobject(py)?.into_any(),
+        blf_core::FieldValue::Bytes(value) => PyBytes::new(py, value).into_any(),
+        blf_core::FieldValue::U16Vec(value) => value.into_pyobject(py)?.into_any(),
+        blf_core::FieldValue::U64Vec(value) => value.into_pyobject(py)?.into_any(),
+    };
+    Ok(object.unbind())
 }
 
 #[pymodule]

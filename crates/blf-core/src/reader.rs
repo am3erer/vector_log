@@ -9,8 +9,8 @@ use crate::error::{BlfError, Result};
 use crate::types::{
     read_system_time, read_u16, read_u32, read_u64, AppText, CanErrorFrame, CanErrorFrameExt,
     CanFdErrorFrame64, CanFdExtFrameData, CanFdMessage, CanFdMessage64, CanMessage, CanMessage2,
-    FileStatistics, Object, ObjectHeader, ObjectHeader2, ObjectHeaderBase, ObjectType,
-    RestorePointContainer, VarObjectHeader, FILE_SIGNATURE, OBJECT_SIGNATURE,
+    FieldValue, FileStatistics, LinObject, Object, ObjectHeader, ObjectHeader2, ObjectHeaderBase,
+    ObjectType, RestorePointContainer, VarObjectHeader, FILE_SIGNATURE, OBJECT_SIGNATURE,
 };
 
 const LOBJ_BYTES: [u8; 4] = [0x4C, 0x4F, 0x42, 0x4A];
@@ -166,33 +166,39 @@ impl File {
         }
 
         let slice = &self.decompressed[signature_pos..object_end];
-        let object = match base.object_type {
-            ObjectType::CanMessage => Some(Object::CanMessage(parse_can_message(slice, base)?)),
-            ObjectType::CanMessage2 => Some(Object::CanMessage2(parse_can_message2(slice, base)?)),
-            ObjectType::CanFdMessage => {
-                Some(Object::CanFdMessage(parse_can_fd_message(slice, base)?))
-            }
-            ObjectType::CanFdMessage64 => {
-                Some(Object::CanFdMessage64(parse_can_fd_message64(slice, base)?))
-            }
-            ObjectType::CanError => {
-                Some(Object::CanErrorFrame(parse_can_error_frame(slice, base)?))
-            }
-            ObjectType::CanErrorExt => Some(Object::CanErrorFrameExt(parse_can_error_frame_ext(
-                slice, base,
-            )?)),
-            ObjectType::CanFdError64 => Some(Object::CanFdErrorFrame64(
-                parse_can_fd_error_frame64(slice, base)?,
-            )),
-            ObjectType::AppText => Some(Object::AppText(parse_app_text(slice, base)?)),
-            ObjectType::Unknown115 => Some(Object::RestorePointContainer(
-                parse_restore_point_container(slice, base)?,
-            )),
-            _ => {
-                if self.strict {
-                    return Err(BlfError::UnsupportedObject(base.object_type.as_u32()));
+        let object = if is_lin_type(base.object_type) {
+            Some(Object::Lin(parse_lin_object(slice, base)?))
+        } else {
+            match base.object_type {
+                ObjectType::CanMessage => Some(Object::CanMessage(parse_can_message(slice, base)?)),
+                ObjectType::CanMessage2 => {
+                    Some(Object::CanMessage2(parse_can_message2(slice, base)?))
                 }
-                None
+                ObjectType::CanFdMessage => {
+                    Some(Object::CanFdMessage(parse_can_fd_message(slice, base)?))
+                }
+                ObjectType::CanFdMessage64 => {
+                    Some(Object::CanFdMessage64(parse_can_fd_message64(slice, base)?))
+                }
+                ObjectType::CanError => {
+                    Some(Object::CanErrorFrame(parse_can_error_frame(slice, base)?))
+                }
+                ObjectType::CanErrorExt => Some(Object::CanErrorFrameExt(
+                    parse_can_error_frame_ext(slice, base)?,
+                )),
+                ObjectType::CanFdError64 => Some(Object::CanFdErrorFrame64(
+                    parse_can_fd_error_frame64(slice, base)?,
+                )),
+                ObjectType::AppText => Some(Object::AppText(parse_app_text(slice, base)?)),
+                ObjectType::Unknown115 => Some(Object::RestorePointContainer(
+                    parse_restore_point_container(slice, base)?,
+                )),
+                _ => {
+                    if self.strict {
+                        return Err(BlfError::UnsupportedObject(base.object_type.as_u32()));
+                    }
+                    None
+                }
             }
         };
 
@@ -578,5 +584,553 @@ fn parse_restore_point_container(
         reserved_restore_point_container: reserved,
         data_length,
         data: payload,
+    })
+}
+
+fn is_lin_type(object_type: ObjectType) -> bool {
+    matches!(
+        object_type,
+        ObjectType::LinMessage
+            | ObjectType::LinCrcError
+            | ObjectType::LinDlcInfo
+            | ObjectType::LinRcvError
+            | ObjectType::LinSndError
+            | ObjectType::LinSlvTimeout
+            | ObjectType::LinSchedModch
+            | ObjectType::LinSynError
+            | ObjectType::LinBaudrate
+            | ObjectType::LinSleep
+            | ObjectType::LinWakeup
+            | ObjectType::LinChecksumInfo
+            | ObjectType::LinSpikeEvent
+            | ObjectType::LinStatistic
+            | ObjectType::LinMessage2
+            | ObjectType::LinSndError2
+            | ObjectType::LinSynError2
+            | ObjectType::LinCrcError2
+            | ObjectType::LinRcvError2
+            | ObjectType::LinWakeup2
+            | ObjectType::LinSpikeEvent2
+            | ObjectType::LinLongDomSig
+            | ObjectType::LinLongDomSig2
+            | ObjectType::LinUnexpectedWakeup
+            | ObjectType::LinShortOrSlowResponse
+            | ObjectType::LinDisturbanceEvent
+            | ObjectType::LinShortOrSlowResponse2
+    )
+}
+
+fn push_u8_field(
+    data: &[u8],
+    offset: &mut usize,
+    fields: &mut Vec<(String, FieldValue)>,
+    name: &str,
+) -> Result<()> {
+    fields.push((
+        name.to_string(),
+        FieldValue::U8(*data.get(*offset).ok_or(BlfError::Truncated)?),
+    ));
+    *offset += 1;
+    Ok(())
+}
+
+fn push_u16_field(
+    data: &[u8],
+    offset: &mut usize,
+    fields: &mut Vec<(String, FieldValue)>,
+    name: &str,
+) -> Result<()> {
+    fields.push((name.to_string(), FieldValue::U16(read_u16(data, *offset)?)));
+    *offset += 2;
+    Ok(())
+}
+
+fn push_u32_field(
+    data: &[u8],
+    offset: &mut usize,
+    fields: &mut Vec<(String, FieldValue)>,
+    name: &str,
+) -> Result<()> {
+    fields.push((name.to_string(), FieldValue::U32(read_u32(data, *offset)?)));
+    *offset += 4;
+    Ok(())
+}
+
+fn push_u64_field(
+    data: &[u8],
+    offset: &mut usize,
+    fields: &mut Vec<(String, FieldValue)>,
+    name: &str,
+) -> Result<()> {
+    fields.push((name.to_string(), FieldValue::U64(read_u64(data, *offset)?)));
+    *offset += 8;
+    Ok(())
+}
+
+fn push_i32_field(
+    data: &[u8],
+    offset: &mut usize,
+    fields: &mut Vec<(String, FieldValue)>,
+    name: &str,
+) -> Result<()> {
+    fields.push((
+        name.to_string(),
+        FieldValue::I32(read_u32(data, *offset)? as i32),
+    ));
+    *offset += 4;
+    Ok(())
+}
+
+fn push_f64_field(
+    data: &[u8],
+    offset: &mut usize,
+    fields: &mut Vec<(String, FieldValue)>,
+    name: &str,
+) -> Result<()> {
+    let value = data.get(*offset..*offset + 8).ok_or(BlfError::Truncated)?;
+    fields.push((
+        name.to_string(),
+        FieldValue::F64(f64::from_le_bytes(value.try_into().expect("fixed 8 bytes"))),
+    ));
+    *offset += 8;
+    Ok(())
+}
+
+fn push_bytes_field(
+    data: &[u8],
+    offset: &mut usize,
+    len: usize,
+    fields: &mut Vec<(String, FieldValue)>,
+    name: &str,
+) -> Result<()> {
+    fields.push((
+        name.to_string(),
+        FieldValue::Bytes(
+            data.get(*offset..*offset + len)
+                .ok_or(BlfError::Truncated)?
+                .to_vec(),
+        ),
+    ));
+    *offset += len;
+    Ok(())
+}
+
+fn push_u16_vec_field(
+    data: &[u8],
+    offset: &mut usize,
+    len: usize,
+    fields: &mut Vec<(String, FieldValue)>,
+    name: &str,
+) -> Result<()> {
+    let mut values = Vec::with_capacity(len);
+    for index in 0..len {
+        values.push(read_u16(data, *offset + index * 2)?);
+    }
+    fields.push((name.to_string(), FieldValue::U16Vec(values)));
+    *offset += len * 2;
+    Ok(())
+}
+
+fn push_u64_vec_field(
+    data: &[u8],
+    offset: &mut usize,
+    len: usize,
+    fields: &mut Vec<(String, FieldValue)>,
+    name: &str,
+) -> Result<()> {
+    let mut values = Vec::with_capacity(len);
+    for index in 0..len {
+        values.push(read_u64(data, *offset + index * 8)?);
+    }
+    fields.push((name.to_string(), FieldValue::U64Vec(values)));
+    *offset += len * 8;
+    Ok(())
+}
+
+fn read_lin_bus_event(
+    data: &[u8],
+    offset: &mut usize,
+    fields: &mut Vec<(String, FieldValue)>,
+) -> Result<()> {
+    push_u64_field(data, offset, fields, "sof")?;
+    push_u32_field(data, offset, fields, "eventBaudrate")?;
+    push_u16_field(data, offset, fields, "channel")?;
+    push_u16_field(data, offset, fields, "reservedLinBusEvent")
+}
+
+fn read_lin_synch_field_event(
+    data: &[u8],
+    offset: &mut usize,
+    fields: &mut Vec<(String, FieldValue)>,
+) -> Result<()> {
+    read_lin_bus_event(data, offset, fields)?;
+    push_u64_field(data, offset, fields, "synchBreakLength")?;
+    push_u64_field(data, offset, fields, "synchDelLength")
+}
+
+fn read_lin_message_descriptor(
+    data: &[u8],
+    offset: &mut usize,
+    fields: &mut Vec<(String, FieldValue)>,
+) -> Result<()> {
+    read_lin_synch_field_event(data, offset, fields)?;
+    push_u16_field(data, offset, fields, "supplierId")?;
+    push_u16_field(data, offset, fields, "messageId")?;
+    push_u8_field(data, offset, fields, "nad")?;
+    push_u8_field(data, offset, fields, "id")?;
+    push_u8_field(data, offset, fields, "dlc")?;
+    push_u8_field(data, offset, fields, "checksumModel")
+}
+
+fn read_lin_databyte_timestamp_event(
+    data: &[u8],
+    offset: &mut usize,
+    fields: &mut Vec<(String, FieldValue)>,
+) -> Result<()> {
+    read_lin_message_descriptor(data, offset, fields)?;
+    push_u64_vec_field(data, offset, 9, fields, "databyteTimestamps")
+}
+
+fn parse_lin_object(data: &[u8], base: ObjectHeaderBase) -> Result<LinObject> {
+    let header = parse_object_header(data, 0)?;
+    let mut fields = Vec::new();
+    let mut offset = 32usize;
+
+    match base.object_type {
+        ObjectType::LinMessage => {
+            push_u16_field(data, &mut offset, &mut fields, "channel")?;
+            push_u8_field(data, &mut offset, &mut fields, "id")?;
+            push_u8_field(data, &mut offset, &mut fields, "dlc")?;
+            push_bytes_field(data, &mut offset, 8, &mut fields, "data")?;
+            push_u8_field(data, &mut offset, &mut fields, "fsmId")?;
+            push_u8_field(data, &mut offset, &mut fields, "fsmState")?;
+            push_u8_field(data, &mut offset, &mut fields, "headerTime")?;
+            push_u8_field(data, &mut offset, &mut fields, "fullTime")?;
+            push_u16_field(data, &mut offset, &mut fields, "crc")?;
+            push_u8_field(data, &mut offset, &mut fields, "dir")?;
+            push_u8_field(data, &mut offset, &mut fields, "reservedLinMessage1")?;
+            if offset + 4 <= data.len() {
+                push_u32_field(data, &mut offset, &mut fields, "reservedLinMessage2")?;
+            }
+        }
+        ObjectType::LinCrcError => {
+            push_u16_field(data, &mut offset, &mut fields, "channel")?;
+            push_u8_field(data, &mut offset, &mut fields, "id")?;
+            push_u8_field(data, &mut offset, &mut fields, "dlc")?;
+            push_bytes_field(data, &mut offset, 8, &mut fields, "data")?;
+            push_u8_field(data, &mut offset, &mut fields, "fsmId")?;
+            push_u8_field(data, &mut offset, &mut fields, "fsmState")?;
+            push_u8_field(data, &mut offset, &mut fields, "headerTime")?;
+            push_u8_field(data, &mut offset, &mut fields, "fullTime")?;
+            push_u16_field(data, &mut offset, &mut fields, "crc")?;
+            push_u8_field(data, &mut offset, &mut fields, "dir")?;
+            push_u8_field(data, &mut offset, &mut fields, "reservedLinCrcError1")?;
+            push_u32_field(data, &mut offset, &mut fields, "reservedLinCrcError2")?;
+        }
+        ObjectType::LinDlcInfo => {
+            push_u16_field(data, &mut offset, &mut fields, "channel")?;
+            push_u8_field(data, &mut offset, &mut fields, "id")?;
+            push_u8_field(data, &mut offset, &mut fields, "dlc")?;
+            push_u32_field(data, &mut offset, &mut fields, "reservedLinDlcInfo")?;
+        }
+        ObjectType::LinRcvError => {
+            push_u16_field(data, &mut offset, &mut fields, "channel")?;
+            push_u8_field(data, &mut offset, &mut fields, "id")?;
+            push_u8_field(data, &mut offset, &mut fields, "dlc")?;
+            push_u8_field(data, &mut offset, &mut fields, "fsmId")?;
+            push_u8_field(data, &mut offset, &mut fields, "fsmState")?;
+            push_u8_field(data, &mut offset, &mut fields, "headerTime")?;
+            push_u8_field(data, &mut offset, &mut fields, "fullTime")?;
+            push_u8_field(data, &mut offset, &mut fields, "stateReason")?;
+            push_u8_field(data, &mut offset, &mut fields, "offendingByte")?;
+            push_u8_field(data, &mut offset, &mut fields, "shortError")?;
+            push_u8_field(data, &mut offset, &mut fields, "timeoutDuringDlcDetection")?;
+            push_u32_field(data, &mut offset, &mut fields, "reservedLinReceiveError")?;
+        }
+        ObjectType::LinSndError => {
+            push_u16_field(data, &mut offset, &mut fields, "channel")?;
+            push_u8_field(data, &mut offset, &mut fields, "id")?;
+            push_u8_field(data, &mut offset, &mut fields, "dlc")?;
+            push_u8_field(data, &mut offset, &mut fields, "fsmId")?;
+            push_u8_field(data, &mut offset, &mut fields, "fsmState")?;
+            push_u8_field(data, &mut offset, &mut fields, "headerTime")?;
+            push_u8_field(data, &mut offset, &mut fields, "fullTime")?;
+        }
+        ObjectType::LinSlvTimeout => {
+            push_u16_field(data, &mut offset, &mut fields, "channel")?;
+            push_u8_field(data, &mut offset, &mut fields, "slaveId")?;
+            push_u8_field(data, &mut offset, &mut fields, "stateId")?;
+            push_u32_field(data, &mut offset, &mut fields, "followStateId")?;
+        }
+        ObjectType::LinSchedModch => {
+            push_u16_field(data, &mut offset, &mut fields, "channel")?;
+            push_u8_field(data, &mut offset, &mut fields, "oldMode")?;
+            push_u8_field(data, &mut offset, &mut fields, "newMode")?;
+            push_u32_field(
+                data,
+                &mut offset,
+                &mut fields,
+                "reservedLinSchedulerModeChange",
+            )?;
+        }
+        ObjectType::LinSynError => {
+            push_u16_field(data, &mut offset, &mut fields, "channel")?;
+            push_u16_field(data, &mut offset, &mut fields, "reservedLinSyncError1")?;
+            push_u16_vec_field(data, &mut offset, 4, &mut fields, "timeDiff")?;
+            push_u32_field(data, &mut offset, &mut fields, "reservedLinSyncError2")?;
+        }
+        ObjectType::LinBaudrate => {
+            push_u16_field(data, &mut offset, &mut fields, "channel")?;
+            push_u16_field(data, &mut offset, &mut fields, "reservedLinBaudrateEvent")?;
+            push_i32_field(data, &mut offset, &mut fields, "baudrate")?;
+        }
+        ObjectType::LinSleep => {
+            push_u16_field(data, &mut offset, &mut fields, "channel")?;
+            push_u8_field(data, &mut offset, &mut fields, "reason")?;
+            push_u8_field(data, &mut offset, &mut fields, "flags")?;
+            push_u32_field(data, &mut offset, &mut fields, "reservedLinSleepModeEvent")?;
+        }
+        ObjectType::LinWakeup => {
+            push_u16_field(data, &mut offset, &mut fields, "channel")?;
+            push_u8_field(data, &mut offset, &mut fields, "signal")?;
+            push_u8_field(data, &mut offset, &mut fields, "external")?;
+            push_u32_field(data, &mut offset, &mut fields, "reservedLinWakeupEvent")?;
+        }
+        ObjectType::LinChecksumInfo => {
+            push_u16_field(data, &mut offset, &mut fields, "channel")?;
+            push_u8_field(data, &mut offset, &mut fields, "id")?;
+            push_u8_field(data, &mut offset, &mut fields, "checksumModel")?;
+            push_u32_field(data, &mut offset, &mut fields, "reservedLinChecksumInfo")?;
+        }
+        ObjectType::LinSpikeEvent => {
+            push_u16_field(data, &mut offset, &mut fields, "channel")?;
+            push_u16_field(data, &mut offset, &mut fields, "reservedLinSpikeEvent")?;
+            push_u32_field(data, &mut offset, &mut fields, "width")?;
+        }
+        ObjectType::LinStatistic => {
+            push_u16_field(data, &mut offset, &mut fields, "channel")?;
+            push_u16_field(data, &mut offset, &mut fields, "reservedLinStatisticEvent1")?;
+            push_u32_field(data, &mut offset, &mut fields, "reservedLinStatisticEvent2")?;
+            push_f64_field(data, &mut offset, &mut fields, "busLoad")?;
+            push_u32_field(data, &mut offset, &mut fields, "burstsTotal")?;
+            push_u32_field(data, &mut offset, &mut fields, "burstsOverrun")?;
+            push_u32_field(data, &mut offset, &mut fields, "framesSent")?;
+            push_u32_field(data, &mut offset, &mut fields, "framesReceived")?;
+            push_u32_field(data, &mut offset, &mut fields, "framesUnanswered")?;
+            push_u32_field(data, &mut offset, &mut fields, "reservedLinStatisticEvent3")?;
+        }
+        ObjectType::LinDisturbanceEvent => {
+            push_u16_field(data, &mut offset, &mut fields, "channel")?;
+            push_u8_field(data, &mut offset, &mut fields, "id")?;
+            push_u8_field(data, &mut offset, &mut fields, "disturbingFrameId")?;
+            push_u32_field(data, &mut offset, &mut fields, "disturbanceType")?;
+            push_u32_field(data, &mut offset, &mut fields, "byteIndex")?;
+            push_u32_field(data, &mut offset, &mut fields, "bitIndex")?;
+            push_u32_field(data, &mut offset, &mut fields, "bitOffsetInSixteenthBits")?;
+            push_u32_field(
+                data,
+                &mut offset,
+                &mut fields,
+                "disturbanceLengthInSixteenthBits",
+            )?;
+        }
+        ObjectType::LinMessage2 => {
+            read_lin_databyte_timestamp_event(data, &mut offset, &mut fields)?;
+            push_bytes_field(data, &mut offset, 8, &mut fields, "data")?;
+            push_u16_field(data, &mut offset, &mut fields, "crc")?;
+            push_u8_field(data, &mut offset, &mut fields, "dir")?;
+            push_u8_field(data, &mut offset, &mut fields, "simulated")?;
+            push_u8_field(data, &mut offset, &mut fields, "isEtf")?;
+            push_u8_field(data, &mut offset, &mut fields, "etfAssocIndex")?;
+            push_u8_field(data, &mut offset, &mut fields, "etfAssocEtfId")?;
+            push_u8_field(data, &mut offset, &mut fields, "fsmId")?;
+            push_u8_field(data, &mut offset, &mut fields, "fsmState")?;
+            push_u8_field(data, &mut offset, &mut fields, "reservedLinMessage1")?;
+            push_u16_field(data, &mut offset, &mut fields, "reservedLinMessage2")?;
+            if offset < data.len() {
+                push_u32_field(data, &mut offset, &mut fields, "respBaudrate")?;
+            }
+            if offset + 16 <= data.len() {
+                push_f64_field(data, &mut offset, &mut fields, "exactHeaderBaudrate")?;
+                push_u32_field(data, &mut offset, &mut fields, "earlyStopbitOffset")?;
+                push_u32_field(data, &mut offset, &mut fields, "earlyStopbitOffsetResponse")?;
+            }
+        }
+        ObjectType::LinSndError2 => {
+            read_lin_message_descriptor(data, &mut offset, &mut fields)?;
+            push_u64_field(data, &mut offset, &mut fields, "eoh")?;
+            push_u8_field(data, &mut offset, &mut fields, "isEtf")?;
+            push_u8_field(data, &mut offset, &mut fields, "fsmId")?;
+            push_u8_field(data, &mut offset, &mut fields, "fsmState")?;
+            push_u8_field(data, &mut offset, &mut fields, "reservedLinSendError1")?;
+            push_u32_field(data, &mut offset, &mut fields, "reservedLinSendError2")?;
+            push_f64_field(data, &mut offset, &mut fields, "exactHeaderBaudrate")?;
+            push_u32_field(data, &mut offset, &mut fields, "earlyStopbitOffset")?;
+            if offset + 4 <= data.len() {
+                push_u32_field(data, &mut offset, &mut fields, "reservedLinSendError3")?;
+            }
+        }
+        ObjectType::LinSynError2 => {
+            read_lin_synch_field_event(data, &mut offset, &mut fields)?;
+            push_u16_vec_field(data, &mut offset, 4, &mut fields, "timeDiff")?;
+        }
+        ObjectType::LinCrcError2 => {
+            read_lin_databyte_timestamp_event(data, &mut offset, &mut fields)?;
+            push_bytes_field(data, &mut offset, 8, &mut fields, "data")?;
+            push_u16_field(data, &mut offset, &mut fields, "crc")?;
+            push_u8_field(data, &mut offset, &mut fields, "dir")?;
+            push_u8_field(data, &mut offset, &mut fields, "fsmId")?;
+            push_u8_field(data, &mut offset, &mut fields, "fsmState")?;
+            push_u8_field(data, &mut offset, &mut fields, "simulated")?;
+            push_u16_field(data, &mut offset, &mut fields, "reservedLinCrcError1")?;
+            push_u32_field(data, &mut offset, &mut fields, "respBaudrate")?;
+            push_u32_field(data, &mut offset, &mut fields, "reservedLinCrcError2")?;
+            push_f64_field(data, &mut offset, &mut fields, "exactHeaderBaudrate")?;
+            push_u32_field(data, &mut offset, &mut fields, "earlyStopbitOffset")?;
+            push_u32_field(data, &mut offset, &mut fields, "earlyStopbitOffsetResponse")?;
+        }
+        ObjectType::LinRcvError2 => {
+            read_lin_databyte_timestamp_event(data, &mut offset, &mut fields)?;
+            push_bytes_field(data, &mut offset, 8, &mut fields, "data")?;
+            push_u8_field(data, &mut offset, &mut fields, "fsmId")?;
+            push_u8_field(data, &mut offset, &mut fields, "fsmState")?;
+            push_u8_field(data, &mut offset, &mut fields, "stateReason")?;
+            push_u8_field(data, &mut offset, &mut fields, "offendingByte")?;
+            push_u8_field(data, &mut offset, &mut fields, "shortError")?;
+            push_u8_field(data, &mut offset, &mut fields, "timeoutDuringDlcDetection")?;
+            push_u8_field(data, &mut offset, &mut fields, "isEtf")?;
+            push_u8_field(data, &mut offset, &mut fields, "hasDatabytes")?;
+            push_u32_field(data, &mut offset, &mut fields, "respBaudrate")?;
+            push_u32_field(data, &mut offset, &mut fields, "reservedLinReceiveError")?;
+            push_f64_field(data, &mut offset, &mut fields, "exactHeaderBaudrate")?;
+            push_u32_field(data, &mut offset, &mut fields, "earlyStopbitOffset")?;
+            push_u32_field(data, &mut offset, &mut fields, "earlyStopbitOffsetResponse")?;
+        }
+        ObjectType::LinWakeup2 => {
+            read_lin_bus_event(data, &mut offset, &mut fields)?;
+            push_u8_field(data, &mut offset, &mut fields, "lengthInfo")?;
+            push_u8_field(data, &mut offset, &mut fields, "signal")?;
+            push_u8_field(data, &mut offset, &mut fields, "external")?;
+            push_u8_field(data, &mut offset, &mut fields, "reservedLinWakeupEvent1")?;
+            push_u32_field(data, &mut offset, &mut fields, "reservedLinWakeupEvent2")?;
+        }
+        ObjectType::LinSpikeEvent2 => {
+            read_lin_bus_event(data, &mut offset, &mut fields)?;
+            push_u32_field(data, &mut offset, &mut fields, "width")?;
+            push_u8_field(data, &mut offset, &mut fields, "internal")?;
+            push_u8_field(data, &mut offset, &mut fields, "reservedLinSpikeEvent1")?;
+            push_u16_field(data, &mut offset, &mut fields, "reservedLinSpikeEvent2")?;
+        }
+        ObjectType::LinLongDomSig => {
+            read_lin_bus_event(data, &mut offset, &mut fields)?;
+            push_u8_field(data, &mut offset, &mut fields, "type")?;
+            push_u8_field(
+                data,
+                &mut offset,
+                &mut fields,
+                "reservedLinLongDomSignalEvent1",
+            )?;
+            push_u16_field(
+                data,
+                &mut offset,
+                &mut fields,
+                "reservedLinLongDomSignalEvent2",
+            )?;
+            push_u32_field(
+                data,
+                &mut offset,
+                &mut fields,
+                "reservedLinLongDomSignalEvent3",
+            )?;
+        }
+        ObjectType::LinLongDomSig2 => {
+            read_lin_bus_event(data, &mut offset, &mut fields)?;
+            push_u8_field(data, &mut offset, &mut fields, "type")?;
+            push_u8_field(
+                data,
+                &mut offset,
+                &mut fields,
+                "reservedLinLongDomSignalEvent1",
+            )?;
+            push_u16_field(
+                data,
+                &mut offset,
+                &mut fields,
+                "reservedLinLongDomSignalEvent2",
+            )?;
+            push_u32_field(
+                data,
+                &mut offset,
+                &mut fields,
+                "reservedLinLongDomSignalEvent3",
+            )?;
+            push_u64_field(data, &mut offset, &mut fields, "length")?;
+        }
+        ObjectType::LinUnexpectedWakeup => {
+            read_lin_bus_event(data, &mut offset, &mut fields)?;
+            push_u64_field(data, &mut offset, &mut fields, "width")?;
+            push_u8_field(data, &mut offset, &mut fields, "signal")?;
+            push_u8_field(
+                data,
+                &mut offset,
+                &mut fields,
+                "reservedLinUnexpectedWakeup1",
+            )?;
+            push_u16_field(
+                data,
+                &mut offset,
+                &mut fields,
+                "reservedLinUnexpectedWakeup2",
+            )?;
+            push_u32_field(
+                data,
+                &mut offset,
+                &mut fields,
+                "reservedLinUnexpectedWakeup3",
+            )?;
+        }
+        ObjectType::LinShortOrSlowResponse => {
+            read_lin_databyte_timestamp_event(data, &mut offset, &mut fields)?;
+            push_u32_field(data, &mut offset, &mut fields, "numberOfRespBytes")?;
+            push_bytes_field(data, &mut offset, 9, &mut fields, "respBytes")?;
+            push_u8_field(data, &mut offset, &mut fields, "slowResponse")?;
+            push_u8_field(data, &mut offset, &mut fields, "interruptedByBreak")?;
+            push_u8_field(
+                data,
+                &mut offset,
+                &mut fields,
+                "reservedLinShortOrSlowResponse",
+            )?;
+        }
+        ObjectType::LinShortOrSlowResponse2 => {
+            read_lin_databyte_timestamp_event(data, &mut offset, &mut fields)?;
+            push_u32_field(data, &mut offset, &mut fields, "numberOfRespBytes")?;
+            push_bytes_field(data, &mut offset, 9, &mut fields, "respBytes")?;
+            push_u8_field(data, &mut offset, &mut fields, "slowResponse")?;
+            push_u8_field(data, &mut offset, &mut fields, "interruptedByBreak")?;
+            push_u8_field(
+                data,
+                &mut offset,
+                &mut fields,
+                "reservedLinShortOrSlowResponse1",
+            )?;
+            push_f64_field(data, &mut offset, &mut fields, "exactHeaderBaudrate")?;
+            push_u32_field(data, &mut offset, &mut fields, "earlyStopbitOffset")?;
+            push_u32_field(
+                data,
+                &mut offset,
+                &mut fields,
+                "reservedLinShortOrSlowResponse2",
+            )?;
+        }
+        _ => {
+            return Err(BlfError::UnsupportedObject(base.object_type.as_u32()));
+        }
+    }
+
+    Ok(LinObject {
+        object_type: base.object_type,
+        header,
+        fields,
     })
 }

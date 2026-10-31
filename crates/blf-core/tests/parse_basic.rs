@@ -98,6 +98,20 @@ fn can_fd_message64() -> Vec<u8> {
     object
 }
 
+fn lin_message() -> Vec<u8> {
+    let mut object = object_header(11, 56, 500);
+    push_u16(&mut object, 1);
+    object.push(0x10);
+    object.push(8);
+    object.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    object.extend_from_slice(&[0, 0, 0, 0]);
+    push_u16(&mut object, 0x1234);
+    object.push(1);
+    object.push(0);
+    push_u32(&mut object, 0);
+    object
+}
+
 fn log_container(uncompressed: &[u8]) -> Vec<u8> {
     let object_size = 32 + uncompressed.len() as u32;
     let mut container = Vec::new();
@@ -124,9 +138,10 @@ fn write_blf(path: &std::path::Path) {
         inner.extend_from_slice(&can_message());
         inner.extend_from_slice(&can_message2());
         inner.extend_from_slice(&can_fd_message64());
+        inner.extend_from_slice(&lin_message());
         inner
     };
-    let mut file = file_statistics(inner.len() as u64, 3);
+    let mut file = file_statistics(inner.len() as u64, 4);
     file.extend_from_slice(&log_container(&inner));
     fs::write(path, file).unwrap();
 }
@@ -139,7 +154,7 @@ fn parses_p0_objects() {
     write_blf(&path);
 
     let mut reader = File::open(&path).unwrap();
-    assert_eq!(reader.file_statistics.object_count, 3);
+    assert_eq!(reader.file_statistics.object_count, 4);
     assert_eq!(reader.file_statistics.statistics_size, 144);
 
     let first = reader.read().unwrap().unwrap();
@@ -171,6 +186,20 @@ fn parses_p0_objects() {
             assert_eq!(frame.data.len(), 12);
             assert_eq!(frame.data[0], 10);
             assert!(frame.ext_data.is_none());
+        }
+        _ => panic!("wrong object"),
+    }
+
+    let fourth = reader.read().unwrap().unwrap();
+    assert_eq!(fourth.object_type(), ObjectType::LinMessage);
+    match fourth {
+        Object::Lin(frame) => {
+            assert_eq!(frame.header.object_time_stamp, 500);
+            assert_eq!(frame.object_type, ObjectType::LinMessage);
+            assert!(frame
+                .fields
+                .iter()
+                .any(|(name, value)| name == "id" && value == &blf_core::FieldValue::U8(0x10)));
         }
         _ => panic!("wrong object"),
     }
