@@ -1,0 +1,8 @@
+/target/
+/.venv/
+/.omx/
+__pycache__/
+*.pyc
+*.so
+*.whl
+.DS_Store

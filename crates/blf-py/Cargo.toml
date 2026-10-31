@@ -1,0 +1,13 @@
+[package]
+name = "blf-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "blf_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+blf-core = { path = "../blf-core" }
+pyo3 = { version = "0.23", features = ["extension-module"] }

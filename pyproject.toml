@@ -1,0 +1,16 @@
+[build-system]
+requires = ["maturin>=1.8,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "vector-log-blf"
+version = "0.1.0"
+description = "Rust-backed Vector BLF parser with Python bindings"
+requires-python = ">=3.9"
+dependencies = []
+
+[tool.maturin]
+manifest-path = "crates/blf-py/Cargo.toml"
+module-name = "vector_log.blf_rs._core"
+python-source = "python"
+features = ["pyo3/extension-module"]
