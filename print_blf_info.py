@@ -3,8 +3,33 @@
 
 import argparse
 from collections import Counter
+from pathlib import Path
+import sys
 
-from vector_log.blf_rs import open
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+PYTHON_SOURCE = PROJECT_ROOT / "python"
+
+try:
+    from vector_log.blf_rs import open
+except ModuleNotFoundError as error:
+    if error.name != "vector_log":
+        raise
+    sys.path.insert(0, str(PYTHON_SOURCE))
+    try:
+        from vector_log.blf_rs import open
+    except ImportError as error:
+        raise SystemExit(
+            "vector_log native extension is not built. Run "
+            "`maturin develop --release` from the vector_log repository, "
+            "then retry this command."
+        ) from error
+except ImportError as error:
+    raise SystemExit(
+        "vector_log native extension is not installed correctly. Run "
+        "`maturin develop --release` from the vector_log repository, "
+        "then retry this command."
+    ) from error
 
 
 def format_timestamp(ns):
@@ -19,6 +44,64 @@ def format_bytes(data, length):
     if length is not None and 0 < length < len(data):
         data = data[:length]
     return data.hex(" ").upper()
+
+
+def format_direction(direction):
+    labels = {
+        0: "Rx",
+        1: "Tx",
+        2: "TxRq",
+    }
+    if direction is None:
+        return None
+    return labels.get(direction, f"Unknown({direction})")
+
+
+def object_field(obj, name, default=None):
+    fields = getattr(obj, "fields", None)
+    if isinstance(fields, dict) and name in fields:
+        return fields[name]
+    return getattr(obj, name, default)
+
+
+def message_data(obj, class_name):
+    data_names = (
+        "data",
+        "dataBytes",
+        "payLoad",
+        "pktData",
+        "frameData",
+        "msg",
+        "firstData",
+        "a429Data",
+        "regData",
+        "text",
+    )
+    for name in data_names:
+        value = object_field(obj, name)
+        if isinstance(value, bytes):
+            length_name = {
+                "data": "dlc" if class_name.startswith("Lin") else "validDataBytes",
+                "dataBytes": "dataCount",
+                "payLoad": "payLoadLength",
+                "pktData": "pktDataLength",
+                "frameData": "frameLength",
+                "msg": "msgLen",
+                "firstData": "firstDataLen",
+                "regData": "regDataLen",
+                "text": "textLength",
+            }.get(name)
+            length = object_field(obj, length_name) if length_name else None
+            return value, length
+    return None, None
+
+
+def lin_event_description(class_name):
+    descriptions = {
+        "LinSendError": "TxHeaderNoResponse",
+        "LinSendError2": "TxHeaderNoResponse",
+    }
+    return descriptions.get(class_name)
 
 
 def print_file_stats(stats):
@@ -56,11 +139,13 @@ def print_file_stats(stats):
 def print_object(index, obj):
     class_name = type(obj).__name__
     timestamp = getattr(obj, "object_time_stamp", None)
-    channel = getattr(obj, "channel", None)
-    frame_id = getattr(obj, "id", None)
-    dlc = getattr(obj, "dlc", None)
-    direction = getattr(obj, "dir", None)
-    data = getattr(obj, "data", None)
+    channel = object_field(obj, "channel")
+    frame_id = object_field(obj, "id")
+    dlc = object_field(obj, "dlc")
+    direction = object_field(obj, "dir")
+    data, data_length = message_data(obj, class_name)
+    is_lin = class_name.startswith("Lin")
+    event_description = lin_event_description(class_name)
 
     parts = [
         f"[{index}] {class_name}",
@@ -71,11 +156,13 @@ def print_object(index, obj):
     if frame_id is not None:
         parts.append(f"id=0x{frame_id:02X}")
     if dlc is not None:
-        parts.append(f"dlc={dlc}")
+        parts.append(f"{'headerDlc' if is_lin else 'dlc'}={dlc}")
     if direction is not None:
-        parts.append(f"dir={direction}")
+        parts.append(f"dir={format_direction(direction)}")
+    elif event_description is not None:
+        parts.append(f"event={event_description}")
     if data is not None:
-        parts.append(f"data={format_bytes(data, dlc)}")
+        parts.append(f"data={format_bytes(data, data_length if data_length is not None else dlc)}")
 
     print("  ".join(parts))
 
@@ -96,14 +183,23 @@ def main():
         default=50,
         help="Maximum number of objects to print; use 0 to print all",
     )
+    parser.add_argument(
+        "--messages-only",
+        action="store_true",
+        help="Print every object without file statistics or the summary",
+    )
     args = parser.parse_args()
 
     with open(args.path) as reader:
-        print_file_stats(reader.file_statistics)
+        if not args.messages_only:
+            print_file_stats(reader.file_statistics)
 
         counts = Counter()
         total = 0
-        print("== Objects ==")
+        if args.messages_only:
+            args.limit = 0
+        else:
+            print("== Objects ==")
 
         while True:
             obj = reader.read()
@@ -116,11 +212,12 @@ def main():
                 print_object(total, obj)
             total += 1
 
-        print()
-        print("== Object Summary ==")
-        print(f"total objects: {total}")
-        for class_name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
-            print(f"{class_name:<28} {count}")
+        if not args.messages_only:
+            print()
+            print("== Object Summary ==")
+            print(f"total objects: {total}")
+            for class_name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
+                print(f"{class_name:<28} {count}")
 
 
 if __name__ == "__main__":

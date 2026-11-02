@@ -53,6 +53,33 @@ fn object_header(object_type: u32, object_size: u32, timestamp: u64) -> Vec<u8> 
     data
 }
 
+fn object_header2(object_type: u32, object_size: u32, timestamp: u64, original: u64) -> Vec<u8> {
+    let mut data = Vec::new();
+    push_u32(&mut data, 0x4A42_4F4C);
+    push_u16(&mut data, 40);
+    push_u16(&mut data, 2);
+    push_u32(&mut data, object_size);
+    push_u32(&mut data, object_type);
+    push_u32(&mut data, 0x0000_0002);
+    data.push(1);
+    data.push(0);
+    push_u16(&mut data, 0);
+    push_u64(&mut data, timestamp);
+    push_u64(&mut data, original);
+    data
+}
+
+fn legacy_object_header2(
+    object_type: u32,
+    object_size: u32,
+    timestamp: u64,
+    original: u64,
+) -> Vec<u8> {
+    let mut data = object_header2(object_type, object_size, timestamp, original);
+    data[6..8].copy_from_slice(&1u16.to_le_bytes());
+    data
+}
+
 fn can_message() -> Vec<u8> {
     let mut object = object_header(1, 48, 100);
     push_u16(&mut object, 1);
@@ -112,6 +139,34 @@ fn lin_message() -> Vec<u8> {
     object
 }
 
+fn lin_message2(object_size: u32, extension: &[u8]) -> Vec<u8> {
+    let mut object = object_header(57, object_size, 600);
+    // LinDatabyteTimestampEvent: bus/sync fields, descriptor, and 9 timestamps.
+    object.extend_from_slice(&[0; 112]);
+    object.extend_from_slice(&[0; 8]); // data
+    push_u16(&mut object, 0x1234); // crc
+    object.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]); // flags and FSM fields
+    push_u16(&mut object, 0x5678); // reservedLinMessage2
+    object.extend_from_slice(extension);
+    assert_eq!(object.len(), object_size as usize);
+    object
+}
+
+fn malformed_global_marker() -> Vec<u8> {
+    let mut object = object_header(96, 571, 700);
+    object.extend_from_slice(&[0; 16]); // event type and colors
+    push_u32(&mut object, 131);
+    push_u32(&mut object, 131);
+    push_u32(&mut object, 261);
+    object.extend_from_slice(&[0; 4]); // reservedGlobalMarker3
+    object.extend_from_slice(&[0; 8]); // reservedGlobalMarker4
+    object.extend_from_slice(&[b'G'; 131]);
+    object.extend_from_slice(&[b'M'; 131]);
+    object.extend_from_slice(&[b'D'; 261]);
+    assert_eq!(object.len(), 595);
+    object
+}
+
 fn log_container(uncompressed: &[u8]) -> Vec<u8> {
     let object_size = 32 + uncompressed.len() as u32;
     let mut container = Vec::new();
@@ -126,9 +181,7 @@ fn log_container(uncompressed: &[u8]) -> Vec<u8> {
     push_u32(&mut container, uncompressed.len() as u32);
     push_u32(&mut container, 0);
     container.extend_from_slice(uncompressed);
-    for _ in 0..object_size % 4 {
-        container.push(0);
-    }
+    container.resize(container.len() + object_size as usize % 4, 0);
     container
 }
 
@@ -143,6 +196,12 @@ fn write_blf(path: &std::path::Path) {
     };
     let mut file = file_statistics(inner.len() as u64, 4);
     file.extend_from_slice(&log_container(&inner));
+    fs::write(path, file).unwrap();
+}
+
+fn write_blf_with_inner(path: &std::path::Path, inner: &[u8], object_count: u32) {
+    let mut file = file_statistics(inner.len() as u64, object_count);
+    file.extend_from_slice(&log_container(inner));
     fs::write(path, file).unwrap();
 }
 
@@ -205,4 +264,392 @@ fn parses_p0_objects() {
     }
 
     assert!(reader.read().unwrap().is_none());
+}
+
+#[test]
+fn reports_truncated_object_instead_of_eof() {
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("truncated-object.blf");
+    let mut inner = object_header(1, 48, 100);
+    inner.extend_from_slice(&[0; 4]);
+    write_blf_with_inner(&path, &inner, 1);
+
+    let mut reader = File::open(&path).unwrap();
+    assert!(matches!(reader.read(), Err(blf_core::BlfError::Truncated)));
+}
+
+#[test]
+fn rejects_zero_sized_unknown_objects() {
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("zero-sized-object.blf");
+    let mut inner = object_header(999, 0, 100);
+    inner.truncate(16);
+    write_blf_with_inner(&path, &inner, 1);
+
+    let mut reader = File::open(&path).unwrap();
+    assert!(matches!(reader.read(), Err(blf_core::BlfError::Format(_))));
+}
+
+#[test]
+fn reports_truncated_log_container() {
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("truncated-container.blf");
+    let mut file = file_statistics(4, 0);
+    push_u32(&mut file, 0x4A42_4F4C);
+    push_u16(&mut file, 16);
+    push_u16(&mut file, 1);
+    push_u32(&mut file, 36);
+    push_u32(&mut file, 10);
+    push_u16(&mut file, 0);
+    push_u16(&mut file, 0);
+    push_u32(&mut file, 0);
+    push_u32(&mut file, 4);
+    push_u32(&mut file, 0);
+    fs::write(&path, file).unwrap();
+
+    let mut reader = File::open(&path).unwrap();
+    assert!(matches!(reader.read(), Err(blf_core::BlfError::Truncated)));
+}
+
+#[test]
+fn parses_structured_and_unknown_objects() {
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("all-known-objects.blf");
+    let mut inner = object_header(3, 40, 1003);
+    inner.extend_from_slice(&[1, 0, 2, 0]);
+    inner.extend_from_slice(&3u32.to_le_bytes());
+    let mut most = object_header2(33, 73, 1033, 2033);
+    most.extend_from_slice(&[0; 32]);
+    most.extend_from_slice(&[0xA5]);
+    inner.extend_from_slice(&most);
+    let mut unknown = object_header(999, 33, 1999);
+    unknown.push(0xA5);
+    inner.extend_from_slice(&unknown);
+    write_blf_with_inner(&path, &inner, 3);
+
+    let mut reader = File::open(&path).unwrap();
+    match reader.read().unwrap().unwrap() {
+        Object::Structured(value) => {
+            assert_eq!(value.object_type, ObjectType::CanOverload);
+            assert!(value.extensions.is_empty());
+            assert!(value.fields.iter().any(|(name, _)| name == "channel"));
+        }
+        _ => panic!("expected structured CAN object"),
+    }
+    match reader.read().unwrap().unwrap() {
+        Object::Structured(value) => {
+            assert_eq!(value.object_type, ObjectType::MostPkt2);
+            assert_eq!(value.extensions, vec![0xA5]);
+            match value.header {
+                blf_core::RawObjectHeader::Object2(header) => {
+                    assert_eq!(header.object_time_stamp, 1033);
+                    assert_eq!(header.original_time_stamp, 2033);
+                }
+                _ => panic!("expected ObjectHeader2"),
+            }
+        }
+        _ => panic!("expected structured MOST object"),
+    }
+    match reader.read().unwrap().unwrap() {
+        Object::Raw(raw) => {
+            let raw_type = match raw.header {
+                blf_core::RawObjectHeader::Object(header) => header.base.raw_object_type,
+                blf_core::RawObjectHeader::Object2(header) => header.base.raw_object_type,
+                blf_core::RawObjectHeader::Var(header) => header.base.raw_object_type,
+                blf_core::RawObjectHeader::Base(header) => header.raw_object_type,
+            };
+            assert_eq!(raw_type, 999);
+            assert_eq!(raw.payload, vec![0xA5]);
+        }
+        _ => panic!("expected unknown raw object"),
+    }
+    assert!(reader.read().unwrap().is_none());
+}
+
+#[test]
+fn parses_legacy_header_version_with_object_header2_size() {
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("legacy-object-header2.blf");
+    let mut inner = legacy_object_header2(33, 73, 1033, 2033);
+    inner.extend_from_slice(&[0; 32]);
+    inner.push(0xA5);
+    write_blf_with_inner(&path, &inner, 1);
+
+    let mut reader = File::open(&path).unwrap();
+    match reader.read().unwrap().unwrap() {
+        Object::Structured(value) => {
+            if let blf_core::RawObjectHeader::Object2(header) = value.header {
+                assert_eq!(header.base.header_version, 1);
+                assert_eq!(header.time_stamp_status, 1);
+                assert_eq!(header.original_time_stamp, 2033);
+            } else {
+                panic!("expected physical ObjectHeader2");
+            }
+        }
+        _ => panic!("expected structured object"),
+    }
+    assert!(reader.read().unwrap().is_none());
+}
+
+#[test]
+fn preserves_file_statistics_and_lin_extensions() {
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("statistics-and-lin-extensions.blf");
+
+    let mut inner = lin_message2(165, &[0xA1]);
+    inner.extend_from_slice(&lin_message2(
+        184,
+        &[
+            0xB2, 0xB3, 0xB4, 0xB5, // response baudrate
+            0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, // exact baudrate
+            0xD2, 0xD3, 0xD4, 0xD5, // early stopbit offsets
+            0xE2, 0xE3, 0xE4, 0xE5,
+        ],
+    ));
+    let mut file = file_statistics(inner.len() as u64, 2);
+    file[4..8].copy_from_slice(&146u32.to_le_bytes());
+    file.extend_from_slice(&[0xF1, 0xF2]);
+    file.extend_from_slice(&log_container(&inner));
+    fs::write(&path, file).unwrap();
+
+    let mut reader = File::open(&path).unwrap();
+    assert_eq!(reader.file_statistics.statistics_size, 146);
+    assert_eq!(reader.file_statistics.extensions, vec![0xF1, 0xF2]);
+
+    match reader.read().unwrap().unwrap() {
+        Object::Lin(value) => {
+            assert_eq!(value.extensions, vec![0xA1]);
+            assert!(!value.fields.iter().any(|(name, _)| name == "respBaudrate"));
+        }
+        _ => panic!("expected LinMessage2"),
+    }
+    match reader.read().unwrap().unwrap() {
+        Object::Lin(value) => {
+            assert_eq!(value.extensions, vec![]);
+            assert!(value.fields.iter().any(|(name, _)| name == "respBaudrate"));
+            assert!(value
+                .fields
+                .iter()
+                .any(|(name, _)| name == "exactHeaderBaudrate"));
+        }
+        _ => panic!("expected LinMessage2"),
+    }
+    assert!(reader.read().unwrap().is_none());
+}
+
+#[test]
+fn recovers_upstream_global_marker_size_bug() {
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("malformed-global-marker.blf");
+    let mut inner = malformed_global_marker();
+    inner.extend_from_slice(&[0; 3]); // upstream skips objectSize % 4 padding
+    write_blf_with_inner(&path, &inner, 1);
+
+    let mut reader = File::open(&path).unwrap();
+    match reader.read().unwrap().unwrap() {
+        Object::Structured(value) => {
+            assert_eq!(value.object_type, ObjectType::GlobalMarker);
+            assert_eq!(value.data.len(), 595);
+            assert!(value.extensions.is_empty());
+            assert!(value.fields.iter().any(|(name, value)| {
+                name == "groupNameLength" && value == &blf_core::FieldValue::U32(131)
+            }));
+        }
+        _ => panic!("expected GlobalMarker"),
+    }
+    assert!(reader.read().unwrap().is_none());
+}
+
+#[test]
+fn strict_mode_rejects_unknown_numeric_object_type() {
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("unknown-object-strict.blf");
+    let mut inner = object_header(999, 33, 100);
+    inner.push(0xA5);
+    write_blf_with_inner(&path, &inner, 1);
+
+    let mut reader = File::open_with_options(&path, true).unwrap();
+    assert!(matches!(
+        reader.read(),
+        Err(blf_core::BlfError::UnsupportedObject(999))
+    ));
+}
+
+#[test]
+fn parses_serial_event_union_variants_and_can_setting_timings() {
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("serial-and-can-setting.blf");
+    let mut inner = Vec::new();
+
+    let mut single = object_header(90, 64, 1);
+    push_u32(&mut single, 0x04);
+    push_u32(&mut single, 3);
+    push_u32(&mut single, 19_200);
+    push_u32(&mut single, 0);
+    single.push(0xA5);
+    single.resize(64, 0);
+    inner.extend_from_slice(&single);
+
+    let mut compact = object_header(90, 64, 2);
+    push_u32(&mut compact, 0x08);
+    push_u32(&mut compact, 4);
+    push_u32(&mut compact, 115_200);
+    push_u32(&mut compact, 0);
+    compact.push(3);
+    compact.extend_from_slice(&[1, 2, 3]);
+    compact.resize(64, 0);
+    inner.extend_from_slice(&compact);
+
+    let mut general = object_header(90, 32 + 16 + 16 + 3 + 16, 3);
+    push_u32(&mut general, 0);
+    push_u32(&mut general, 5);
+    push_u32(&mut general, 9_600);
+    push_u32(&mut general, 0);
+    push_u32(&mut general, 3);
+    push_u32(&mut general, 16);
+    push_u64(&mut general, 0);
+    general.extend_from_slice(&[9, 8, 7]);
+    push_u64(&mut general, 11);
+    push_u64(&mut general, -22i64 as u64);
+    inner.extend_from_slice(&general);
+    inner.push(0);
+
+    let mut setting = object_header(129, 43, 4);
+    push_u16(&mut setting, 7);
+    setting.push(1);
+    push_u32(&mut setting, 0x1122_3344);
+    push_u32(&mut setting, 0x5566_7788);
+    inner.extend_from_slice(&setting);
+
+    write_blf_with_inner(&path, &inner, 4);
+    let mut reader = File::open(&path).unwrap();
+
+    match reader.read().unwrap().unwrap() {
+        Object::Structured(value) => {
+            assert_eq!(value.object_type, ObjectType::SerialEvent);
+            assert_eq!(value.extensions, vec![]);
+            assert!(value.fields.iter().any(|(name, value)| {
+                name == "byte" && value == &blf_core::FieldValue::U8(0xA5)
+            }));
+        }
+        _ => panic!("expected single-byte serial event"),
+    }
+    match reader.read().unwrap().unwrap() {
+        Object::Structured(value) => {
+            assert!(value.fields.iter().any(|(name, value)| {
+                name == "compactLength" && value == &blf_core::FieldValue::U8(3)
+            }));
+            assert!(value.fields.iter().any(|(name, value)| {
+                name == "compactData"
+                    && value
+                        == &blf_core::FieldValue::Bytes(vec![
+                            1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                        ])
+            }));
+        }
+        _ => panic!("expected compact serial event"),
+    }
+    match reader.read().unwrap().unwrap() {
+        Object::Structured(value) => {
+            assert!(value.fields.iter().any(|(name, value)| {
+                name == "data" && value == &blf_core::FieldValue::Bytes(vec![9, 8, 7])
+            }));
+            assert!(value.fields.iter().any(|(name, value)| {
+                name == "timeStamps" && value == &blf_core::FieldValue::I64Vec(vec![11, -22])
+            }));
+        }
+        _ => panic!("expected general serial event"),
+    }
+    match reader.read().unwrap().unwrap() {
+        Object::Structured(value) => {
+            assert!(value.fields.iter().any(|(name, value)| {
+                name == "btrExtArb" && value == &blf_core::FieldValue::U32(0x1122_3344)
+            }));
+            assert!(value.fields.iter().any(|(name, value)| {
+                name == "btrExtData" && value == &blf_core::FieldValue::U32(0x5566_7788)
+            }));
+        }
+        _ => panic!("expected CAN setting changed event"),
+    }
+    assert!(reader.read().unwrap().is_none());
+}
+
+#[test]
+fn skips_nonzero_object_alignment_padding() {
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("nonzero-object-padding.blf");
+
+    let mut app_text = object_header(65, 49, 1);
+    push_u32(&mut app_text, 0x1234);
+    push_u32(&mut app_text, 0);
+    push_u32(&mut app_text, 1);
+    push_u32(&mut app_text, 0);
+    app_text.push(b"x"[0]);
+    assert_eq!(app_text.len(), 49);
+
+    let mut inner = app_text;
+    inner.extend_from_slice(&[0xA5, 0xA6, 0xA7]);
+    inner.extend_from_slice(&object_header(3, 40, 2));
+    inner.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
+    write_blf_with_inner(&path, &inner, 2);
+
+    let mut reader = File::open(&path).unwrap();
+    assert_eq!(
+        reader.read().unwrap().unwrap().object_type(),
+        ObjectType::AppText
+    );
+    assert_eq!(
+        reader.read().unwrap().unwrap().object_type(),
+        ObjectType::CanOverload
+    );
+    assert!(reader.read().unwrap().is_none());
+}
+
+#[test]
+fn rejects_dynamic_payload_length_outside_object() {
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("dynamic-payload-overflow.blf");
+
+    let mut inner = object_header(6, 48, 1);
+    push_u32(&mut inner, u32::MAX);
+    push_u32(&mut inner, 0);
+    push_u64(&mut inner, 0);
+    assert_eq!(inner.len(), 48);
+    write_blf_with_inner(&path, &inner, 1);
+
+    let mut reader = File::open(&path).unwrap();
+    assert!(matches!(reader.read(), Err(blf_core::BlfError::Truncated)));
+}
+
+#[test]
+fn rejects_huge_serial_timestamp_length_without_allocating() {
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("serial-timestamp-overflow.blf");
+
+    let mut inner = object_header(90, 48, 1);
+    push_u32(&mut inner, 0);
+    push_u32(&mut inner, 0);
+    push_u32(&mut inner, 9_600);
+    push_u32(&mut inner, 0);
+    push_u32(&mut inner, 0);
+    push_u32(&mut inner, u32::MAX);
+    assert_eq!(inner.len(), 56);
+    let object_size = inner.len() as u32;
+    inner[8..12].copy_from_slice(&object_size.to_le_bytes());
+    write_blf_with_inner(&path, &inner, 1);
+
+    let mut reader = File::open(&path).unwrap();
+    assert!(matches!(reader.read(), Err(blf_core::BlfError::Truncated)));
 }

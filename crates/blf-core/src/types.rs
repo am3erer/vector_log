@@ -32,6 +32,9 @@ pub enum ObjectType {
     MostCtrl = 23,
     MostLightlock = 24,
     MostStatistic = 25,
+    Reserved26 = 26,
+    Reserved27 = 27,
+    Reserved28 = 28,
     FlexrayData = 29,
     FlexraySync = 30,
     CanDriverError = 31,
@@ -55,6 +58,8 @@ pub enum ObjectType {
     FrStartcycle = 49,
     FrRcvmessage = 50,
     Realtimeclock = 51,
+    Reserved52 = 52,
+    Reserved53 = 53,
     LinStatistic = 54,
     J1708Message = 55,
     J1708VirtualMsg = 56,
@@ -109,6 +114,7 @@ pub enum ObjectType {
     LinShortOrSlowResponse2 = 105,
     AfdxStatus = 106,
     AfdxBusStatistic = 107,
+    Reserved108 = 108,
     AfdxErrorEvent = 109,
     A429Error = 110,
     A429Status = 111,
@@ -116,6 +122,8 @@ pub enum ObjectType {
     A429Message = 113,
     EthernetStatistic = 114,
     Unknown115 = 115,
+    Reserved116 = 116,
+    Reserved117 = 117,
     TestStructure = 118,
     DiagRequestInterpretation = 119,
     EthernetFrameEx = 120,
@@ -160,6 +168,9 @@ impl ObjectType {
             23 => Self::MostCtrl,
             24 => Self::MostLightlock,
             25 => Self::MostStatistic,
+            26 => Self::Reserved26,
+            27 => Self::Reserved27,
+            28 => Self::Reserved28,
             29 => Self::FlexrayData,
             30 => Self::FlexraySync,
             31 => Self::CanDriverError,
@@ -183,6 +194,8 @@ impl ObjectType {
             49 => Self::FrStartcycle,
             50 => Self::FrRcvmessage,
             51 => Self::Realtimeclock,
+            52 => Self::Reserved52,
+            53 => Self::Reserved53,
             54 => Self::LinStatistic,
             55 => Self::J1708Message,
             56 => Self::J1708VirtualMsg,
@@ -237,6 +250,7 @@ impl ObjectType {
             105 => Self::LinShortOrSlowResponse2,
             106 => Self::AfdxStatus,
             107 => Self::AfdxBusStatistic,
+            108 => Self::Reserved108,
             109 => Self::AfdxErrorEvent,
             110 => Self::A429Error,
             111 => Self::A429Status,
@@ -244,6 +258,8 @@ impl ObjectType {
             113 => Self::A429Message,
             114 => Self::EthernetStatistic,
             115 => Self::Unknown115,
+            116 => Self::Reserved116,
+            117 => Self::Reserved117,
             118 => Self::TestStructure,
             119 => Self::DiagRequestInterpretation,
             120 => Self::EthernetFrameEx,
@@ -265,6 +281,140 @@ impl ObjectType {
     pub fn as_u32(self) -> u32 {
         self as u32
     }
+
+    pub fn name(self) -> &'static str {
+        object_type_name(self.as_u32())
+    }
+}
+
+pub fn object_type_name(value: u32) -> &'static str {
+    match value {
+        0 => "Unknown",
+        1 => "CanMessage",
+        2 => "CanErrorFrame",
+        3 => "CanOverloadFrame",
+        4 => "CanDriverStatistic",
+        5 => "AppTrigger",
+        6..=9 => "EnvironmentVariable",
+        10 => "LogContainer",
+        11 => "LinMessage",
+        12 => "LinCrcError",
+        13 => "LinDlcInfo",
+        14 => "LinReceiveError",
+        15 => "LinSendError",
+        16 => "LinSlaveTimeout",
+        17 => "LinSchedulerModeChange",
+        18 => "LinSyncError",
+        19 => "LinBaudrateEvent",
+        20 => "LinSleepModeEvent",
+        21 => "LinWakeupEvent",
+        22 => "MostSpy",
+        23 => "MostCtrl",
+        24 => "MostLightLock",
+        25 => "MostStatistic",
+        26..=28 => "Reserved",
+        29 => "FlexRayData",
+        30 => "FlexRaySync",
+        31 => "CanDriverError",
+        32 => "MostPkt",
+        33 => "MostPkt2",
+        34 => "MostHwMode",
+        35 => "MostReg",
+        36 => "MostGenReg",
+        37 => "MostNetState",
+        38 => "MostDataLost",
+        39 => "MostTrigger",
+        40 => "FlexRayV6StartCycleEvent",
+        41 => "FlexRayV6Message",
+        42 => "LinChecksumInfo",
+        43 => "LinSpikeEvent",
+        44 => "CanDriverHwSync",
+        45 => "FlexRayStatusEvent",
+        46 => "GpsEvent",
+        47 => "FlexRayVFrError",
+        48 => "FlexRayVFrStatus",
+        49 => "FlexRayVFrStartCycle",
+        50 => "FlexRayVFrReceiveMsg",
+        51 => "RealtimeClock",
+        52..=53 => "Reserved",
+        54 => "LinStatisticEvent",
+        55..=56 => "J1708Message",
+        57 => "LinMessage2",
+        58 => "LinSendError2",
+        59 => "LinSyncError2",
+        60 => "LinCrcError2",
+        61 => "LinReceiveError2",
+        62 => "LinWakeupEvent2",
+        63 => "LinSpikeEvent2",
+        64 => "LinLongDomSignalEvent",
+        65 => "AppText",
+        66 => "FlexRayVFrReceiveMsgEx",
+        67 => "MostStatisticEx",
+        68 => "MostTxLight",
+        69 => "MostAllocTab",
+        70 => "MostStress",
+        71 => "EthernetFrame",
+        72 => "SystemVariable",
+        73 => "CanErrorFrameExt",
+        74 => "CanDriverErrorExt",
+        75 => "LinLongDomSignalEvent2",
+        76 => "Most150Message",
+        77 => "Most150Pkt",
+        78 => "MostEthernetPkt",
+        79 => "Most150MessageFragment",
+        80 => "Most150PktFragment",
+        81 => "MostEthernetPktFragment",
+        82 => "MostSystemEvent",
+        83 => "Most150AllocTab",
+        84 => "Most50Message",
+        85 => "Most50Pkt",
+        86 => "CanMessage2",
+        87 => "LinUnexpectedWakeup",
+        88 => "LinShortOrSlowResponse",
+        89 => "LinDisturbanceEvent",
+        90 => "SerialEvent",
+        91 => "DriverOverrun",
+        92 => "EventComment",
+        93 => "WlanFrame",
+        94 => "WlanStatistic",
+        95 => "MostEcl",
+        96 => "GlobalMarker",
+        97 => "AfdxFrame",
+        98 => "AfdxStatistic",
+        99 => "KLineStatusEvent",
+        100 => "CanFdMessage",
+        101 => "CanFdMessage64",
+        102 => "EthernetRxError",
+        103 => "EthernetStatus",
+        104 => "CanFdErrorFrame64",
+        105 => "LinShortOrSlowResponse2",
+        106 => "AfdxStatus",
+        107 => "AfdxBusStatistic",
+        108 => "Reserved",
+        109 => "AfdxErrorEvent",
+        110 => "A429Error",
+        111 => "A429Status",
+        112 => "A429BusStatistic",
+        113 => "A429Message",
+        114 => "EthernetStatistic",
+        115 => "RestorePointContainer",
+        116..=117 => "Reserved",
+        118 => "TestStructure",
+        119 => "DiagRequestInterpretation",
+        120 => "EthernetFrameEx",
+        121 => "EthernetFrameForwarded",
+        122 => "EthernetErrorEx",
+        123 => "EthernetErrorForwarded",
+        124 => "FunctionBus",
+        125 => "DataLostBegin",
+        126 => "DataLostEnd",
+        127 => "WaterMarkEvent",
+        128 => "TriggerCondition",
+        129 => "CanSettingChanged",
+        130 => "DistributedObjectMember",
+        131 => "AttributeEvent",
+        _ => "UnknownObject",
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -279,7 +429,7 @@ pub struct SystemTime {
     pub milliseconds: u16,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileStatistics {
     pub signature: u32,
     pub statistics_size: u32,
@@ -296,6 +446,8 @@ pub struct FileStatistics {
     pub last_object_time: SystemTime,
     pub restore_points_offset: u64,
     pub reserved_file_statistics: [u32; 16],
+    /// Bytes after the fixed 144-byte FileStatistics layout.
+    pub extensions: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,6 +457,7 @@ pub struct ObjectHeaderBase {
     pub header_version: u16,
     pub object_size: u32,
     pub object_type: ObjectType,
+    pub raw_object_type: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,6 +490,37 @@ pub struct VarObjectHeader {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RawObjectHeader {
+    Object(ObjectHeader),
+    Object2(ObjectHeader2),
+    Var(VarObjectHeader),
+    Base(ObjectHeaderBase),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawObject {
+    pub header: RawObjectHeader,
+    pub class_name: String,
+    pub payload: Vec<u8>,
+    pub data: Vec<u8>,
+}
+
+/// A protocol object whose fixed and variable fields are represented by name.
+///
+/// BLF has many protocol objects with small, versioned layouts. Keeping the
+/// original object bytes alongside the decoded fields lets callers inspect
+/// newer extensions without making the reader reject an otherwise valid BLF.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StructuredObject {
+    pub object_type: ObjectType,
+    pub header: RawObjectHeader,
+    pub class_name: String,
+    pub fields: Vec<(String, FieldValue)>,
+    pub extensions: Vec<u8>,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanMessage {
     pub header: ObjectHeader,
     pub channel: u16,
@@ -344,6 +528,7 @@ pub struct CanMessage {
     pub dlc: u8,
     pub id: u32,
     pub data: [u8; 8],
+    pub raw_data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -358,6 +543,7 @@ pub struct CanMessage2 {
     pub bit_count: u8,
     pub reserved_can_message1: u8,
     pub reserved_can_message2: u16,
+    pub raw_data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -375,6 +561,7 @@ pub struct CanFdMessage {
     pub reserved_can_fd_message2: u32,
     pub data: [u8; 64],
     pub reserved_can_fd_message3: u32,
+    pub raw_data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -404,6 +591,11 @@ pub struct CanFdMessage64 {
     pub crc: u32,
     pub data: Vec<u8>,
     pub ext_data: Option<CanFdExtFrameData>,
+    /// Bytes after the payload when the optional CAN-FD timing block is absent.
+    /// When the timing block is present, its trailing reserved bytes are kept
+    /// in `ext_data.reserved_can_fd_ext_frame_data`, matching vector_blf.
+    pub reserved_can_fd_ext_frame_data: Vec<u8>,
+    pub raw_data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -412,6 +604,7 @@ pub struct CanErrorFrame {
     pub channel: u16,
     pub length: u16,
     pub reserved_can_error_frame: Option<u32>,
+    pub raw_data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -429,6 +622,7 @@ pub struct CanErrorFrameExt {
     pub flags_ext: u16,
     pub reserved_can_error_frame_ext2: u16,
     pub data: Vec<u8>,
+    pub raw_data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -454,6 +648,11 @@ pub struct CanFdErrorFrame64 {
     pub reserved_can_fd_error_frame2: u16,
     pub data: Vec<u8>,
     pub ext_data: Option<CanFdExtFrameData>,
+    /// Bytes after the payload when the optional CAN-FD timing block is absent.
+    /// When the timing block is present, its trailing reserved bytes are kept
+    /// in `ext_data.reserved_can_fd_ext_frame_data`, matching vector_blf.
+    pub reserved_can_fd_ext_frame_data: Vec<u8>,
+    pub raw_data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -464,6 +663,7 @@ pub struct AppText {
     pub text_length: u32,
     pub reserved_app_text2: u32,
     pub text: Vec<u8>,
+    pub raw_data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -480,6 +680,7 @@ pub struct RestorePointContainer {
     pub reserved_restore_point_container: [u8; 14],
     pub data_length: u16,
     pub data: Vec<u8>,
+    pub raw_data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -493,13 +694,18 @@ pub struct RestorePoints {
 pub enum FieldValue {
     U8(u8),
     U16(u16),
+    I16(i16),
     U32(u32),
     U64(u64),
     I32(i32),
+    I64(i64),
     F64(f64),
     Bytes(Vec<u8>),
+    String(String),
     U16Vec(Vec<u16>),
+    U32Vec(Vec<u32>),
     U64Vec(Vec<u64>),
+    I64Vec(Vec<i64>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -507,6 +713,8 @@ pub struct LinObject {
     pub object_type: ObjectType,
     pub header: ObjectHeader,
     pub fields: Vec<(String, FieldValue)>,
+    pub extensions: Vec<u8>,
+    pub raw_data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -521,6 +729,8 @@ pub enum Object {
     AppText(AppText),
     RestorePointContainer(RestorePointContainer),
     Lin(LinObject),
+    Structured(StructuredObject),
+    Raw(RawObject),
 }
 
 impl Object {
@@ -536,36 +746,59 @@ impl Object {
             Object::AppText(_) => ObjectType::AppText,
             Object::RestorePointContainer(_) => ObjectType::Unknown115,
             Object::Lin(object) => object.object_type,
+            Object::Structured(object) => object.object_type,
+            Object::Raw(object) => match &object.header {
+                RawObjectHeader::Object(header) => header.base.object_type,
+                RawObjectHeader::Object2(header) => header.base.object_type,
+                RawObjectHeader::Var(header) => header.base.object_type,
+                RawObjectHeader::Base(header) => header.object_type,
+            },
+        }
+    }
+
+    pub fn object_type_raw(&self) -> u32 {
+        match self {
+            Object::Raw(object) => match &object.header {
+                RawObjectHeader::Object(header) => header.base.raw_object_type,
+                RawObjectHeader::Object2(header) => header.base.raw_object_type,
+                RawObjectHeader::Var(header) => header.base.raw_object_type,
+                RawObjectHeader::Base(header) => header.raw_object_type,
+            },
+            _ => self.object_type().as_u32(),
         }
     }
 }
 
 pub(crate) fn read_u16(data: &[u8], offset: usize) -> Result<u16> {
-    let bytes = data.get(offset..offset + 2).ok_or(BlfError::Incomplete)?;
+    let end = offset.checked_add(2).ok_or(BlfError::Incomplete)?;
+    let bytes = data.get(offset..end).ok_or(BlfError::Incomplete)?;
     Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
 pub(crate) fn read_u32(data: &[u8], offset: usize) -> Result<u32> {
-    let bytes = data.get(offset..offset + 4).ok_or(BlfError::Incomplete)?;
+    let end = offset.checked_add(4).ok_or(BlfError::Incomplete)?;
+    let bytes = data.get(offset..end).ok_or(BlfError::Incomplete)?;
     Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
 }
 
 pub(crate) fn read_u64(data: &[u8], offset: usize) -> Result<u64> {
-    let bytes = data.get(offset..offset + 8).ok_or(BlfError::Incomplete)?;
+    let end = offset.checked_add(8).ok_or(BlfError::Incomplete)?;
+    let bytes = data.get(offset..end).ok_or(BlfError::Incomplete)?;
     Ok(u64::from_le_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ]))
 }
 
 pub(crate) fn read_system_time(data: &[u8], offset: usize) -> Result<SystemTime> {
+    let at = |delta| offset.checked_add(delta).ok_or(BlfError::Incomplete);
     Ok(SystemTime {
         year: read_u16(data, offset)?,
-        month: read_u16(data, offset + 2)?,
-        day_of_week: read_u16(data, offset + 4)?,
-        day: read_u16(data, offset + 6)?,
-        hour: read_u16(data, offset + 8)?,
-        minute: read_u16(data, offset + 10)?,
-        second: read_u16(data, offset + 12)?,
-        milliseconds: read_u16(data, offset + 14)?,
+        month: read_u16(data, at(2)?)?,
+        day_of_week: read_u16(data, at(4)?)?,
+        day: read_u16(data, at(6)?)?,
+        hour: read_u16(data, at(8)?)?,
+        minute: read_u16(data, at(10)?)?,
+        second: read_u16(data, at(12)?)?,
+        milliseconds: read_u16(data, at(14)?)?,
     })
 }
