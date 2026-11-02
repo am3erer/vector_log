@@ -2,11 +2,89 @@ use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 
+pyo3::create_exception!(_core, BlfFormatError, PyException, "BLF format error.");
+pyo3::create_exception!(
+    _core,
+    BlfTruncatedError,
+    PyException,
+    "BLF file is truncated."
+);
+pyo3::create_exception!(
+    _core,
+    BlfCompressionError,
+    PyException,
+    "BLF compression error."
+);
+pyo3::create_exception!(_core, BlfIoError, PyException, "BLF I/O error.");
+pyo3::create_exception!(
+    _core,
+    BlfLimitError,
+    PyException,
+    "BLF read limit exceeded."
+);
+pyo3::create_exception!(
+    _core,
+    BlfUnsupportedObjectError,
+    PyException,
+    "BLF object type is unsupported."
+);
+pyo3::create_exception!(
+    _core,
+    BlfUnsupportedVersionError,
+    PyException,
+    "BLF object header version is unsupported."
+);
+
+fn blf_error_to_py(error: blf_core::BlfError) -> PyErr {
+    match error {
+        blf_core::BlfError::Io(error) => BlfIoError::new_err(error.to_string()),
+        blf_core::BlfError::Format(message) => BlfFormatError::new_err(message),
+        blf_core::BlfError::Truncated | blf_core::BlfError::Incomplete => {
+            BlfTruncatedError::new_err(error.to_string())
+        }
+        blf_core::BlfError::Compression(message) => BlfCompressionError::new_err(message),
+        blf_core::BlfError::Limit {
+            kind,
+            limit,
+            actual,
+        } => BlfLimitError::new_err(format!(
+            "BLF read limit exceeded for {kind}: limit={limit}, actual={actual}"
+        )),
+        blf_core::BlfError::UnsupportedObject(object_type) => {
+            BlfUnsupportedObjectError::new_err(format!("unsupported object type: {object_type}"))
+        }
+        blf_core::BlfError::UnsupportedHeaderVersion(version) => {
+            BlfUnsupportedVersionError::new_err(format!(
+                "unsupported object header version: {version}"
+            ))
+        }
+    }
+}
+
 #[pyfunction]
-#[pyo3(signature = (path, strict=None))]
-fn open(path: String, strict: Option<bool>) -> PyResult<Py<PyFile>> {
-    let reader = blf_core::File::open_with_options(path, strict.unwrap_or(false))
-        .map_err(|error| PyException::new_err(error.to_string()))?;
+#[pyo3(signature = (path, strict=None, max_container_size=None, max_object_size=None, max_signature_scan=None))]
+fn open(
+    path: String,
+    strict: Option<bool>,
+    max_container_size: Option<u64>,
+    max_object_size: Option<u64>,
+    max_signature_scan: Option<usize>,
+) -> PyResult<Py<PyFile>> {
+    let mut options = blf_core::ReaderOptions::default();
+    if let Some(value) = strict {
+        options.strict = value;
+    }
+    if let Some(value) = max_container_size {
+        options.max_uncompressed_container_size = value;
+    }
+    if let Some(value) = max_object_size {
+        options.max_object_size = value;
+    }
+    if let Some(value) = max_signature_scan {
+        options.max_object_signature_scan = value;
+    }
+    let reader =
+        blf_core::File::open_with_reader_options(path, options).map_err(blf_error_to_py)?;
     Python::with_gil(|py| Py::new(py, PyFile { reader }))
 }
 
@@ -50,6 +128,21 @@ impl PyFile {
     }
 
     #[getter]
+    fn max_container_size(&self) -> u64 {
+        self.reader.options.max_uncompressed_container_size
+    }
+
+    #[getter]
+    fn max_object_size(&self) -> u64 {
+        self.reader.options.max_object_size
+    }
+
+    #[getter]
+    fn max_signature_scan(&self) -> usize {
+        self.reader.options.max_object_signature_scan
+    }
+
+    #[getter]
     fn write_restore_points(&self) -> bool {
         self.reader.write_restore_points
     }
@@ -59,21 +152,16 @@ impl PyFile {
     }
 
     fn read(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
-        match self
-            .reader
-            .read()
-            .map_err(|error| PyException::new_err(error.to_string()))?
-        {
+        let result = py.allow_threads(|| self.reader.read());
+        match result.map_err(blf_error_to_py)? {
             Some(object) => object_to_dict(py, &object).map(Some),
             None => Ok(None),
         }
     }
 
     fn read_batch(&mut self, py: Python<'_>, max_objects: usize) -> PyResult<Vec<PyObject>> {
-        let objects = self
-            .reader
-            .read_batch(max_objects)
-            .map_err(|error| PyException::new_err(error.to_string()))?;
+        let result = py.allow_threads(|| self.reader.read_batch(max_objects));
+        let objects = result.map_err(blf_error_to_py)?;
         objects
             .iter()
             .map(|object| object_to_dict(py, object))
@@ -175,6 +263,7 @@ fn object_to_dict(py: Python<'_>, object: &blf_core::Object) -> PyResult<PyObjec
             dict.set_item("class", "CanFdMessage")?;
             dict.set_item("channel", value.channel)?;
             dict.set_item("flags", value.flags)?;
+            dict.set_item("canFdFlags", value.can_fd_flags)?;
             dict.set_item("dlc", value.dlc)?;
             dict.set_item("id", value.id)?;
             dict.set_item("data", PyBytes::new(py, &value.data))?;
@@ -199,6 +288,7 @@ fn object_to_dict(py: Python<'_>, object: &blf_core::Object) -> PyResult<PyObjec
             dict.set_item("channel", value.channel)?;
             dict.set_item("dlc", value.dlc)?;
             dict.set_item("validDataBytes", value.valid_data_bytes)?;
+            dict.set_item("canFdFlags", value.flags)?;
             dict.set_item("id", value.id)?;
             dict.set_item("data", PyBytes::new(py, &value.data))?;
             dict.set_item("frameLength", value.frame_length)?;
@@ -336,6 +426,11 @@ fn object_to_dict(py: Python<'_>, object: &blf_core::Object) -> PyResult<PyObjec
             dict.set_item("class", "RestorePointContainer")?;
             dict.set_item("dataLength", value.data_length)?;
             dict.set_item("data", PyBytes::new(py, &value.data))?;
+            if let Some(restore_points) = &value.restore_points {
+                dict.set_item("restorePoints", restore_points_to_dict(py, restore_points)?)?;
+            } else {
+                dict.set_item("restorePoints", py.None())?;
+            }
             let fields = PyDict::new(py);
             fields.set_item(
                 "reservedRestorePointContainer",
@@ -343,6 +438,11 @@ fn object_to_dict(py: Python<'_>, object: &blf_core::Object) -> PyResult<PyObjec
             )?;
             fields.set_item("dataLength", value.data_length)?;
             fields.set_item("data", PyBytes::new(py, &value.data))?;
+            if let Some(restore_points) = &value.restore_points {
+                fields.set_item("restorePoints", restore_points_to_dict(py, restore_points)?)?;
+            } else {
+                fields.set_item("restorePoints", py.None())?;
+            }
             dict.set_item("fields", fields)?;
         }
         blf_core::Object::Lin(value) => {
@@ -396,6 +496,9 @@ fn object_to_dict(py: Python<'_>, object: &blf_core::Object) -> PyResult<PyObjec
         blf_core::Object::Raw(value) => &value.data,
     };
     dict.set_item("rawData", PyBytes::new(py, raw_data))?;
+    if let Some(timestamp_ns) = object_timestamp_ns(object) {
+        dict.set_item("timestampNs", timestamp_ns)?;
+    }
     if let Some(extensions) = typed_extensions(object) {
         dict.set_item("extensions", PyBytes::new(py, extensions))?;
     }
@@ -428,6 +531,87 @@ fn ext_data_to_dict(py: Python<'_>, ext: &blf_core::CanFdExtFrameData) -> PyResu
         PyBytes::new(py, &ext.reserved_can_fd_ext_frame_data),
     )?;
     Ok(dict.into_pyobject(py)?.into_any().unbind())
+}
+
+fn restore_points_to_dict(
+    py: Python<'_>,
+    restore_points: &blf_core::RestorePoints,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("objectSize", restore_points.object_size)?;
+    dict.set_item("objectInterval", restore_points.object_interval)?;
+    let points = restore_points
+        .restore_points
+        .iter()
+        .map(|point| {
+            let item = PyDict::new(py);
+            item.set_item("timeStamp", point.time_stamp)?;
+            item.set_item("compressedFilePosition", point.compressed_file_position)?;
+            item.set_item("uncompressedFileOffset", point.uncompressed_file_offset)?;
+            item.set_item("unknownRestorePoint", point.unknown_restore_point)?;
+            Ok::<_, PyErr>(item.into_pyobject(py)?.into_any().unbind())
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    dict.set_item("restorePoints", points)?;
+    Ok(dict.into_pyobject(py)?.into_any().unbind())
+}
+
+fn object_timestamp_ns(object: &blf_core::Object) -> Option<u64> {
+    let (flags, timestamp) = match object {
+        blf_core::Object::CanMessage(value) => {
+            (value.header.object_flags, value.header.object_time_stamp)
+        }
+        blf_core::Object::CanMessage2(value) => {
+            (value.header.object_flags, value.header.object_time_stamp)
+        }
+        blf_core::Object::CanFdMessage(value) => {
+            (value.header.object_flags, value.header.object_time_stamp)
+        }
+        blf_core::Object::CanFdMessage64(value) => {
+            (value.header.object_flags, value.header.object_time_stamp)
+        }
+        blf_core::Object::CanErrorFrame(value) => {
+            (value.header.object_flags, value.header.object_time_stamp)
+        }
+        blf_core::Object::CanErrorFrameExt(value) => {
+            (value.header.object_flags, value.header.object_time_stamp)
+        }
+        blf_core::Object::CanFdErrorFrame64(value) => {
+            (value.header.object_flags, value.header.object_time_stamp)
+        }
+        blf_core::Object::AppText(value) => {
+            (value.header.object_flags, value.header.object_time_stamp)
+        }
+        blf_core::Object::RestorePointContainer(value) => {
+            (value.header.object_flags, value.header.object_time_stamp)
+        }
+        blf_core::Object::Lin(value) => (value.header.object_flags, value.header.object_time_stamp),
+        blf_core::Object::Structured(value) => raw_header_timestamp(&value.header)?,
+        blf_core::Object::Raw(value) => raw_header_timestamp(&value.header)?,
+    };
+
+    if flags & 0x2 != 0 {
+        Some(timestamp)
+    } else if flags & 0x1 != 0 {
+        timestamp.checked_mul(10_000)
+    } else {
+        None
+    }
+}
+
+fn raw_header_timestamp(header: &blf_core::RawObjectHeader) -> Option<(u32, u64)> {
+    match header {
+        blf_core::RawObjectHeader::Object(value) => {
+            Some((value.object_flags, value.object_time_stamp))
+        }
+        blf_core::RawObjectHeader::Object2(value) => {
+            Some((value.object_flags, value.object_time_stamp))
+        }
+        blf_core::RawObjectHeader::Var(value) => {
+            Some((value.object_flags, value.object_time_stamp))
+        }
+        blf_core::RawObjectHeader::Base(_) => None,
+    }
 }
 
 fn typed_extensions(object: &blf_core::Object) -> Option<&[u8]> {
@@ -698,5 +882,24 @@ fn field_value_to_py(py: Python<'_>, value: &blf_core::FieldValue) -> PyResult<P
 fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(open, module)?)?;
     module.add_class::<PyFile>()?;
+    module.add("BlfFormatError", module.py().get_type::<BlfFormatError>())?;
+    module.add("BlfIoError", module.py().get_type::<BlfIoError>())?;
+    module.add("BlfLimitError", module.py().get_type::<BlfLimitError>())?;
+    module.add(
+        "BlfTruncatedError",
+        module.py().get_type::<BlfTruncatedError>(),
+    )?;
+    module.add(
+        "BlfCompressionError",
+        module.py().get_type::<BlfCompressionError>(),
+    )?;
+    module.add(
+        "BlfUnsupportedObjectError",
+        module.py().get_type::<BlfUnsupportedObjectError>(),
+    )?;
+    module.add(
+        "BlfUnsupportedVersionError",
+        module.py().get_type::<BlfUnsupportedVersionError>(),
+    )?;
     Ok(())
 }

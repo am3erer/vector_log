@@ -18,6 +18,26 @@ const LOBJ_BYTES: [u8; 4] = [0x4C, 0x4F, 0x42, 0x4A];
 const FILE_STATISTICS_SIZE: usize = 144;
 const LOG_CONTAINER_HEADER_SIZE: usize = 32;
 const MAX_UNCOMPRESSED_CONTAINER_SIZE: u64 = 512 * 1024 * 1024;
+const MAX_OBJECT_SIGNATURE_SCAN: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+pub struct ReaderOptions {
+    pub strict: bool,
+    pub max_uncompressed_container_size: u64,
+    pub max_object_size: u64,
+    pub max_object_signature_scan: usize,
+}
+
+impl Default for ReaderOptions {
+    fn default() -> Self {
+        Self {
+            strict: false,
+            max_uncompressed_container_size: MAX_UNCOMPRESSED_CONTAINER_SIZE,
+            max_object_size: u64::from(u32::MAX),
+            max_object_signature_scan: MAX_OBJECT_SIGNATURE_SCAN,
+        }
+    }
+}
 
 fn checked_offset(offset: usize, amount: usize) -> Result<usize> {
     offset
@@ -81,6 +101,7 @@ pub struct File {
     pub compression_level: i32,
     pub write_restore_points: bool,
     pub strict: bool,
+    pub options: ReaderOptions,
     open: bool,
     eof: bool,
 }
@@ -91,6 +112,17 @@ impl File {
     }
 
     pub fn open_with_options(path: impl AsRef<Path>, strict: bool) -> Result<Self> {
+        let options = ReaderOptions {
+            strict,
+            ..ReaderOptions::default()
+        };
+        Self::open_with_reader_options(path, options)
+    }
+
+    pub fn open_with_reader_options(
+        path: impl AsRef<Path>,
+        options: ReaderOptions,
+    ) -> Result<Self> {
         let std_file = StdFile::open(path)?;
         let mmap = unsafe { MmapOptions::new().map(&std_file)? };
         if mmap.len() < FILE_STATISTICS_SIZE {
@@ -121,7 +153,8 @@ impl File {
             compression_level: file_statistics.compression_level as i32,
             write_restore_points: true,
             file_statistics,
-            strict,
+            strict: options.strict,
+            options,
             open: true,
             eof: false,
         })
@@ -191,10 +224,15 @@ impl File {
             return Err(BlfError::Incomplete);
         }
 
-        let signature_pos = find_lobj(&self.decompressed, self.decompressed_pos)?;
+        let signature_pos = find_lobj(
+            &self.decompressed,
+            self.decompressed_pos,
+            self.options.max_object_signature_scan,
+        )?;
 
         let base = parse_object_header_base(&self.decompressed, signature_pos)?;
         validate_object_size(&base)?;
+        self.check_object_size(base.object_size)?;
         let object_size = base.object_size as usize;
         let declared_end = signature_pos
             .checked_add(object_size)
@@ -300,11 +338,12 @@ impl File {
             return Err(BlfError::Truncated);
         };
 
-        if u64::from(uncompressed_size) > MAX_UNCOMPRESSED_CONTAINER_SIZE {
-            return Err(BlfError::Format(format!(
-                "log container exceeds {} byte limit",
-                MAX_UNCOMPRESSED_CONTAINER_SIZE
-            )));
+        if u64::from(uncompressed_size) > self.options.max_uncompressed_container_size {
+            return Err(BlfError::Limit {
+                kind: "uncompressed log container",
+                limit: self.options.max_uncompressed_container_size,
+                actual: u64::from(uncompressed_size),
+            });
         }
 
         let compressed_size = object_size - LOG_CONTAINER_HEADER_SIZE;
@@ -367,34 +406,49 @@ impl File {
         self.decompressed.append(&mut decompressed);
         Ok(true)
     }
+
+    fn check_object_size(&self, object_size: u32) -> Result<()> {
+        if u64::from(object_size) > self.options.max_object_size {
+            return Err(BlfError::Limit {
+                kind: "BLF object",
+                limit: self.options.max_object_size,
+                actual: u64::from(object_size),
+            });
+        }
+        Ok(())
+    }
 }
 
-fn find_lobj(data: &[u8], start: usize) -> Result<usize> {
+fn find_lobj(data: &[u8], start: usize, max_scan: usize) -> Result<usize> {
     let remaining = data.get(start..).ok_or(BlfError::Incomplete)?;
     if remaining.starts_with(&LOBJ_BYTES) {
         return Ok(start);
     }
 
-    // Object readers in vector_blf skip `objectSize % 4` bytes without
-    // inspecting their contents. Keep the short scan for files which have
-    // leading alignment bytes at the beginning of a decompressed container.
-    for padding in 1..=3 {
-        let Some(candidate) = start.checked_add(padding) else {
-            break;
-        };
-        let Some(end) = candidate.checked_add(4) else {
-            break;
-        };
-        let Some(window) = data.get(candidate..end) else {
-            break;
-        };
-        if window == LOBJ_BYTES {
-            return Ok(candidate);
-        }
-    }
-
     if remaining.len() < 4 {
         return Err(BlfError::Incomplete);
+    }
+
+    // vector_blf scans forward for the next LOBJ signature when a converter
+    // leaves non-object bytes between records. Keep that compatibility while
+    // bounding work on damaged input so a large garbage region cannot turn a
+    // single read into an unbounded search.
+    let scan_len = remaining
+        .len()
+        .min(max_scan.saturating_add(LOBJ_BYTES.len() - 1));
+    let scan = &remaining[..scan_len];
+    if let Some(offset) = scan
+        .windows(LOBJ_BYTES.len())
+        .position(|window| window == LOBJ_BYTES)
+    {
+        return Ok(start + offset);
+    }
+
+    if remaining.len() > max_scan {
+        return Err(BlfError::Format(format!(
+            "LOBJ signature not found within {} bytes",
+            max_scan
+        )));
     }
 
     Err(BlfError::Format(
@@ -563,6 +617,13 @@ fn parse_object_header2(data: &[u8], offset: usize) -> Result<ObjectHeader2> {
 }
 
 fn parse_raw_header(data: &[u8], base: ObjectHeaderBase) -> Result<RawObjectHeader> {
+    if matches!(
+        base.object_type,
+        ObjectType::FunctionBus | ObjectType::TriggerCondition
+    ) {
+        return Ok(RawObjectHeader::Var(parse_var_object_header(data, 0)?));
+    }
+
     // ObjectHeader2 is 40 bytes on the wire. Some historical Vector files
     // report headerVersion=1 for it, so choose the representation by the
     // declared physical size before falling back to the version field.
@@ -2189,13 +2250,56 @@ fn parse_restore_point_container(
         .get(48..checked_offset(48, data_length as usize)?)
         .ok_or(BlfError::Truncated)?
         .to_vec();
+    let restore_points = parse_restore_points(&payload)?;
     Ok(RestorePointContainer {
         header,
         reserved_restore_point_container: reserved,
         data_length,
         data: payload,
+        restore_points,
         raw_data: data.to_vec(),
     })
+}
+
+fn parse_restore_points(data: &[u8]) -> Result<Option<crate::types::RestorePoints>> {
+    if data.is_empty() {
+        return Ok(None);
+    }
+    if data.len() < 8 {
+        // Object type 115 is reserved in vector_blf. Some Vector writers use
+        // it for restore points, while others leave an opaque payload here.
+        // Keep the latter readable and expose the bytes through `data`.
+        return Ok(None);
+    }
+
+    let object_size = read_u32(data, 0)?;
+    let object_size_usize = usize::try_from(object_size).map_err(|_| {
+        BlfError::Format("restore point object size does not fit usize".to_string())
+    })?;
+    if object_size_usize < 8 || object_size_usize > data.len() {
+        return Ok(None);
+    }
+
+    let point_bytes = object_size_usize - 8;
+    if point_bytes % 24 != 0 {
+        return Ok(None);
+    }
+
+    let mut restore_points = Vec::with_capacity(point_bytes / 24);
+    for offset in (8..object_size_usize).step_by(24) {
+        restore_points.push(crate::types::RestorePoint {
+            time_stamp: read_u64(data, offset)?,
+            compressed_file_position: read_u64(data, checked_offset(offset, 8)?)?,
+            uncompressed_file_offset: read_u32(data, checked_offset(offset, 16)?)?,
+            unknown_restore_point: read_u32(data, checked_offset(offset, 20)?)?,
+        });
+    }
+
+    Ok(Some(crate::types::RestorePoints {
+        object_size,
+        object_interval: read_u32(data, 4)?,
+        restore_points,
+    }))
 }
 
 fn is_lin_type(object_type: ObjectType) -> bool {

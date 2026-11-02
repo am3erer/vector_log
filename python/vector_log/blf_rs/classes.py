@@ -143,6 +143,14 @@ def _snake_to_camel(name):
     return parts[0] + "".join(part[:1].upper() + part[1:] for part in parts[1:])
 
 
+def _wrap_value(value):
+    if isinstance(value, dict):
+        return _AttributeMapping(value)
+    if isinstance(value, list):
+        return [_wrap_value(item) for item in value]
+    return value
+
+
 class _AttributeMapping:
     __slots__ = ("_data",)
 
@@ -152,16 +160,14 @@ class _AttributeMapping:
     def __getattr__(self, name):
         data = object.__getattribute__(self, "_data")
         if name in data:
-            value = data[name]
-            return _AttributeMapping(value) if isinstance(value, dict) else value
+            return _wrap_value(data[name])
         camel_name = _snake_to_camel(name)
         if camel_name in data:
-            value = data[camel_name]
-            return _AttributeMapping(value) if isinstance(value, dict) else value
+            return _wrap_value(data[camel_name])
         raise AttributeError(name)
 
     def __getitem__(self, key):
-        return self._data[key]
+        return _wrap_value(self._data[key])
 
     def get(self, key, default=None):
         return self._data.get(key, default)
@@ -184,18 +190,26 @@ class ExtData(_AttributeMapping):
     """Decoded optional CAN-FD timing extension."""
 
 
+class RestorePoint(_AttributeMapping):
+    """One restore point entry from a BLF restore-point container."""
+
+
+class RestorePoints(_AttributeMapping):
+    """Decoded restore-point metadata and entries."""
+
+
 class FileStatistics(_AttributeMapping):
     """BLF file statistics with attribute and mapping access."""
 
     @property
     def measurement_start_time(self):
         value = self._data.get("measurementStartTime")
-        return _AttributeMapping(value) if isinstance(value, dict) else value
+        return _wrap_value(value)
 
     @property
     def last_object_time(self):
         value = self._data.get("lastObjectTime")
-        return _AttributeMapping(value) if isinstance(value, dict) else value
+        return _wrap_value(value)
 
 
 class _Object(_AttributeMapping):
@@ -228,6 +242,79 @@ class _Object(_AttributeMapping):
         return self.extData
 
     @property
+    def timestamp_ns(self):
+        """Object timestamp converted using the BLF object time flags."""
+        return self._data.get("timestampNs")
+
+    @property
+    def direction(self):
+        """Human-readable direction for objects that expose ``dir``."""
+        value = self._data.get("dir")
+        return {0: "Rx", 1: "Tx", 2: "TxRq"}.get(value, value)
+
+    @property
+    def is_rx(self):
+        return self._data.get("dir") == 0
+
+    @property
+    def is_tx(self):
+        return self._data.get("dir") == 1
+
+    @property
+    def raw_direction(self):
+        return self._data.get("dir")
+
+    @property
+    def source_address(self):
+        return self._data.get("sourceAddress", self._data.get("sourceAdr"))
+
+    @property
+    def destination_address(self):
+        return self._data.get("destinationAddress", self._data.get("destAdr"))
+
+    @property
+    def frame_id(self):
+        """CAN/FlexRay-style frame identifier alias for ``id``."""
+        return self._data.get("frameId", self._data.get("id"))
+
+    @property
+    def can_fd_flags(self):
+        """CAN-FD protocol flags, when present on the object."""
+        if "canFdFlags" in self._data:
+            return self._data["canFdFlags"]
+        if self.class_name in {"CanFdMessage64", "CanFdErrorFrame64"}:
+            return self._data.get("flags")
+        return None
+
+    def _can_fd_flag(self, mask):
+        flags = self.can_fd_flags
+        return flags is not None and bool(int(flags) & mask)
+
+    @property
+    def is_remote_frame(self):
+        return self._can_fd_flag(0x0010)
+
+    @property
+    def is_tx_request(self):
+        return self._can_fd_flag(0x0080)
+
+    @property
+    def tx_acknowledge(self):
+        return self._can_fd_flag(0x0040)
+
+    @property
+    def is_fd(self):
+        return self._can_fd_flag(0x1000)
+
+    @property
+    def bit_rate_switch(self):
+        return self._can_fd_flag(0x2000)
+
+    @property
+    def esi(self):
+        return self._can_fd_flag(0x4000)
+
+    @property
     def object_time_stamp(self):
         return self._data.get("objectTimeStamp")
 
@@ -248,8 +335,39 @@ class _Object(_AttributeMapping):
         """
         if "payload" in self._data:
             return self._data["payload"]
-        value = self._data.get("data")
-        return value if isinstance(value, bytes) else b""
+        candidates = (
+            ("data", None),
+            ("dataBytes", "dataCount"),
+            ("payLoad", "payLoadLength"),
+            ("pktData", "pktDataLength"),
+            ("frameData", "frameLength"),
+            ("msg", "msgLen"),
+            ("firstData", "firstDataLen"),
+            ("a429Data", None),
+            ("regData", "regDataLen"),
+            ("text", "textLength"),
+        )
+        value = None
+        length = None
+        for name, length_name in candidates:
+            candidate = self._data.get(name)
+            if isinstance(candidate, bytes):
+                value = candidate
+                length = self._data.get(length_name) if length_name else None
+                break
+        if not isinstance(value, bytes):
+            return b""
+        if self.class_name in {"CanFdMessage", "CanFdMessage64", "CanFdErrorFrame64"}:
+            length = self._data.get("validDataBytes")
+        elif self.class_name.startswith("Can") or self.class_name.startswith("Lin"):
+            length = self._data.get("dlc")
+        if isinstance(length, int) and 0 <= length <= len(value):
+            return value[:length]
+        return value
+
+    @property
+    def payload_length(self):
+        return len(self.payload)
 
     @property
     def raw_data(self):
@@ -300,7 +418,10 @@ class AppText(_Object):
 
 
 class RestorePointContainer(_Object):
-    pass
+    @property
+    def restore_points(self):
+        value = self._data.get("restorePoints")
+        return RestorePoints(value) if isinstance(value, dict) else value
 
 
 class RawObject(_Object):
@@ -502,6 +623,22 @@ CAN_CLASS_NAMES = {
     "CanFdMessage64",
 }
 
+CAN_ERROR_CLASS_NAMES = {
+    "CanErrorFrame",
+    "CanErrorFrameExt",
+    "CanFdErrorFrame64",
+    "CanOverloadFrame",
+    "CanDriverError",
+    "CanDriverErrorExt",
+    "CanDriverHwSync",
+    "DriverOverrun",
+}
+
+CAN_OBJECT_CLASS_NAMES = CAN_CLASS_NAMES | CAN_ERROR_CLASS_NAMES | {
+    "CanDriverStatistic",
+    "CanSettingChanged",
+}
+
 
 def object_from_data(data):
     cls = CLASS_BY_NAME.get(
@@ -514,11 +651,15 @@ __all__ = [
     "ObjectType",
     "Header",
     "ExtData",
+    "RestorePoint",
+    "RestorePoints",
     "FileStatistics",
     "RawObject",
     "StructuredObject",
     "object_from_data",
     "CAN_CLASS_NAMES",
+    "CAN_ERROR_CLASS_NAMES",
+    "CAN_OBJECT_CLASS_NAMES",
     *(cls.__name__ for cls in _TYPED_CLASSES),
     *_RAW_CLASS_NAMES,
 ]

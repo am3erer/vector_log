@@ -680,6 +680,7 @@ pub struct RestorePointContainer {
     pub reserved_restore_point_container: [u8; 14],
     pub data_length: u16,
     pub data: Vec<u8>,
+    pub restore_points: Option<RestorePoints>,
     pub raw_data: Vec<u8>,
 }
 

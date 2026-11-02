@@ -82,13 +82,31 @@ Reader methods and properties include:
 
 - `read()` reads one object and returns `None` at EOF.
 - `read_batch(max_objects)` reads up to the requested number of objects.
-- `iter_objects()` and direct iteration provide object iteration.
-- `can_messages()` filters the stream to CAN-family messages.
+- `read_numpy(max_objects=None)` exports the next objects as NumPy columns;
+  payloads are zero-padded to the widest payload by default and paired with
+  `data_length`. Pass `data_width=64` for a fixed CAN-FD-sized matrix.
+- `read_arrow(max_objects=None)` exports the next objects as a PyArrow table;
+  PyArrow is optional and payloads remain variable-length binary values.
+- `iter_objects()` and direct iteration provide object iteration. It accepts
+  `object_types`, `channels`, `frame_ids`, `start_ns`, `end_ns`, and a
+  `predicate` for sequential filtering. Object types may be numeric IDs or
+  class names.
+- `iter_numpy(batch_size=4096)` and `iter_arrow(batch_size=4096)` stream
+  columnar batches without retaining the complete file in memory.
+- `can_messages()`, `can_error_frames()`, and `can_objects()` filter the
+  stream to CAN-family objects and accept the same filters.
+- `objects_to_csv()` and `objects_to_jsonl()` provide standard-library text
+  exports; `write_csv()` and `write_jsonl()` stream them to a path or text
+  file. Payload bytes are represented as space-separated hexadecimal text.
 - `file_statistics` exposes file metadata and measurement timestamps.
 - `current_object_count`, `current_uncompressed_file_size`, and
   `compression_level` expose reader progress and container state.
 - `good()`, `eof()`, and `close()` expose reader state and lifecycle control.
 - `strict=True` makes unknown object IDs an error.
+- `max_container_size`, `max_object_size`, and `max_signature_scan` provide
+  configurable safety limits for damaged or untrusted files. The default
+  limits preserve the existing reader behavior. `BlfLimitError` and
+  `BlfIoError` distinguish limit and I/O failures from format errors.
 
 Every decoded object exposes its wire fields through `fields`, and the same
 fields are available as Python attributes where the name is valid. Both the
@@ -111,6 +129,15 @@ if obj.extData is not None:
     print(obj.ext_data.btr_ext_data)
 ```
 
+CAN-FD objects also expose protocol flag helpers such as `is_remote_frame`,
+`is_tx_request`, `is_fd`, `bit_rate_switch`, `tx_acknowledge`, and `esi`.
+Classic CAN `flags` are kept separate and are not interpreted as CAN-FD flags.
+
+Reserved object type 115 is retained as `RestorePointContainer`. Restore-point
+entries are decoded when the payload has the expected `(objectSize - 8) / 24`
+layout; opaque payload variants remain available through `data` instead of
+causing the reader to stop.
+
 The byte properties have distinct meanings:
 
 - `data` is the protocol payload on typed legacy objects.
@@ -121,6 +148,28 @@ The byte properties have distinct meanings:
 For example, `reader.file_statistics.measurement_start_time.year` accesses a
 decoded timestamp component, while `reader.file_statistics.fileSize` accesses
 the original BLF field name.
+
+The batch export helpers are also available for an existing iterable:
+
+```python
+from vector_log.blf_rs import objects_to_arrow, objects_to_numpy
+
+objects = list(reader.can_messages())
+columns = objects_to_numpy(objects)
+table = objects_to_arrow(objects)  # requires optional pyarrow
+```
+
+The optional fuzz smoke harness and benchmark can be run without changing the
+BLF reader:
+
+```bash
+PYTHONPATH=python python3 scripts/fuzz_reader.py --iterations 1000
+PYTHONPATH=python python3 benchmarks/bench_reader.py trace.blf --repeat 5
+```
+
+The fuzz harness treats expected format, truncation, compression, and
+unsupported-object errors as correct rejection; unexpected exceptions still
+fail the process.
 
 ## Inspect a BLF file
 
@@ -155,6 +204,7 @@ and a recorded BLF file:
 - 109 upstream normal fixture files, 447 decoded objects, and 0 parse errors.
 - Every decoded fixture object has non-empty `raw_data`.
 - `RoofUnits.blf` decodes to 671 objects.
-- Python attribute audit: 1,118 objects and 19,894 fields with 0 failures.
-- Rust workspace tests: 13 passed.
+- Python attribute audit: 671 objects and 16,914 fields with 0 failures on
+  `RoofUnits.blf`.
+- Rust workspace tests: 16 passed.
 - Clippy with warnings denied: passed.

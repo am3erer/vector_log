@@ -1,6 +1,6 @@
 use std::fs;
 
-use blf_core::{File, Object, ObjectType};
+use blf_core::{File, Object, ObjectType, ReaderOptions};
 
 fn push_u16(out: &mut Vec<u8>, value: u16) {
     out.extend_from_slice(&value.to_le_bytes());
@@ -150,6 +150,34 @@ fn lin_message2(object_size: u32, extension: &[u8]) -> Vec<u8> {
     object.extend_from_slice(extension);
     assert_eq!(object.len(), object_size as usize);
     object
+}
+
+fn restore_point_container() -> Vec<u8> {
+    let mut restore_points = Vec::new();
+    push_u32(&mut restore_points, 56);
+    push_u32(&mut restore_points, 25);
+    push_u64(&mut restore_points, 1000);
+    push_u64(&mut restore_points, 2000);
+    push_u32(&mut restore_points, 3000);
+    push_u32(&mut restore_points, 4000);
+    push_u64(&mut restore_points, 5000);
+    push_u64(&mut restore_points, 6000);
+    push_u32(&mut restore_points, 7000);
+    push_u32(&mut restore_points, 8000);
+
+    let object_size = 48 + restore_points.len() as u32;
+    let mut object = object_header(115, object_size, 900);
+    object.extend_from_slice(&[0; 14]);
+    push_u16(&mut object, restore_points.len() as u16);
+    object.extend_from_slice(&restore_points);
+    assert_eq!(object.len(), object_size as usize);
+    object
+}
+
+fn var_object_header(object_type: u32, object_size: u32, timestamp: u64) -> Vec<u8> {
+    let mut data = object_header(object_type, object_size, timestamp);
+    data[20..22].copy_from_slice(&32u16.to_le_bytes());
+    data
 }
 
 fn malformed_global_marker() -> Vec<u8> {
@@ -315,6 +343,29 @@ fn reports_truncated_log_container() {
 }
 
 #[test]
+fn enforces_configured_object_size_limit() {
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("limited-object.blf");
+    let object = can_message();
+    write_blf_with_inner(&path, &object, 1);
+
+    let options = ReaderOptions {
+        max_object_size: 47,
+        ..ReaderOptions::default()
+    };
+    let mut reader = File::open_with_reader_options(&path, options).unwrap();
+    assert!(matches!(
+        reader.read(),
+        Err(blf_core::BlfError::Limit {
+            kind: "BLF object",
+            limit: 47,
+            actual: 48,
+        })
+    ));
+}
+
+#[test]
 fn parses_structured_and_unknown_objects() {
     let dir = std::env::temp_dir().join("blf-core-tests");
     fs::create_dir_all(&dir).unwrap();
@@ -368,6 +419,90 @@ fn parses_structured_and_unknown_objects() {
         _ => panic!("expected unknown raw object"),
     }
     assert!(reader.read().unwrap().is_none());
+}
+
+#[test]
+fn parses_restore_point_entries() {
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("restore-points.blf");
+    let inner = restore_point_container();
+    write_blf_with_inner(&path, &inner, 1);
+
+    let mut reader = File::open(&path).unwrap();
+    match reader.read().unwrap().unwrap() {
+        Object::RestorePointContainer(value) => {
+            let points = value.restore_points.expect("restore point payload");
+            assert_eq!(points.object_size, 56);
+            assert_eq!(points.object_interval, 25);
+            assert_eq!(points.restore_points.len(), 2);
+            assert_eq!(points.restore_points[0].time_stamp, 1000);
+            assert_eq!(points.restore_points[0].compressed_file_position, 2000);
+            assert_eq!(points.restore_points[1].uncompressed_file_offset, 7000);
+            assert_eq!(points.restore_points[1].unknown_restore_point, 8000);
+        }
+        _ => panic!("expected restore point container"),
+    }
+    assert!(reader.read().unwrap().is_none());
+}
+
+#[test]
+fn preserves_opaque_reserved_restore_point_payload() {
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("opaque-restore-point-payload.blf");
+    let mut object = object_header(115, 56, 901);
+    object.extend_from_slice(&[0; 14]);
+    push_u16(&mut object, 8);
+    object.extend_from_slice(&[0x78, 0x9c, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06]);
+    assert_eq!(object.len(), 56);
+    write_blf_with_inner(&path, &object, 1);
+
+    let mut reader = File::open(&path).unwrap();
+    match reader.read().unwrap().unwrap() {
+        Object::RestorePointContainer(value) => {
+            assert_eq!(
+                value.data,
+                vec![0x78, 0x9c, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06]
+            );
+            assert!(value.restore_points.is_none());
+        }
+        _ => panic!("expected restore point container"),
+    }
+    assert!(reader.read().unwrap().is_none());
+}
+
+#[test]
+fn uses_var_object_header_for_variable_objects() {
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("var-object-header.blf");
+
+    let mut function_bus = var_object_header(124, 53, 1);
+    function_bus.extend_from_slice(&[1, 0, 0, 0]);
+    function_bus.extend_from_slice(&[2, 0, 0, 0]);
+    function_bus.extend_from_slice(&[3, 0, 0, 0]);
+    function_bus.extend_from_slice(&[2, 0, 0, 0]);
+    function_bus.extend_from_slice(b"abcde");
+    assert_eq!(function_bus.len(), 53);
+    write_blf_with_inner(&path, &function_bus, 1);
+
+    let mut reader = File::open(&path).unwrap();
+    match reader.read().unwrap().unwrap() {
+        Object::Structured(value) => {
+            match value.header {
+                blf_core::RawObjectHeader::Var(header) => {
+                    assert_eq!(header.object_static_size, 32);
+                    assert_eq!(header.object_time_stamp, 1);
+                }
+                _ => panic!("expected VarObjectHeader"),
+            }
+            assert!(value.fields.iter().any(|(name, value)| {
+                name == "nameLength" && value == &blf_core::FieldValue::U32(3)
+            }));
+        }
+        _ => panic!("expected structured FunctionBus object"),
+    }
 }
 
 #[test]

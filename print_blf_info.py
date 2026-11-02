@@ -32,10 +32,10 @@ except ImportError as error:
     ) from error
 
 
-def format_timestamp(ns):
-    if ns is None:
+def format_timestamp(timestamp_ns):
+    if timestamp_ns is None:
         return "-"
-    return f"{ns / 1_000_000_000.0:.9f}"
+    return f"{timestamp_ns / 1_000_000_000.0:.9f}"
 
 
 def format_bytes(data, length):
@@ -138,7 +138,7 @@ def print_file_stats(stats):
 
 def print_object(index, obj):
     class_name = type(obj).__name__
-    timestamp = getattr(obj, "object_time_stamp", None)
+    timestamp = getattr(obj, "timestamp_ns", None)
     channel = object_field(obj, "channel")
     frame_id = object_field(obj, "id")
     dlc = object_field(obj, "dlc")

@@ -3,7 +3,7 @@ mod reader;
 mod types;
 
 pub use error::{BlfError, Result};
-pub use reader::{parse_file_statistics, File};
+pub use reader::{parse_file_statistics, File, ReaderOptions};
 pub use types::{
     AppText, CanErrorFrame, CanErrorFrameExt, CanFdErrorFrame64, CanFdExtFrameData, CanFdMessage,
     CanFdMessage64, CanMessage, CanMessage2, FieldValue, FileStatistics, LinObject, Object,

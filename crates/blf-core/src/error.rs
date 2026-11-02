@@ -14,6 +14,13 @@ pub enum BlfError {
     #[error("compression error: {0}")]
     Compression(String),
 
+    #[error("BLF read limit exceeded for {kind}: limit={limit}, actual={actual}")]
+    Limit {
+        kind: &'static str,
+        limit: u64,
+        actual: u64,
+    },
+
     #[error("unsupported object type: {0}")]
     UnsupportedObject(u32),
 
