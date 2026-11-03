@@ -269,15 +269,10 @@ fn parse_bo(path: &str, tokens: &[Token], database: &mut DbcDatabase) -> Databas
         name: tokens[2].text.clone(),
         dlc,
         is_fd: false,
-        // Vector's logical-container convention uses an extended identifier
-        // together with an application-level DLC above the CAN-FD wire limit.
-        // Keep ordinary oversized definitions physical so malformed DBC data
-        // cannot bypass payload validation by number alone.
-        payload_kind: if id.extended && dlc > 64 {
-            CanPayloadKind::LogicalContainer
-        } else {
-            CanPayloadKind::Physical
-        },
+        // Payload kind is assigned only after an explicit Vector
+        // VFrameFormat marker is parsed.  An oversized DLC alone is not
+        // sufficient to relax physical payload validation.
+        payload_kind: CanPayloadKind::Physical,
         signals: Vec::new(),
         comment: None,
         attributes: Default::default(),
@@ -640,6 +635,9 @@ fn parse_attribute(
             if name == "VFrameFormat" {
                 let is_fd = parse_vframe_format(path, &tokens[4])?;
                 database.set_message_is_fd(id, is_fd)?;
+                if tokens[4].text == "3" {
+                    database.set_message_payload_kind(id, CanPayloadKind::LogicalContainer)?;
+                }
             }
             database.set_message_attribute(id, name.clone(), value.clone())?;
         }

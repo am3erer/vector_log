@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+const MAX_MULTIPLEX_VALUES: u64 = 1_000_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum BusKind {
     Can,
@@ -459,6 +461,32 @@ impl DbcDatabase {
         Ok(())
     }
 
+    pub(crate) fn set_message_payload_kind(
+        &mut self,
+        id: CanMessageId,
+        payload_kind: CanPayloadKind,
+    ) -> DatabaseResult<()> {
+        let message = self.messages_by_id.get_mut(&id).ok_or_else(|| {
+            DatabaseError::new(
+                self.source_path.as_deref().unwrap_or("<memory>"),
+                0,
+                "BA_",
+                format!("unknown CAN message id 0x{:X}", id.id),
+            )
+        })?;
+        Arc::get_mut(message)
+            .ok_or_else(|| {
+                DatabaseError::new(
+                    self.source_path.as_deref().unwrap_or("<memory>"),
+                    0,
+                    "BA_",
+                    "message is shared and cannot be modified",
+                )
+            })?
+            .payload_kind = payload_kind;
+        Ok(())
+    }
+
     pub(crate) fn set_signal_attribute(
         &mut self,
         id: CanMessageId,
@@ -564,6 +592,32 @@ impl DbcDatabase {
                 ));
             }
         };
+        let ranges: Vec<_> = ranges.into_iter().collect();
+        let total_values = ranges.iter().try_fold(0_u64, |total, (start, end)| {
+            total.checked_add(u64::from(*end) - u64::from(*start) + 1)
+        });
+        let Some(total_values) = total_values else {
+            return Err(DatabaseError::new(
+                self.source_path.as_deref().unwrap_or("<memory>"),
+                0,
+                "SG_MUL_VAL_",
+                "multiplex value range size overflowed",
+            ));
+        };
+        let existing_values = match &signal.multiplex {
+            MultiplexRole::Branch(values) => values.len() as u64,
+            _ => 0,
+        };
+        if existing_values.saturating_add(total_values) > MAX_MULTIPLEX_VALUES {
+            return Err(DatabaseError::new(
+                self.source_path.as_deref().unwrap_or("<memory>"),
+                0,
+                "SG_MUL_VAL_",
+                format!(
+                    "multiplex value range expands beyond the {MAX_MULTIPLEX_VALUES} value limit"
+                ),
+            ));
+        }
         for (start, end) in ranges {
             values.extend(start..=end);
         }

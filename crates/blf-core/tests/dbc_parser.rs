@@ -135,6 +135,7 @@ fn accepts_logical_vector_message_dlc_above_can_fd_payload_size() {
     let source = r#"
 BO_ 2553607254 CLMIF: 196 ECU
  SG_ Selector : 0|8@1+ (1,0) [0|255] "" ECU
+BA_ "VFrameFormat" BO_ 2553607254 3;
 "#;
     let database = DbcDatabase::from_str(source).unwrap();
     let message = database.message_by_name("CLMIF").unwrap();
@@ -155,6 +156,31 @@ BO_ 2553607254 CLMIF: 196 ECU
             .payload_kind,
         blf_core::CanPayloadKind::Physical
     );
+}
+
+#[test]
+fn extended_oversized_message_without_container_marker_stays_physical() {
+    let source = r#"
+BO_ 2553607254 UnmarkedExtended: 196 ECU
+ SG_ Value : 0|8@1+ (1,0) [0|255] "" ECU
+"#;
+    let database = DbcDatabase::from_str(source).unwrap();
+    let message = database.message_by_name("UnmarkedExtended").unwrap();
+    assert!(message.id.extended);
+    assert_eq!(message.payload_kind, blf_core::CanPayloadKind::Physical);
+}
+
+#[test]
+fn rejects_multiplex_ranges_before_unbounded_expansion() {
+    let source = r#"
+BO_ 256 Muxed: 8 ECU
+ SG_ Mux M : 0|32@1+ (1,0) [0|4294967295] "" ECU
+ SG_ Value m1 : 32|8@1+ (1,0) [0|255] "" ECU
+SG_MUL_VAL_ 256 Value Mux 0-4294967295;
+"#;
+    let error = DbcDatabase::from_str(source).unwrap_err();
+    assert_eq!(error.field, "SG_MUL_VAL_");
+    assert!(error.reason.contains("value limit"));
 }
 
 #[test]
