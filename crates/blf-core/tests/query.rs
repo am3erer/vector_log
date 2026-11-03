@@ -177,6 +177,13 @@ fn write_aggregate_can_blf(path: &Path) {
     fs::write(path, output).unwrap();
 }
 
+fn write_muxed_can_blf(path: &Path) {
+    let inner = can_message(1, 0x100, 10, &[1, 0xAA, 0xBB]);
+    let mut output = file_statistics(inner.len() as u64, 1);
+    output.extend_from_slice(&log_container(&inner));
+    fs::write(path, output).unwrap();
+}
+
 fn write_strict_blf(path: &Path) {
     let mut inner = Vec::new();
     inner.extend_from_slice(&can_message(1, 0x100, 10, &[42]));
@@ -210,6 +217,16 @@ fn aggregate_can_database() -> DbcDatabase {
           SG_ Speed : 0|8@1+ (1,0) [0|255] \"\" ECU\n\
          BO_ 257 SecondStatus: 1 ECU\n\
           SG_ Speed : 0|8@1+ (1,0) [0|255] \"\" ECU\n",
+    )
+    .unwrap()
+}
+
+fn muxed_can_database() -> DbcDatabase {
+    DbcDatabase::from_str(
+        "BO_ 256 Muxed: 3 ECU\n\
+         SG_ Mux M : 0|4@1+ (1,0) [0|15] \"\" ECU\n\
+         SG_ Active m1 : 8|8@1+ (1,0) [0|255] \"\" ECU\n\
+         SG_ Inactive m2 : 16|8@1+ (1,0) [0|255] \"\" ECU\n",
     )
     .unwrap()
 }
@@ -304,6 +321,34 @@ fn strict_aggregate_query_does_not_misclassify_other_same_name_messages() {
     assert!(samples
         .iter()
         .all(|sample| sample.status == DecodeStatus::Ok));
+    fs::remove_file(path).ok();
+}
+
+#[test]
+fn inactive_multiplex_branch_is_omitted_in_both_query_modes() {
+    let path = std::env::temp_dir().join("blf-core-query-inactive-mux-tests.blf");
+    write_muxed_can_blf(&path);
+    let file = File::open(&path).unwrap();
+    let binding = DatabaseBinding::new(
+        BusKind::Can,
+        1,
+        Database::Can(Arc::new(muxed_can_database())),
+    )
+    .unwrap();
+
+    let tolerant = file
+        .signal_query(binding.clone(), "Muxed.Inactive", false)
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert!(tolerant.is_empty());
+
+    let strict = file
+        .signal_query(binding, "Muxed.Inactive", true)
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert!(strict.is_empty());
     fs::remove_file(path).ok();
 }
 

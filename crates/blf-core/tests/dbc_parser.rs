@@ -208,6 +208,47 @@ fn rejects_unsupported_comment_and_attribute_scopes() {
 }
 
 #[test]
+fn enforces_attribute_definition_scope() {
+    let wrong_scope = r#"
+BA_DEF_ SG_ "Custom" INT 0 1;
+BO_ 256 Status: 1 ECU
+ SG_ Value : 0|8@1+ (1,0) [0|255] "" ECU
+BA_ "Custom" BO_ 256 1;
+"#;
+    let error = DbcDatabase::from_str(wrong_scope).unwrap_err();
+    assert!(error.reason.contains("unsupported attribute scope"));
+
+    let wrong_vframe_scope = r#"
+BA_DEF_ SG_ "VFrameFormat" ENUM "StandardCAN","StandardCAN_FD";
+BO_ 256 Status: 1 ECU
+ SG_ Value : 0|8@1+ (1,0) [0|255] "" ECU
+BA_ "VFrameFormat" BO_ 256 14;
+"#;
+    let error = DbcDatabase::from_str(wrong_vframe_scope).unwrap_err();
+    assert!(error.reason.contains("unsupported attribute scope"));
+
+    let wrong_relationship = r#"
+BA_DEF_ "Custom" INT 0 1;
+BA_REL_ "Custom" BU_SG_REL_ ECU SG_ 256 Value 1;
+"#;
+    let error = DbcDatabase::from_str(wrong_relationship).unwrap_err();
+    assert!(error.reason.contains("relationship attribute"));
+}
+
+#[test]
+fn rejects_unimplemented_metadata_outside_namespace() {
+    for keyword in ["CAT_", "FILTER_", "SGTYPE_", "SG_MUL_VAL_"] {
+        let error = DbcDatabase::from_source(
+            "metadata.dbc",
+            &format!("VERSION \"1.0\"\n{keyword} malformed;\n"),
+        )
+        .unwrap_err();
+        assert_eq!(error.field, keyword);
+        assert!(error.reason.contains("unsupported"));
+    }
+}
+
+#[test]
 fn rejects_malformed_comment_scope_structure() {
     for source in [
         "CM_ BO_ 256 extra \"bad\";\n",

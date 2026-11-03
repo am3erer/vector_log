@@ -1,12 +1,12 @@
 //! Small, dependency-free DBC parser.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
 use crate::database::{
-    ByteOrder, CanMessageId, CanSignal, DatabaseError, DatabaseResult, DbcDatabase, DbcMessage,
-    MultiplexRole, SignalType, SourceSpan, ValueTable,
+    ByteOrder, CanMessageId, CanPayloadKind, CanSignal, DatabaseError, DatabaseResult, DbcDatabase,
+    DbcMessage, MultiplexRole, SignalType, SourceSpan, ValueTable,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -269,6 +269,11 @@ fn parse_bo(path: &str, tokens: &[Token], database: &mut DbcDatabase) -> Databas
         name: tokens[2].text.clone(),
         dlc,
         is_fd: false,
+        payload_kind: if dlc > 64 {
+            CanPayloadKind::LogicalContainer
+        } else {
+            CanPayloadKind::Physical
+        },
         signals: Vec::new(),
         comment: None,
         attributes: Default::default(),
@@ -581,7 +586,7 @@ fn parse_attribute(
     path: &str,
     tokens: &[Token],
     database: &mut DbcDatabase,
-    attribute_definitions: &HashSet<String>,
+    attribute_definitions: &HashMap<String, AttributeScope>,
 ) -> DatabaseResult<()> {
     if tokens.len() < 3 || !tokens[1].quoted {
         return Err(error(
@@ -592,7 +597,17 @@ fn parse_attribute(
         ));
     }
     let name = tokens[1].text.clone();
-    let is_defined = name == "VFrameFormat" || attribute_definitions.contains(&name);
+    let expected_scope = match tokens[2].text.as_str() {
+        "BO_" => AttributeScope::Message,
+        "SG_" => AttributeScope::Signal,
+        "BU_" => AttributeScope::Node,
+        "EV_" => AttributeScope::Environment,
+        _ => AttributeScope::Global,
+    };
+    let is_defined = attribute_definitions.get(&name).map_or(
+        name == "VFrameFormat" && expected_scope == AttributeScope::Message,
+        |scope| *scope == expected_scope,
+    );
     match tokens[2].text.as_str() {
         "BO_" => {
             if !is_defined {
@@ -678,10 +693,20 @@ fn require_quoted_token(path: &str, token: Option<&Token>, field: &str) -> Datab
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AttributeScope {
+    Global,
+    Message,
+    Signal,
+    Node,
+    Environment,
+    Relationship(String),
+}
+
 fn parse_standard_metadata(
     path: &str,
     tokens: &[Token],
-    attribute_definitions: &mut HashSet<String>,
+    attribute_definitions: &mut HashMap<String, AttributeScope>,
 ) -> DatabaseResult<()> {
     let keyword = tokens
         .first()
@@ -697,6 +722,24 @@ fn parse_standard_metadata(
     }
     match keyword {
         "BA_DEF_" => {
+            let scope = match tokens.get(1).map(|token| token.text.as_str()) {
+                Some("BO_") => AttributeScope::Message,
+                Some("SG_") => AttributeScope::Signal,
+                Some("BU_") => AttributeScope::Node,
+                Some("EV_") => AttributeScope::Environment,
+                Some(value) if tokens.get(1).is_some_and(|token| token.quoted) => {
+                    let _ = value;
+                    AttributeScope::Global
+                }
+                _ => {
+                    return Err(error(
+                        path,
+                        tokens.get(1),
+                        keyword,
+                        "attribute definition has an invalid scope",
+                    ));
+                }
+            };
             let quoted = tokens.iter().position(|token| token.quoted);
             require_quoted_token(path, quoted.and_then(|index| tokens.get(index)), keyword)?;
             if quoted.is_none_or(|index| index + 1 >= tokens.len()) {
@@ -708,7 +751,7 @@ fn parse_standard_metadata(
                 ));
             }
             if let Some(index) = quoted {
-                attribute_definitions.insert(tokens[index].text.clone());
+                attribute_definitions.insert(tokens[index].text.clone(), scope);
             }
         }
         "BA_DEF_DEF_" | "BA_DEF_DEF_REL_" => {
@@ -723,6 +766,14 @@ fn parse_standard_metadata(
             }
         }
         "BA_DEF_REL_" => {
+            let relationship = tokens.get(1).filter(|token| !token.quoted).ok_or_else(|| {
+                error(
+                    path,
+                    tokens.get(1),
+                    keyword,
+                    "relationship attribute definition is missing its relationship scope",
+                )
+            })?;
             let quoted = tokens.iter().position(|token| token.quoted);
             require_quoted_token(path, quoted.and_then(|index| tokens.get(index)), keyword)?;
             if quoted.is_none_or(|index| index + 1 >= tokens.len()) {
@@ -734,7 +785,10 @@ fn parse_standard_metadata(
                 ));
             }
             if let Some(index) = quoted {
-                attribute_definitions.insert(tokens[index].text.clone());
+                attribute_definitions.insert(
+                    tokens[index].text.clone(),
+                    AttributeScope::Relationship(relationship.text.clone()),
+                );
             }
         }
         "BA_REL_" => {
@@ -746,6 +800,33 @@ fn parse_standard_metadata(
                     keyword,
                     "unsupported or incomplete relationship attribute assignment",
                 ));
+            }
+            let relationship = tokens.get(2).ok_or_else(|| {
+                error(
+                    path,
+                    tokens.last(),
+                    keyword,
+                    "relationship attribute assignment is missing its relationship scope",
+                )
+            })?;
+            match attribute_definitions.get(&tokens[1].text) {
+                Some(AttributeScope::Relationship(expected)) if expected == &relationship.text => {}
+                Some(_) => {
+                    return Err(error(
+                        path,
+                        Some(&tokens[1]),
+                        keyword,
+                        "attribute is not defined as a relationship attribute",
+                    ));
+                }
+                None => {
+                    return Err(error(
+                        path,
+                        Some(&tokens[1]),
+                        keyword,
+                        "relationship attribute is not defined",
+                    ));
+                }
             }
         }
         "BO_TX_BU_" => {
@@ -779,7 +860,14 @@ fn parse_standard_metadata(
                 ));
             }
         }
-        _ => {}
+        _ => {
+            return Err(error(
+                path,
+                tokens.first(),
+                keyword,
+                "unsupported DBC metadata statement",
+            ));
+        }
     }
     Ok(())
 }
@@ -830,7 +918,7 @@ fn parse_line(
     line_number: usize,
     current_message: Option<CanMessageId>,
     database: &mut DbcDatabase,
-    attribute_definitions: &mut HashSet<String>,
+    attribute_definitions: &mut HashMap<String, AttributeScope>,
 ) -> DatabaseResult<()> {
     let content = without_line_comment(line);
     let mut tokens = lex_line(path, content, line_number)?;
@@ -906,12 +994,7 @@ fn parse_line(
             Ok(())
         }
         "BA_DEF_" | "BA_DEF_DEF_" | "BA_DEF_REL_" | "BA_DEF_DEF_REL_" | "BA_REL_" | "BO_TX_BU_"
-        | "SIG_GROUP_" | "CAT_DEF_" | "CAT_" | "FILTER_" | "EV_DATA_" | "ENVVAR_DATA_"
-        | "SGTYPE_" | "SGTYPE_VAL_" | "BA_DEF_SGTYPE_" | "BA_SGTYPE_" | "SIG_TYPE_REF_"
-        | "VAL_TABLE_" | "SIG_VALTYPE_" | "SIGTYPE_VALTYPE_" | "BU_SG_REL_" | "BU_EV_REL_"
-        | "BU_BO_REL_" | "SG_MUL_VAL_" => {
-            parse_standard_metadata(path, &tokens, attribute_definitions)
-        }
+        | "SIG_GROUP_" => parse_standard_metadata(path, &tokens, attribute_definitions),
         other => Err(error(
             path,
             tokens.first(),
@@ -942,7 +1025,7 @@ impl DbcDatabase {
         let mut in_namespace_declaration = false;
         let mut logical_line = String::new();
         let mut logical_start = 0;
-        let mut attribute_definitions = HashSet::new();
+        let mut attribute_definitions = HashMap::new();
         for (line_index, line) in source.lines().enumerate() {
             if logical_line.is_empty() {
                 logical_start = line_index + 1;

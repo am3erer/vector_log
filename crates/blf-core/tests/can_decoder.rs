@@ -1,6 +1,7 @@
 use blf_core::{
     decode_message, decode_signal, decode_signal_for_message, message_for_id, ByteOrder,
-    CanDecodeError, CanMessageId, CanSignal, DbcDatabase, DbcMessage, MultiplexRole, SignalType,
+    CanDecodeError, CanMessageId, CanPayloadKind, CanSignal, DbcDatabase, DbcMessage,
+    MultiplexRole, SignalType,
 };
 
 fn signal(name: &str, start: u16, length: u16, order: ByteOrder, kind: SignalType) -> CanSignal {
@@ -66,6 +67,7 @@ fn rejects_short_payload_and_out_of_range_physical_value() {
         name: "Message".to_string(),
         dlc: 8,
         is_fd: false,
+        payload_kind: CanPayloadKind::Physical,
         signals: vec![value.clone()],
         comment: None,
         attributes: Default::default(),
@@ -100,6 +102,7 @@ fn logical_vector_message_uses_signal_width_for_physical_query_decode() {
         name: "CLMIF".to_string(),
         dlc: 196,
         is_fd: false,
+        payload_kind: CanPayloadKind::LogicalContainer,
         signals: vec![signal(
             "Selector",
             0,
@@ -117,6 +120,31 @@ fn logical_vector_message_uses_signal_width_for_physical_query_decode() {
     assert_eq!(decoded.raw_value, 7);
     assert!(matches!(
         decode_message(&message, &[7]),
+        Err(CanDecodeError::PayloadTooShort { required: 196, .. })
+    ));
+}
+
+#[test]
+fn physical_oversized_message_still_requires_the_declared_payload() {
+    let message = DbcMessage {
+        id: CanMessageId::new(0x123, false),
+        name: "MalformedPhysical".to_string(),
+        dlc: 196,
+        is_fd: false,
+        payload_kind: CanPayloadKind::Physical,
+        signals: vec![signal(
+            "Selector",
+            0,
+            8,
+            ByteOrder::LittleEndian,
+            SignalType::Unsigned,
+        )],
+        comment: None,
+        attributes: Default::default(),
+        source: None,
+    };
+    assert!(matches!(
+        decode_signal_for_message(&message, "Selector", &[7]),
         Err(CanDecodeError::PayloadTooShort { required: 196, .. })
     ));
 }
@@ -144,6 +172,7 @@ fn targeted_decode_ignores_unrelated_invalid_signals() {
         name: "Status".to_string(),
         dlc: 1,
         is_fd: false,
+        payload_kind: CanPayloadKind::Physical,
         signals: vec![requested, unrelated],
         comment: None,
         attributes: Default::default(),
@@ -178,6 +207,7 @@ fn multiplex_decodes_selector_and_only_active_branch() {
         name: "Muxed".to_string(),
         dlc: 3,
         is_fd: false,
+        payload_kind: CanPayloadKind::Physical,
         signals: vec![
             CanSignal {
                 multiplex: MultiplexRole::Selector,

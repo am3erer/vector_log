@@ -106,6 +106,14 @@ pub enum SignalType {
     Signed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CanPayloadKind {
+    /// A normal CAN or CAN-FD frame whose DLC describes the physical payload.
+    Physical,
+    /// A Vector logical/container message whose DBC DLC is application-level.
+    LogicalContainer,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub enum MultiplexRole {
     #[default]
@@ -175,6 +183,7 @@ pub struct DbcMessage {
     pub name: String,
     pub dlc: u8,
     pub is_fd: bool,
+    pub payload_kind: CanPayloadKind,
     pub signals: Vec<CanSignal>,
     pub comment: Option<String>,
     pub attributes: BTreeMap<String, String>,

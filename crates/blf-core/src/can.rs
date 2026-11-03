@@ -2,7 +2,9 @@
 
 use thiserror::Error;
 
-use crate::database::{ByteOrder, CanSignal, DbcDatabase, DbcMessage, MultiplexRole, SignalType};
+use crate::database::{
+    ByteOrder, CanPayloadKind, CanSignal, DbcDatabase, DbcMessage, MultiplexRole, SignalType,
+};
 
 #[derive(Debug, Clone, PartialEq, Error)]
 pub enum CanDecodeError {
@@ -158,7 +160,7 @@ pub fn decode_signal_for_message(
     // Ordinary CAN/CAN-FD messages have a physical DLC.  Logical Vector
     // container messages may declare a larger application-level DLC, so those
     // continue to validate only the requested signal's bit range below.
-    if message.dlc <= 64 && data.len() < usize::from(message.dlc) {
+    if message.payload_kind == CanPayloadKind::Physical && data.len() < usize::from(message.dlc) {
         return Err(CanDecodeError::PayloadTooShort {
             required: usize::from(message.dlc),
             actual: data.len(),

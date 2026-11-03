@@ -365,17 +365,10 @@ impl SignalQuery {
                     signal,
                     data,
                 ))),
-                Ok(None) => results.push(Ok(error_sample(
-                    timestamp_ns,
-                    BusKind::Can,
-                    channel,
-                    id,
-                    message_name,
-                    signal_name,
-                    DecodeStatus::DecodeError,
-                    format!("CAN multiplex signal {signal_name:?} is inactive"),
-                    data,
-                ))),
+                // A named branch that is not selected by this frame is not a
+                // decoding failure. Exact signal queries omit it, matching
+                // decode_message's multiplex semantics in both modes.
+                Ok(None) => {}
                 Err(error) => results.push(Ok(error_sample(
                     timestamp_ns,
                     BusKind::Can,
