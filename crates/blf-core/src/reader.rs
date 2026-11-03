@@ -24,9 +24,12 @@ const MAX_OBJECT_SIGNATURE_SCAN: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, Copy)]
 pub struct ReaderOptions {
     pub strict: bool,
-    /// Preserve truly unknown object IDs as `Object::Raw` instead of skipping them.
-    /// The default follows the Vector-compatible reader contract and skips them.
+    /// Preserve truly unknown object IDs as `Object::Raw`.
     pub preserve_unknown_objects: bool,
+    /// Skip truly unknown object IDs instead of returning `Object::Raw`.
+    /// This is retained as an explicit override for callers that enable raw
+    /// preservation globally and still want a filtered stream.
+    pub skip_unknown_objects: bool,
     pub max_uncompressed_container_size: u64,
     pub max_object_size: u64,
     pub max_object_signature_scan: usize,
@@ -37,6 +40,7 @@ impl Default for ReaderOptions {
         Self {
             strict: false,
             preserve_unknown_objects: false,
+            skip_unknown_objects: false,
             max_uncompressed_container_size: MAX_UNCOMPRESSED_CONTAINER_SIZE,
             max_object_size: u64::from(u32::MAX),
             max_object_signature_scan: MAX_OBJECT_SIGNATURE_SCAN,
@@ -326,11 +330,13 @@ impl File {
                             return Err(BlfError::UnsupportedObject(base.raw_object_type));
                         }
                         if base.object_type == ObjectType::Unknown {
-                            if self.options.preserve_unknown_objects {
-                                Ok(Some(Object::Raw(parse_raw_object(slice, base)?)))
-                            } else {
+                            if self.options.skip_unknown_objects
+                                || !self.options.preserve_unknown_objects
+                            {
                                 self.decompressed_pos = stream_end;
                                 Ok(None)
+                            } else {
+                                Ok(Some(Object::Raw(parse_raw_object(slice, base)?)))
                             }
                         } else {
                             Ok(Some(Object::Structured(parse_structured_object(
@@ -407,7 +413,17 @@ impl File {
             .ok_or(BlfError::Truncated)?;
 
         let mut decompressed = match compression_method {
-            0 => compressed.to_vec(),
+            0 => {
+                let actual = compressed.len() as u64;
+                if actual > self.options.max_uncompressed_container_size {
+                    return Err(BlfError::Limit {
+                        kind: "uncompressed log container",
+                        limit: self.options.max_uncompressed_container_size,
+                        actual,
+                    });
+                }
+                compressed.to_vec()
+            }
             2 => {
                 let uncompressed_size_usize = usize::try_from(uncompressed_size).map_err(|_| {
                     BlfError::Format("uncompressed size does not fit usize".to_string())

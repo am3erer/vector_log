@@ -198,14 +198,18 @@ fn decode_source(bytes: Vec<u8>) -> String {
 }
 
 fn parse_f64(path: &str, token: &Token, field: &str) -> DatabaseResult<f64> {
-    token.text.parse().map_err(|_| {
+    let value = token.text.parse::<f64>().map_err(|_| {
         error(
             path,
             Some(token),
             field,
             format!("invalid number {:?}", token.text),
         )
-    })
+    })?;
+    if !value.is_finite() {
+        return Err(error(path, Some(token), field, "number must be finite"));
+    }
+    Ok(value)
 }
 
 fn expect<'a>(
@@ -407,6 +411,14 @@ fn parse_signal(
             .ok_or_else(|| error(path, tokens.last(), "maximum", "missing maximum"))?,
         "maximum",
     )?;
+    if minimum > maximum {
+        return Err(error(
+            path,
+            tokens.get(index - 1),
+            "limits",
+            "minimum must not exceed maximum",
+        ));
+    }
     index += 1;
     expect(path, tokens, index, "]", "SG_")?;
     index += 1;
@@ -458,6 +470,8 @@ fn parse_signal(
                     "receiver must be an ECU name",
                 ));
             }
+            // Accept both comma-separated and legacy whitespace-separated
+            // receiver lists emitted by existing DBC generators.
             index += 1;
         }
     }

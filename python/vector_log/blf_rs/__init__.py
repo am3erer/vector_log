@@ -105,8 +105,63 @@ class SignalQuery:
 
 
 class File:
-    def __init__(self, native):
+    def __init__(
+        self,
+        path=None,
+        mode="r",
+        *,
+        strict=None,
+        max_container_size=None,
+        max_object_size=None,
+        max_signature_scan=None,
+        preserve_unknown_objects=None,
+        skip_unknown_objects=None,
+        native=None,
+    ):
+        if native is not None and path is not None:
+            raise TypeError("native and path cannot both be provided")
         self._native = native
+        if path is not None:
+            if isinstance(path, (str, bytes)) or hasattr(path, "__fspath__"):
+                self.open(
+                    path,
+                    mode,
+                    strict=strict,
+                    max_container_size=max_container_size,
+                    max_object_size=max_object_size,
+                    max_signature_scan=max_signature_scan,
+                    preserve_unknown_objects=preserve_unknown_objects,
+                    skip_unknown_objects=skip_unknown_objects,
+                )
+            else:
+                # Preserve the original public File(native) constructor while
+                # allowing the path-opening facade introduced by this API.
+                self._native = path
+
+    def open(
+        self,
+        path,
+        mode="r",
+        *,
+        strict=None,
+        max_container_size=None,
+        max_object_size=None,
+        max_signature_scan=None,
+        preserve_unknown_objects=None,
+        skip_unknown_objects=None,
+    ):
+        if mode not in ("r", "rb"):
+            raise ValueError("BLF files are read-only; mode must be 'r' or 'rb'")
+        self._native = _core.open(
+            os.fspath(path),
+            strict,
+            max_container_size,
+            max_object_size,
+            max_signature_scan,
+            preserve_unknown_objects,
+            skip_unknown_objects,
+        )
+        return self
 
     @property
     def file_statistics(self):
@@ -117,13 +172,13 @@ class File:
         return self.file_statistics
 
     def is_open(self):
-        return self._native.is_open()
+        return self._native is not None and self._native.is_open()
 
     def good(self):
-        return self._native.good()
+        return self._native is not None and self._native.good()
 
     def eof(self):
-        return self._native.eof()
+        return self._native is None or self._native.eof()
 
     @property
     def current_uncompressed_file_size(self):
@@ -150,6 +205,14 @@ class File:
         return self._native.max_signature_scan
 
     @property
+    def preserve_unknown_objects(self):
+        return self._native.preserve_unknown_objects
+
+    @property
+    def skip_unknown_objects(self):
+        return self._native.skip_unknown_objects
+
+    @property
     def write_restore_points(self):
         return self._native.write_restore_points
 
@@ -170,16 +233,31 @@ class File:
         return self.write_restore_points
 
     def close(self):
-        self._native.close()
+        if self._native is not None:
+            self._native.close()
+
+    def _require_native(self):
+        if self._native is None:
+            raise ValueError("BLF file is not open")
+        return self._native
+
+    def _require_open_native(self):
+        native = self._require_native()
+        if not native.is_open():
+            raise ValueError("BLF file is not open")
+        return native
 
     def read(self):
-        data = self._native.read()
+        data = self._require_native().read()
         if data is None:
             return None
         return object_from_data(data)
 
     def read_batch(self, max_objects):
-        return [object_from_data(data) for data in self._native.read_batch(max_objects)]
+        return [
+            object_from_data(data)
+            for data in self._require_native().read_batch(max_objects)
+        ]
 
     def bind_database(self, bus, channel, database):
         if isinstance(database, (str, bytes)) or hasattr(database, "__fspath__"):
@@ -188,13 +266,15 @@ class File:
         return self
 
     def signal(self, signal_name, *, bus, channel, strict=False):
+        native = self._require_open_native()
         return SignalQuery(
-            self._native.signal(str(signal_name), str(bus), int(channel), bool(strict))
+            native.signal(str(signal_name), str(bus), int(channel), bool(strict))
         )
 
     def signals(self, name, *, bus, channel, strict=False):
+        native = self._require_open_native()
         return SignalQuery(
-            self._native.signals(str(name), str(bus), int(channel), bool(strict))
+            native.signals(str(name), str(bus), int(channel), bool(strict))
         )
 
     def read_numpy(self, max_objects=None, *, data_width=None):
@@ -299,16 +379,18 @@ def open(
     max_container_size=None,
     max_object_size=None,
     max_signature_scan=None,
+    preserve_unknown_objects=None,
+    skip_unknown_objects=None,
     databases=None,
 ):
     reader = File(
-        _core.open(
-            os.fspath(path),
-            strict,
-            max_container_size,
-            max_object_size,
-            max_signature_scan,
-        )
+        path,
+        strict=strict,
+        max_container_size=max_container_size,
+        max_object_size=max_object_size,
+        max_signature_scan=max_signature_scan,
+        preserve_unknown_objects=preserve_unknown_objects,
+        skip_unknown_objects=skip_unknown_objects,
     )
     for binding, database in (databases or {}).items():
         try:

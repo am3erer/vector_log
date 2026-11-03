@@ -740,6 +740,9 @@ pub struct LinSignal {
     pub offset: f64,
     pub minimum: Option<f64>,
     pub maximum: Option<f64>,
+    /// All physical encoding ranges associated with this signal.  The scalar
+    /// fields above remain as a compatibility view of the first range.
+    pub physical_ranges: Vec<LinPhysicalRange>,
     pub encoding: Option<String>,
     pub choices: ValueTable,
     pub source: Option<SourceSpan>,
@@ -800,6 +803,21 @@ pub struct LdfOptionalSection {
     pub source: Option<SourceSpan>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LinDynamicFrameKind {
+    Sporadic,
+    EventTriggered,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinDynamicFrame {
+    pub name: String,
+    pub kind: LinDynamicFrameKind,
+    pub trigger_frame_id: Option<u8>,
+    pub frame_names: Vec<String>,
+    pub source: Option<SourceSpan>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LinSignalRef {
     pub frame_id: u8,
@@ -817,6 +835,7 @@ pub struct LdfDatabase {
     pub(crate) schedules: BTreeMap<String, Vec<LinScheduleEntry>>,
     pub(crate) encodings: BTreeMap<String, LinEncoding>,
     pub(crate) optional_sections: Vec<LdfOptionalSection>,
+    pub(crate) dynamic_frames: Vec<LinDynamicFrame>,
     frames_by_id: BTreeMap<u8, Arc<LinFrame>>,
     frames_by_name: HashMap<String, u8>,
     signals_by_qualified_name: HashMap<String, LinSignalRef>,
@@ -840,6 +859,7 @@ impl LdfDatabase {
             schedules: BTreeMap::new(),
             encodings: BTreeMap::new(),
             optional_sections: Vec::new(),
+            dynamic_frames: Vec::new(),
             frames_by_id: BTreeMap::new(),
             frames_by_name: HashMap::new(),
             signals_by_qualified_name: HashMap::new(),
@@ -944,11 +964,17 @@ impl LdfDatabase {
                 found = true;
                 signal.encoding = Some(encoding_name.to_string());
                 signal.choices = encoding.logical_values.clone();
+                signal.physical_ranges = encoding.physical_ranges.clone();
                 if let Some(range) = encoding.physical_ranges.first() {
                     signal.factor = range.factor;
                     signal.offset = range.offset;
                     signal.minimum = Some(range.minimum);
                     signal.maximum = Some(range.maximum);
+                } else {
+                    signal.factor = 1.0;
+                    signal.offset = 0.0;
+                    signal.minimum = None;
+                    signal.maximum = None;
                 }
             }
         }
@@ -1008,6 +1034,21 @@ impl LdfDatabase {
     /// silently discarded when ordinary frame decoding does not use them.
     pub fn optional_sections(&self) -> impl Iterator<Item = &LdfOptionalSection> {
         self.optional_sections.iter()
+    }
+
+    pub fn dynamic_frames(&self) -> impl Iterator<Item = &LinDynamicFrame> {
+        self.dynamic_frames.iter()
+    }
+
+    pub fn dynamic_frames_for_id(&self, id: u8) -> impl Iterator<Item = &LinDynamicFrame> {
+        let frame_name = self.frame_by_id(id).map(|frame| frame.name.as_str());
+        self.dynamic_frames.iter().filter(move |dynamic| {
+            frame_name.is_some_and(|name| dynamic.frame_names.iter().any(|frame| frame == name))
+        })
+    }
+
+    pub fn dynamic_frame_for_id(&self, id: u8) -> Option<&LinDynamicFrame> {
+        self.dynamic_frames_for_id(id).next()
     }
 
     pub fn len(&self) -> usize {

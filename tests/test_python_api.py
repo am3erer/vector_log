@@ -1,3 +1,4 @@
+import os
 import struct
 
 import pytest
@@ -5,8 +6,10 @@ import pytest
 from vector_log.blf_rs.classes import SignalSample, object_from_data
 from vector_log.blf_rs import (
     DbcDatabase,
+    File,
     LdfDatabase,
     SignalQueryError,
+    _core,
     open,
 )
 from vector_log.blf_rs.export import (
@@ -105,6 +108,21 @@ Signal_encoding_types {
 
 Signal_representation {
   StateEncoding: State ;
+}
+'''
+
+
+LDF_MULTI_RANGE = LDF[:-1] + r'''
+
+Signal_encoding_types {
+  ValueEncoding {
+    physical_value, 0, 10, 1, 0, "unit" ;
+    physical_value, 11, 20, 0.5, 5, "unit" ;
+  }
+}
+
+Signal_representation {
+  ValueEncoding: State ;
 }
 '''
 
@@ -380,6 +398,63 @@ def test_python_ldf_metadata_view_exposes_all_native_fields():
     assert qualified["signal"] == signal
     assert ldf.signal("Missing.Signal") is None
     assert ldf.frame_by_id(2) is None
+
+
+def test_python_ldf_signal_view_preserves_multiple_physical_ranges():
+    ldf = LdfDatabase.from_str(LDF_MULTI_RANGE)
+
+    signal = ldf.frame_by_id(1)["signals"][0]
+    assert signal["encoding"] == "ValueEncoding"
+    assert signal["factor"] == 1.0
+    assert signal["offset"] == 0.0
+    assert signal["physical_ranges"] == [
+        {
+            "minimum": 0.0,
+            "maximum": 10.0,
+            "factor": 1.0,
+            "offset": 0.0,
+            "unit": "unit",
+            "text": None,
+        },
+        {
+            "minimum": 11.0,
+            "maximum": 20.0,
+            "factor": 0.5,
+            "offset": 5.0,
+            "unit": "unit",
+            "text": None,
+        },
+    ]
+    assert ldf.encodings["ValueEncoding"]["physical_ranges"] == signal["physical_ranges"]
+
+
+def test_python_ldf_dynamic_frame_metadata_is_structured():
+    source = """
+LIN_description_file;
+Nodes { Master: ECU, 5 ms, 0.1 ms ; }
+Signals { State: 1, 0, ECU, ECU ; }
+Frames { Status: 1, ECU, 1 { State, 0 ; } }
+Sporadic_frames { StatusGroup { Status ; } }
+Event_triggered_frames { Trigger { Status, Status ; } }
+"""
+    ldf = LdfDatabase.from_str(source)
+
+    assert ldf.dynamic_frames == [
+        {
+            "name": "StatusGroup",
+            "kind": "sporadic",
+            "trigger_frame_id": None,
+            "frame_names": ["Status"],
+            "source": {"line": 6, "column": 19},
+        },
+        {
+            "name": "Trigger",
+            "kind": "event_triggered",
+            "trigger_frame_id": None,
+            "frame_names": ["Status", "Status"],
+            "source": {"line": 7, "column": 26},
+        },
+    ]
 
 
 def test_python_signal_query_preserves_context_and_cursor(tmp_path):
@@ -724,10 +799,50 @@ def test_database_binding_requires_explicit_protocol_channel(tmp_path):
 
     with pytest.raises(SignalQueryError, match="no can database is bound to channel 1"):
         reader.signal("FirstStatus.Speed", bus="can", channel=1)
+    with pytest.raises(SignalQueryError, match="no can database is bound to channel 1"):
+        reader.signals("Speed", bus="can", channel=1)
 
     reader.bind_database("can", 1, DbcDatabase.from_str(DBC))
     with pytest.raises(SignalQueryError, match="not present"):
         reader.signal("Missing.Signal", bus="can", channel=1)
+
+
+def test_file_supports_constructible_and_reopenable_compatibility_api(tmp_path):
+    blf_path = tmp_path / "file-api.blf"
+    _write_blf(blf_path)
+
+    reader = File()
+    assert not reader.is_open()
+    with pytest.raises(ValueError, match="BLF file is not open"):
+        reader.read()
+    with pytest.raises(ValueError, match="BLF file is not open"):
+        reader.read_batch(1)
+    with pytest.raises(ValueError, match="BLF file is not open"):
+        reader.signal("Status.Speed", bus="can", channel=1)
+    with pytest.raises(ValueError, match="BLF file is not open"):
+        reader.signals("Speed", bus="can", channel=1)
+    assert reader.open(blf_path, "r") is reader
+    assert reader.is_open()
+    assert reader.read().class_name == "CanMessage"
+    reader.close()
+    assert not reader.is_open()
+    assert reader.read() is None
+    reader = File(blf_path)
+    reader.bind_database("can", 1, DbcDatabase.from_str(DBC))
+    reader.close()
+    with pytest.raises(ValueError, match="BLF file is not open"):
+        reader.signal("FirstStatus.Speed", bus="can", channel=1)
+    with pytest.raises(ValueError, match="BLF file is not open"):
+        reader.signals("Speed", bus="can", channel=1)
+
+    reader = File(blf_path)
+    assert reader.read().class_name == "CanMessage"
+    reader.close()
+
+    native = _core.open(os.fspath(blf_path))
+    reader = File(native)
+    assert reader.read().class_name == "CanMessage"
+    reader.close()
 
 
 def test_database_binding_replaces_existing_protocol_channel_binding(tmp_path):

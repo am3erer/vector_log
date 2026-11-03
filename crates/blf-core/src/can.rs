@@ -41,6 +41,11 @@ pub enum CanDecodeError {
     MultipleMultiplexSelectors { message: String },
     #[error("CAN multiplex selector {value} is invalid for message {message:?}")]
     InvalidMultiplexSelector { message: String, value: i128 },
+    #[error("CAN signal {signal:?} has invalid numeric metadata: {reason}")]
+    InvalidMetadata {
+        signal: String,
+        reason: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -68,12 +73,40 @@ pub fn message_for_id(
 }
 
 pub fn decode_signal(signal: &CanSignal, data: &[u8]) -> Result<DecodedCanSignal, CanDecodeError> {
+    if !signal.factor.is_finite() || !signal.offset.is_finite() {
+        return Err(CanDecodeError::InvalidMetadata {
+            signal: signal.name.clone(),
+            reason: "factor and offset must be finite",
+        });
+    }
+    if signal.minimum.is_some_and(|value| !value.is_finite())
+        || signal.maximum.is_some_and(|value| !value.is_finite())
+    {
+        return Err(CanDecodeError::InvalidMetadata {
+            signal: signal.name.clone(),
+            reason: "limits must be finite",
+        });
+    }
+    if let (Some(minimum), Some(maximum)) = (signal.minimum, signal.maximum) {
+        if minimum > maximum {
+            return Err(CanDecodeError::InvalidMetadata {
+                signal: signal.name.clone(),
+                reason: "minimum must not exceed maximum",
+            });
+        }
+    }
     let raw_bits = extract_raw(signal, data)?;
     let raw_value = match signal.signal_type {
         SignalType::Unsigned => i128::from(raw_bits),
         SignalType::Signed => i128::from(sign_extend(raw_bits, signal.bit_length)),
     };
     let physical_value = raw_value as f64 * signal.factor + signal.offset;
+    if !physical_value.is_finite() {
+        return Err(CanDecodeError::InvalidMetadata {
+            signal: signal.name.clone(),
+            reason: "decoded physical value is not finite",
+        });
+    }
     let minimum = signal.minimum.unwrap_or(f64::NEG_INFINITY);
     let maximum = signal.maximum.unwrap_or(f64::INFINITY);
     if physical_value < minimum || physical_value > maximum {

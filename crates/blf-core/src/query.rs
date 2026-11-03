@@ -11,7 +11,7 @@ use crate::database::{
     LinFrame, LinSignal,
 };
 use crate::ldf::{decode_lin_signal, DecodedLinSignal, LinDecodeError};
-use crate::lin::{classify_lin_object, LinObservation, LinResponseState};
+use crate::lin::{classify_lin_object, LinResponseState};
 use crate::reader::File;
 use crate::sample::{DecodeStatus, SampleValue, SignalSample};
 use crate::types::{FieldValue, LinObject, Object};
@@ -38,6 +38,8 @@ pub enum QueryError {
     DuplicateBinding { bus: BusKind, channel: u16 },
     #[error("query object has no usable BLF timestamp")]
     MissingTimestamp,
+    #[error("BLF reader is not open")]
+    ReaderClosed,
     #[error("signal decode failed: {0}")]
     Decode(String),
 }
@@ -457,7 +459,7 @@ impl SignalQuery {
             let Some(frame) = database.frame_by_id(frame_id) else {
                 continue;
             };
-            if !observation.state.has_response() {
+            if !observation.has_safe_payload() {
                 results.push(Ok(error_sample(
                     timestamp_ns,
                     BusKind::Lin,
@@ -474,14 +476,55 @@ impl SignalQuery {
                 )));
                 continue;
             }
-            let decoded = if observation.state == LinResponseState::ChecksumError {
-                frame
-                    .signal(signal_name)
-                    .map(|signal| decode_lin_signal(signal, payload))
-                    .transpose()
-            } else {
-                decode_lin_frame_for_signal(database, frame, frame_id, &observation, signal_name)
-            };
+            let mut status = lin_status(observation.state);
+            let mut diagnostic = observation.error.clone();
+            let decoded = frame
+                .signal(signal_name)
+                .map(|signal| decode_lin_signal_for_frame(frame, signal, payload))
+                .transpose();
+            // Checksum/parity is a status overlay. The bytes are still useful
+            // when the complete frame payload is present, but a short payload
+            // must never be promoted to a valid signal value.
+            if status == DecodeStatus::Ok {
+                if let Some(checksum) = observation.checksum {
+                    let model = observation.checksum_model.unwrap_or(frame.checksum);
+                    if let Err(error) =
+                        crate::validate_lin_checksum(frame_id, payload, checksum, model)
+                    {
+                        status = DecodeStatus::ChecksumError;
+                        diagnostic = Some(error.to_string());
+                    }
+                }
+            }
+            let dynamic_groups: Vec<_> = database.dynamic_frames_for_id(frame_id).collect();
+            if !dynamic_groups.is_empty() {
+                let groups = dynamic_groups
+                    .iter()
+                    .map(|dynamic| {
+                        let kind = match dynamic.kind {
+                            crate::LinDynamicFrameKind::Sporadic => "sporadic",
+                            crate::LinDynamicFrameKind::EventTriggered => "event-triggered",
+                        };
+                        let trigger = dynamic
+                            .trigger_frame_id
+                            .map_or_else(|| "unresolved".to_string(), |id| format!("0x{id:02X}"));
+                        format!("{kind} {:?} (trigger={trigger})", dynamic.name)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let dynamic_diagnostic = format!(
+                    "LIN frame 0x{frame_id:02X} response trigger context is not present in BLF record; groups: {groups}"
+                );
+                if status == DecodeStatus::Ok {
+                    status = DecodeStatus::DynamicFrame;
+                    diagnostic = Some(dynamic_diagnostic);
+                } else {
+                    diagnostic = Some(match diagnostic {
+                        Some(existing) => format!("{existing}; {dynamic_diagnostic}"),
+                        None => dynamic_diagnostic,
+                    });
+                }
+            }
             match decoded {
                 Ok(Some(value)) => results.push(Ok(lin_sample(
                     timestamp_ns,
@@ -490,7 +533,8 @@ impl SignalQuery {
                     frame,
                     value,
                     payload,
-                    lin_status(observation.state),
+                    status,
+                    diagnostic,
                 ))),
                 Ok(None) => {}
                 Err(error) => results.push(Ok(error_sample(
@@ -517,6 +561,9 @@ impl File {
         signal_name: impl Into<String>,
         strict: bool,
     ) -> Result<SignalQuery, QueryError> {
+        if !self.is_open() {
+            return Err(QueryError::ReaderClosed);
+        }
         SignalQuery::new(self, vec![binding], signal_name, strict)
     }
 
@@ -526,6 +573,9 @@ impl File {
         signal_name: impl Into<String>,
         strict: bool,
     ) -> Result<SignalQuery, QueryError> {
+        if !self.is_open() {
+            return Err(QueryError::ReaderClosed);
+        }
         SignalQuery::aggregate(self, bindings, signal_name, strict)
     }
 }
@@ -619,35 +669,18 @@ fn lin_decode_status(error: &LinDecodeError) -> DecodeStatus {
     }
 }
 
-fn decode_lin_frame_for_signal(
-    _database: &LdfDatabase,
+fn decode_lin_signal_for_frame(
     frame: &LinFrame,
-    frame_id: u8,
-    observation: &LinObservation,
-    signal_name: &str,
-) -> Result<Option<DecodedLinSignal>, LinDecodeError> {
-    let payload = observation
-        .payload
-        .as_deref()
-        .ok_or(LinDecodeError::InvalidResponse {
-            state: observation.state,
-        })?;
+    signal: &LinSignal,
+    payload: &[u8],
+) -> Result<DecodedLinSignal, LinDecodeError> {
     if payload.len() < usize::from(frame.dlc) {
         return Err(LinDecodeError::PayloadTooShort {
             required: usize::from(frame.dlc),
             actual: payload.len(),
         });
     }
-    // Keep checksum validation in the common decoder. Checksum-error objects
-    // are handled above so their safely extractable signal value is retained.
-    if let Some(checksum) = observation.checksum {
-        let model = observation.checksum_model.unwrap_or(frame.checksum);
-        crate::validate_lin_checksum(frame_id, payload, checksum, model)?;
-    }
-    frame
-        .signal(signal_name)
-        .map(|signal| decode_lin_signal(signal, payload))
-        .transpose()
+    decode_lin_signal(signal, payload)
 }
 
 fn can_sample(
@@ -673,6 +706,7 @@ fn can_sample(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lin_sample(
     timestamp_ns: u64,
     channel: u16,
@@ -681,6 +715,7 @@ fn lin_sample(
     decoded: DecodedLinSignal,
     data: &[u8],
     status: DecodeStatus,
+    error: Option<String>,
 ) -> SignalSample {
     let mut sample = SignalSample::ok(
         timestamp_ns,
@@ -697,7 +732,7 @@ fn lin_sample(
     );
     sample.status = status;
     if status.is_error() {
-        sample.error = Some(status.to_string());
+        sample.error = Some(error.unwrap_or_else(|| status.to_string()));
     }
     sample
 }

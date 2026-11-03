@@ -12,8 +12,9 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::database::{
-    DatabaseError, DatabaseResult, LdfDatabase, LdfOptionalSection, LinChecksum, LinEncoding,
-    LinFrame, LinNode, LinPhysicalRange, LinScheduleEntry, LinSignal, SourceSpan, ValueTable,
+    DatabaseError, DatabaseResult, LdfDatabase, LdfOptionalSection, LinChecksum, LinDynamicFrame,
+    LinDynamicFrameKind, LinEncoding, LinFrame, LinNode, LinPhysicalRange, LinScheduleEntry,
+    LinSignal, SourceSpan, ValueTable,
 };
 use crate::lin::{classify_lin_object, LinObservation, LinResponseState};
 use crate::types::LinObject;
@@ -38,6 +39,13 @@ pub enum LdfParseError {
     ChecksumMismatch { expected: u8, actual: u8 },
     #[error("LIN response is not decodable: {state:?}")]
     InvalidResponse { state: LinResponseState },
+    #[error("LIN signal {signal:?} has no physical encoding range for raw value {raw_value}")]
+    NoPhysicalRange { signal: String, raw_value: u64 },
+    #[error("LIN signal {signal:?} has invalid numeric metadata: {reason}")]
+    InvalidMetadata {
+        signal: String,
+        reason: &'static str,
+    },
 }
 
 pub type LinDecodeError = LdfParseError;
@@ -95,6 +103,8 @@ fn lex(path: &str, source: &str) -> DatabaseResult<Vec<Token>> {
             continue;
         }
         if current == '/' && chars.get(index + 1) == Some(&'*') {
+            let comment_line = line;
+            let comment_column = column;
             index += 2;
             column += 2;
             let mut closed = false;
@@ -116,7 +126,12 @@ fn lex(path: &str, source: &str) -> DatabaseResult<Vec<Token>> {
             if !closed {
                 return Err(db_error(
                     path,
-                    None,
+                    Some(&Token {
+                        text: "/*".to_string(),
+                        line: comment_line,
+                        column: comment_column,
+                        quoted: false,
+                    }),
                     "comment",
                     "unterminated block comment",
                 ));
@@ -155,7 +170,17 @@ fn lex(path: &str, source: &str) -> DatabaseResult<Vec<Token>> {
                 }
             }
             if !closed {
-                return Err(db_error(path, None, "string", "unterminated quoted string"));
+                return Err(db_error(
+                    path,
+                    Some(&Token {
+                        text: "\"".to_string(),
+                        line: token_line,
+                        column: token_column,
+                        quoted: true,
+                    }),
+                    "string",
+                    "unterminated quoted string",
+                ));
             }
             tokens.push(Token {
                 text: value,
@@ -212,14 +237,18 @@ fn parse_u32(path: &str, token: &Token, field: &str) -> DatabaseResult<u32> {
 }
 
 fn parse_f64(path: &str, token: &Token, field: &str) -> DatabaseResult<f64> {
-    token.text.parse().map_err(|_| {
+    let value = token.text.parse::<f64>().map_err(|_| {
         db_error(
             path,
             Some(token),
             field,
             format!("invalid number {:?}", token.text),
         )
-    })
+    })?;
+    if !value.is_finite() {
+        return Err(db_error(path, Some(token), field, "number must be finite"));
+    }
+    Ok(value)
 }
 
 fn parse_u8(path: &str, token: &Token, field: &str) -> DatabaseResult<u8> {
@@ -419,6 +448,7 @@ fn parse_signal_definition(
         offset: 0.0,
         minimum: None,
         maximum: None,
+        physical_ranges: Vec::new(),
         encoding: None,
         choices: ValueTable::default(),
         source: Some(SourceSpan::new(name.line, name.column)),
@@ -594,9 +624,19 @@ fn parse_encoding(
                         "expected minimum, maximum, factor, offset, and optional unit/text",
                     ));
                 }
+                let minimum = parse_f64(path, significant[1], "minimum")?;
+                let maximum = parse_f64(path, significant[2], "maximum")?;
+                if minimum > maximum {
+                    return Err(db_error(
+                        path,
+                        Some(significant[2]),
+                        "physical_value",
+                        "minimum must not exceed maximum",
+                    ));
+                }
                 ranges.push(LinPhysicalRange {
-                    minimum: parse_f64(path, significant[1], "minimum")?,
-                    maximum: parse_f64(path, significant[2], "maximum")?,
+                    minimum,
+                    maximum,
                     factor: parse_f64(path, significant[3], "factor")?,
                     offset: parse_f64(path, significant[4], "offset")?,
                     unit: significant.get(5).map(|token| token.text.clone()),
@@ -656,6 +696,101 @@ fn parse_schedule(
     }
     expect(tokens, index, "}", path, "Schedule_tables")?;
     database.schedules.insert(name.text, entries);
+    Ok(())
+}
+
+fn parse_dynamic_frames(
+    path: &str,
+    tokens: &[Token],
+    index: &mut usize,
+    database: &mut LdfDatabase,
+    kind: LinDynamicFrameKind,
+) -> DatabaseResult<()> {
+    expect(tokens, index, "{", path, "dynamic_frames")?;
+    while *index < tokens.len() && tokens[*index].text != "}" {
+        let name = next(tokens, index, path, "dynamic_frames")?.clone();
+        let mut body = Vec::new();
+        if tokens.get(*index).is_some_and(|token| token.text == ":") {
+            *index += 1;
+            while *index < tokens.len() && tokens[*index].text != ";" {
+                body.push(tokens[*index].clone());
+                *index += 1;
+            }
+            expect(tokens, index, ";", path, "dynamic_frames")?;
+        } else {
+            expect(tokens, index, "{", path, "dynamic_frames")?;
+            let mut depth = 1;
+            while *index < tokens.len() && depth > 0 {
+                let token = tokens[*index].clone();
+                *index += 1;
+                match token.text.as_str() {
+                    "{" => depth += 1,
+                    "}" => depth -= 1,
+                    _ => body.push(token),
+                }
+            }
+            if depth != 0 {
+                return Err(db_error(
+                    path,
+                    tokens.last(),
+                    "dynamic_frames",
+                    "unterminated dynamic frame declaration",
+                ));
+            }
+        }
+        let mut frame_names = Vec::new();
+        let mut trigger_frame_id = None;
+        for token in &body {
+            if token.text == "," || token.text == ":" || token.text == ";" {
+                continue;
+            }
+            if database.frame_by_name(&token.text).is_some() {
+                frame_names.push(token.text.clone());
+                continue;
+            }
+            if kind == LinDynamicFrameKind::EventTriggered && trigger_frame_id.is_none() {
+                let looks_numeric = token
+                    .text
+                    .chars()
+                    .next()
+                    .is_some_and(|character| character.is_ascii_digit() || character == '-');
+                if looks_numeric {
+                    let value = parse_u32(path, token, "trigger_frame_id")?;
+                    trigger_frame_id = Some(u8::try_from(value).map_err(|_| {
+                        db_error(
+                            path,
+                            Some(token),
+                            "trigger_frame_id",
+                            "trigger frame ID must fit in 0..255",
+                        )
+                    })?);
+                    continue;
+                }
+            }
+            return Err(db_error(
+                path,
+                Some(token),
+                "dynamic_frames",
+                format!("unknown dynamic-frame token {:?}", token.text),
+            ));
+        }
+        if frame_names.is_empty() {
+            return Err(db_error(
+                path,
+                Some(&name),
+                "dynamic_frames",
+                "dynamic frame declaration must reference at least one known frame",
+            ));
+        }
+        database.dynamic_frames.push(LinDynamicFrame {
+            name: name.text,
+            kind,
+            trigger_frame_id,
+            frame_names,
+            source: Some(SourceSpan::new(name.line, name.column)),
+        });
+    }
+    expect(tokens, index, "}", path, "dynamic_frames")?;
     Ok(())
 }
 
@@ -789,15 +924,43 @@ impl LdfDatabase {
                 "Signal_representation" => {
                     parse_signal_representation(&path, &tokens, &mut index, &mut database)?;
                 }
-                // Optional diagnostic, sporadic, event-triggered, node
-                // attribute, and vendor sections do not affect ordinary
-                // signal decoding. Keep their presence and source location;
-                // retain only their balanced body until a typed model exists.
-                "Diagnostic_signals"
-                | "Diagnostic_frames"
-                | "Sporadic_frames"
-                | "Event_triggered_frames"
-                | "Node_attributes"
+                // Optional diagnostic, node attribute, and vendor sections do
+                // not affect ordinary signal decoding. Dynamic frame sections
+                // are parsed into explicit associations because a BLF record
+                // alone cannot prove which trigger caused the response.
+                "Sporadic_frames" => {
+                    let source = tokens
+                        .get(index.saturating_sub(1))
+                        .map(|token| SourceSpan::new(token.line, token.column));
+                    database.optional_sections.push(LdfOptionalSection {
+                        name: keyword,
+                        source,
+                    });
+                    parse_dynamic_frames(
+                        &path,
+                        &tokens,
+                        &mut index,
+                        &mut database,
+                        LinDynamicFrameKind::Sporadic,
+                    )?;
+                }
+                "Event_triggered_frames" => {
+                    let source = tokens
+                        .get(index.saturating_sub(1))
+                        .map(|token| SourceSpan::new(token.line, token.column));
+                    database.optional_sections.push(LdfOptionalSection {
+                        name: keyword,
+                        source,
+                    });
+                    parse_dynamic_frames(
+                        &path,
+                        &tokens,
+                        &mut index,
+                        &mut database,
+                        LinDynamicFrameKind::EventTriggered,
+                    )?;
+                }
+                "Diagnostic_signals" | "Diagnostic_frames" | "Node_attributes"
                 | "Table_conversion" => {
                     let source = tokens
                         .get(index.saturating_sub(1))
@@ -917,6 +1080,46 @@ pub fn decode_lin_signal(
     signal: &LinSignal,
     data: &[u8],
 ) -> Result<DecodedLinSignal, LinDecodeError> {
+    if !signal.factor.is_finite() || !signal.offset.is_finite() {
+        return Err(LdfParseError::InvalidMetadata {
+            signal: signal.name.clone(),
+            reason: "factor and offset must be finite",
+        });
+    }
+    if signal.minimum.is_some_and(|value| !value.is_finite())
+        || signal.maximum.is_some_and(|value| !value.is_finite())
+    {
+        return Err(LdfParseError::InvalidMetadata {
+            signal: signal.name.clone(),
+            reason: "limits must be finite",
+        });
+    }
+    if let (Some(minimum), Some(maximum)) = (signal.minimum, signal.maximum) {
+        if minimum > maximum {
+            return Err(LdfParseError::InvalidMetadata {
+                signal: signal.name.clone(),
+                reason: "minimum must not exceed maximum",
+            });
+        }
+    }
+    for range in &signal.physical_ranges {
+        if !range.factor.is_finite()
+            || !range.offset.is_finite()
+            || !range.minimum.is_finite()
+            || !range.maximum.is_finite()
+        {
+            return Err(LdfParseError::InvalidMetadata {
+                signal: signal.name.clone(),
+                reason: "physical encoding ranges must be finite",
+            });
+        }
+        if range.minimum > range.maximum {
+            return Err(LdfParseError::InvalidMetadata {
+                signal: signal.name.clone(),
+                reason: "physical encoding range minimum must not exceed maximum",
+            });
+        }
+    }
     if signal.bit_length == 0 || signal.bit_length > 64 {
         return Err(LdfParseError::UnsupportedBitLength {
             signal: signal.name.clone(),
@@ -937,9 +1140,29 @@ pub fn decode_lin_signal(
     for offset in 0..length {
         raw |= u64::from((data[(start + offset) / 8] >> ((start + offset) % 8)) & 1) << offset;
     }
-    let physical = raw as f64 * signal.factor + signal.offset;
-    if signal.minimum.is_some_and(|minimum| physical < minimum)
-        || signal.maximum.is_some_and(|maximum| physical > maximum)
+    let (factor, offset, minimum, maximum) = if signal.physical_ranges.is_empty() {
+        (signal.factor, signal.offset, signal.minimum, signal.maximum)
+    } else {
+        let matched = signal.physical_ranges.iter().find(|range| {
+            // LDF physical_value bounds select the raw signal range. The
+            // selected range's factor and offset are applied afterward.
+            (raw as f64) >= range.minimum && (raw as f64) <= range.maximum
+        });
+        let range = matched.ok_or_else(|| LdfParseError::NoPhysicalRange {
+            signal: signal.name.clone(),
+            raw_value: raw,
+        })?;
+        (range.factor, range.offset, None, None)
+    };
+    let physical = raw as f64 * factor + offset;
+    if !physical.is_finite() {
+        return Err(LdfParseError::InvalidMetadata {
+            signal: signal.name.clone(),
+            reason: "decoded physical value is not finite",
+        });
+    }
+    if minimum.is_some_and(|minimum| physical < minimum)
+        || maximum.is_some_and(|maximum| physical > maximum)
     {
         return Err(LdfParseError::SignalOutOfBounds {
             signal: signal.name.clone(),

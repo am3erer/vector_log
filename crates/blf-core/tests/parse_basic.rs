@@ -470,6 +470,34 @@ fn enforces_configured_container_size_limit_before_copying_payload() {
 }
 
 #[test]
+fn enforces_actual_uncompressed_payload_limit_before_copying_uncompressed_container() {
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("limited-uncompressed-payload.blf");
+    let inner = vec![0u8; 64];
+    let mut file = file_statistics(inner.len() as u64, 0);
+    file.extend_from_slice(&log_container(&inner));
+    // Keep the declared size below the limit while leaving the actual stored
+    // payload larger. The reader must check before calling to_vec().
+    file[144 + 24..144 + 28].copy_from_slice(&8u32.to_le_bytes());
+    fs::write(&path, file).unwrap();
+
+    let options = ReaderOptions {
+        max_uncompressed_container_size: 32,
+        ..ReaderOptions::default()
+    };
+    let mut reader = File::open_with_reader_options(&path, options).unwrap();
+    assert!(matches!(
+        reader.read(),
+        Err(blf_core::BlfError::Limit {
+            kind: "uncompressed log container",
+            limit: 32,
+            actual: 64,
+        })
+    ));
+}
+
+#[test]
 fn parses_structured_and_unknown_objects() {
     let dir = std::env::temp_dir().join("blf-core-tests");
     fs::create_dir_all(&dir).unwrap();
@@ -510,6 +538,18 @@ fn parses_structured_and_unknown_objects() {
         _ => panic!("expected structured MOST object"),
     }
     assert!(reader.read().unwrap().is_none());
+
+    let mut skipping = File::open_with_reader_options(
+        &path,
+        ReaderOptions {
+            skip_unknown_objects: true,
+            ..ReaderOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(matches!(skipping.read(), Ok(Some(Object::Structured(_)))));
+    assert!(matches!(skipping.read(), Ok(Some(Object::Structured(_)))));
+    assert!(skipping.read().unwrap().is_none());
 
     let mut preserving = File::open_with_reader_options(
         &path,

@@ -87,6 +87,24 @@ fn rejects_short_payload_and_out_of_range_physical_value() {
 }
 
 #[test]
+fn rejects_non_finite_or_reversed_signal_metadata() {
+    let mut non_finite = signal("Value", 0, 8, ByteOrder::LittleEndian, SignalType::Unsigned);
+    non_finite.factor = f64::NAN;
+    assert!(matches!(
+        decode_signal(&non_finite, &[1]),
+        Err(CanDecodeError::InvalidMetadata { .. })
+    ));
+
+    let mut reversed = signal("Value", 0, 8, ByteOrder::LittleEndian, SignalType::Unsigned);
+    reversed.minimum = Some(10.0);
+    reversed.maximum = Some(1.0);
+    assert!(matches!(
+        decode_signal(&reversed, &[1]),
+        Err(CanDecodeError::InvalidMetadata { .. })
+    ));
+}
+
+#[test]
 fn preserves_unsigned_64_bit_values_above_i64() {
     let value = signal("Wide", 0, 64, ByteOrder::LittleEndian, SignalType::Unsigned);
     assert_eq!(

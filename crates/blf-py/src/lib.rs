@@ -446,6 +446,28 @@ impl PyLdfDatabase {
             .collect()
     }
 
+    #[getter]
+    fn dynamic_frames(&self, py: Python<'_>) -> PyResult<Vec<PyObject>> {
+        self.database
+            .dynamic_frames()
+            .map(|dynamic| {
+                let dict = PyDict::new(py);
+                dict.set_item("name", &dynamic.name)?;
+                dict.set_item(
+                    "kind",
+                    match dynamic.kind {
+                        blf_core::LinDynamicFrameKind::Sporadic => "sporadic",
+                        blf_core::LinDynamicFrameKind::EventTriggered => "event_triggered",
+                    },
+                )?;
+                dict.set_item("trigger_frame_id", dynamic.trigger_frame_id)?;
+                dict.set_item("frame_names", &dynamic.frame_names)?;
+                dict.set_item("source", source_to_py(py, dynamic.source)?)?;
+                Ok(dict.into_pyobject(py)?.unbind().into())
+            })
+            .collect()
+    }
+
     fn __repr__(&self) -> String {
         format!("LdfDatabase(frames={})", self.database.len())
     }
@@ -480,6 +502,14 @@ fn lin_signal_to_dict(py: Python<'_>, signal: &blf_core::LinSignal) -> PyResult<
     dict.set_item("offset", signal.offset)?;
     dict.set_item("minimum", signal.minimum)?;
     dict.set_item("maximum", signal.maximum)?;
+    dict.set_item(
+        "physical_ranges",
+        signal
+            .physical_ranges
+            .iter()
+            .map(|range| lin_physical_range_to_dict(py, range))
+            .collect::<PyResult<Vec<_>>>()?,
+    )?;
     dict.set_item("encoding", &signal.encoding)?;
     dict.set_item("choices", value_table_to_dict(py, &signal.choices)?)?;
     dict.set_item("source", source_to_py(py, signal.source)?)?;
@@ -598,13 +628,15 @@ impl PySignalQuery {
 }
 
 #[pyfunction]
-#[pyo3(signature = (path, strict=None, max_container_size=None, max_object_size=None, max_signature_scan=None))]
+#[pyo3(signature = (path, strict=None, max_container_size=None, max_object_size=None, max_signature_scan=None, preserve_unknown_objects=None, skip_unknown_objects=None))]
 fn open(
     path: String,
     strict: Option<bool>,
     max_container_size: Option<u64>,
     max_object_size: Option<u64>,
     max_signature_scan: Option<usize>,
+    preserve_unknown_objects: Option<bool>,
+    skip_unknown_objects: Option<bool>,
 ) -> PyResult<Py<PyFile>> {
     let mut options = blf_core::ReaderOptions::default();
     if let Some(value) = strict {
@@ -618,6 +650,12 @@ fn open(
     }
     if let Some(value) = max_signature_scan {
         options.max_object_signature_scan = value;
+    }
+    if let Some(value) = preserve_unknown_objects {
+        options.preserve_unknown_objects = value;
+    }
+    if let Some(value) = skip_unknown_objects {
+        options.skip_unknown_objects = value;
     }
     let reader =
         blf_core::File::open_with_reader_options(path, options).map_err(blf_error_to_py)?;
@@ -685,6 +723,16 @@ impl PyFile {
     #[getter]
     fn max_signature_scan(&self) -> usize {
         self.reader.options.max_object_signature_scan
+    }
+
+    #[getter]
+    fn preserve_unknown_objects(&self) -> bool {
+        self.reader.options.preserve_unknown_objects
+    }
+
+    #[getter]
+    fn skip_unknown_objects(&self) -> bool {
+        self.reader.options.skip_unknown_objects
     }
 
     #[getter]
@@ -766,12 +814,17 @@ impl PyFile {
         strict: Option<bool>,
     ) -> PyResult<Py<PySignalQuery>> {
         let bus_kind = parse_bus(&bus)?;
-        let bindings = self
+        let bindings: Vec<blf_core::DatabaseBinding> = self
             .bindings
             .iter()
             .filter(|binding| binding.bus() == bus_kind && binding.channel() == channel)
             .cloned()
             .collect();
+        if bindings.is_empty() {
+            return Err(SignalQueryError::new_err(format!(
+                "no {bus_kind} database is bound to channel {channel}"
+            )));
+        }
         let query = self
             .reader
             .aggregate_signal_query(bindings, signal_name, strict.unwrap_or(false))

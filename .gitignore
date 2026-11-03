@@ -1,8 +1,12 @@
 /target/
 /.venv/
 /.omx/
+/.omx-state-locks.identity.json
 __pycache__/
 *.pyc
 *.so
 *.whl
 .DS_Store
+/yes
+/yes.pub
+/doc/*.pdf

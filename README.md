@@ -30,8 +30,9 @@ complete encoded bytes and unrecognised extension bytes are retained, so newer
 BLF extensions remain inspectable. Reserved IDs are skipped using their
 `objectSize`, matching `vector_blf`.
 
-Truly unknown object IDs are returned as `RawObject` in the default mode. Use
-`strict=True` to reject an unknown object instead:
+Truly unknown object IDs are skipped by default, matching the historical
+raw-reader contract. Use `preserve_unknown_objects=True` to retain them as
+`RawObject`, or use `strict=True` to reject an unknown object instead:
 
 ```python
 from vector_log.blf_rs import open
@@ -215,17 +216,22 @@ database. Signal queries always use the current binding.
 For LIN, checksum validation uses valid BLF checksum metadata when present and
 otherwise falls back to the LDF frame rule, including classic checksum for
 diagnostic frame IDs `0x3C` and `0x3D`. Receive-error records preserve their
-Vector BLF `stateReason` in the error text. The BLF record stores only the
-six-bit frame ID and does not identify which receive-error cause occurred, so
-PID parity is not guessed; callers can use `validate_lin_identifier()` when a
-protected identifier is available from another source.
+Vector BLF `stateReason` in the error text. The BLF record normally stores only
+the six-bit frame ID and does not identify which receive-error cause occurred,
+so PID parity is not guessed from that field. When an adapter supplies an
+explicit protected identifier (`pid` or `protectedId`), classification
+validates it before signal extraction.
 
-Known optional LDF sections and explicitly vendor-prefixed (`Vendor_`)
-block-shaped sections are reported by name and source location; their balanced
-bodies are preserved only as opaque presence metadata. Ordinary frame/signal
-decoding does not interpret those sections yet. Other unknown sections,
-unterminated optional blocks, and malformed required LDF statements return
-structured parse errors.
+Known diagnostic and vendor-prefixed (`Vendor_`) block-shaped LDF sections are
+reported by name and source location; their balanced bodies remain opaque when
+they are outside the native decoding model. `Sporadic_frames` and
+`Event_triggered_frames` are additionally exposed as structured
+`dynamic_frames` metadata with associated frame names and source locations.
+Because a BLF response does not carry the schedule trigger context, querying a
+frame from one of those groups returns a value only when its payload is safe,
+with a `dynamic_frame` status and diagnostic instead of pretending the frame
+was an unconditional response. Other unknown sections, unterminated optional
+blocks, and malformed required LDF statements return structured parse errors.
 
 The optional `vector_log.blf_rs.cantools_integration` module remains available
 as a compatibility bridge for applications that already own a cantools
@@ -256,7 +262,9 @@ Reader methods and properties include:
 - `current_object_count`, `current_uncompressed_file_size`, and
   `compression_level` expose reader progress and container state.
 - `good()`, `eof()`, and `close()` expose reader state and lifecycle control.
-- `strict=True` makes unknown object IDs an error.
+- Unknown object IDs are skipped by default; `preserve_unknown_objects=True`
+  retains them as `RawObject`, `skip_unknown_objects=True` explicitly filters
+  them, while `strict=True` makes them an error.
 - `max_container_size`, `max_object_size`, and `max_signature_scan` provide
   configurable safety limits for damaged or untrusted files. The default
   limits preserve the existing reader behavior. `BlfLimitError` and
@@ -320,6 +328,20 @@ BLF reader:
 PYTHONPATH=python python3 scripts/fuzz_reader.py --iterations 1000
 PYTHONPATH=python python3 benchmarks/bench_reader.py trace.blf --repeat 5
 ```
+
+The Rust-native lazy signal path has a separate benchmark. It accepts one or
+more qualified signal names; `--repeat` measures repeated independent scans:
+
+```bash
+PYTHONPATH=python python3 benchmarks/bench_signal_query.py \
+  trace.blf vehicle.dbc Status.Speed Status.Mode \
+  --bus can --channel 1 --repeat 5
+```
+
+One signal measures a single query, adding a second measures two queries over
+the same BLF, and `--repeat` records repeated-query throughput. The benchmark
+reports decoded samples per second and is intended as a release-mode smoke
+measurement rather than a machine-specific threshold.
 
 The fuzz harness treats expected format, truncation, compression, and
 unsupported-object errors as correct rejection; unexpected exceptions still

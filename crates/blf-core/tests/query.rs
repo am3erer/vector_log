@@ -88,6 +88,12 @@ fn lin_message(channel: u16, id: u8, timestamp: u64, data: &[u8]) -> Vec<u8> {
     output
 }
 
+fn lin_message_with_bad_checksum(channel: u16, id: u8, timestamp: u64, data: &[u8]) -> Vec<u8> {
+    let mut output = lin_message(channel, id, timestamp, data);
+    output[48..50].copy_from_slice(&0_u16.to_le_bytes());
+    output
+}
+
 fn lin_crc_error2(channel: u16, id: u8, timestamp: u64, data: &[u8]) -> Vec<u8> {
     let object_size = 184;
     let mut output = object_header(60, object_size, timestamp);
@@ -154,6 +160,13 @@ fn write_blf(path: &Path) {
 
 fn write_lin_checksum_error_blf(path: &Path) {
     let inner = lin_crc_error2(3, 0x10, 40, &[0x2A]);
+    let mut output = file_statistics(inner.len() as u64, 1);
+    output.extend_from_slice(&log_container(&inner));
+    fs::write(path, output).unwrap();
+}
+
+fn write_lin_bad_checksum_message_blf(path: &Path) {
+    let inner = lin_message_with_bad_checksum(3, 0x10, 40, &[0x2A]);
     let mut output = file_statistics(inner.len() as u64, 1);
     output.extend_from_slice(&log_container(&inner));
     fs::write(path, output).unwrap();
@@ -264,6 +277,36 @@ fn query_owns_an_independent_cursor_and_resolves_explicit_channels() {
     assert_eq!(samples[0].channel, 2);
     assert_eq!(samples[0].raw_value, Some(7));
     assert!(query.next().is_none());
+    fs::remove_file(path).ok();
+}
+
+#[test]
+fn closed_reader_rejects_new_queries_but_existing_queries_keep_their_cursor() {
+    let path = std::env::temp_dir().join("blf-core-query-closed-reader-tests.blf");
+    write_blf(&path);
+    let mut file = File::open(&path).unwrap();
+    let binding = DatabaseBinding::new(
+        BusKind::Can,
+        1,
+        Database::Can(Arc::new(can_database("Status"))),
+    )
+    .unwrap();
+    let mut existing = file
+        .signal_query(binding.clone(), "Status.Speed", false)
+        .unwrap();
+
+    file.close();
+    assert!(matches!(
+        file.signal_query(binding.clone(), "Status.Speed", false),
+        Err(blf_core::QueryError::ReaderClosed)
+    ));
+    assert!(matches!(
+        file.aggregate_signal_query(vec![binding], "Speed", false),
+        Err(blf_core::QueryError::ReaderClosed)
+    ));
+
+    let sample = existing.next().unwrap().unwrap();
+    assert_eq!(sample.raw_value, Some(42));
     fs::remove_file(path).ok();
 }
 
@@ -429,6 +472,51 @@ fn lin_checksum_error_query_keeps_value_and_status() {
     assert_eq!(sample.status, DecodeStatus::ChecksumError);
     assert_eq!(sample.raw_value, Some(0x2A));
     assert_eq!(sample.physical_value, Some(42.0_f64));
+    assert!(tolerant.next().is_none());
+
+    let mut strict = file.signal_query(binding, "Status.State", true).unwrap();
+    assert!(strict.next().unwrap().is_err());
+    assert!(strict.next().is_none());
+    fs::remove_file(path).ok();
+}
+
+#[test]
+fn lin_checksum_error_without_payload_keeps_checksum_status() {
+    let path = std::env::temp_dir().join("blf-core-query-lin-no-payload-checksum-tests.blf");
+    let inner = lin_crc_error2(3, 0x10, 40, &[]);
+    let mut output = file_statistics(inner.len() as u64, 1);
+    output.extend_from_slice(&log_container(&inner));
+    fs::write(&path, output).unwrap();
+    let file = File::open(&path).unwrap();
+    let database = Arc::new(lin_database());
+    let binding = DatabaseBinding::new(BusKind::Lin, 3, Database::Lin(database)).unwrap();
+
+    let mut query = file.signal_query(binding, "Status.State", false).unwrap();
+    let sample = query.next().unwrap().unwrap();
+    assert_eq!(sample.status, DecodeStatus::ChecksumError);
+    assert!(sample.raw_value.is_none());
+    assert!(sample.physical_value.is_none());
+    assert!(sample.error.as_deref().unwrap().contains("checksum"));
+    assert!(query.next().is_none());
+    fs::remove_file(path).ok();
+}
+
+#[test]
+fn ordinary_lin_message_checksum_error_keeps_value_and_status() {
+    let path = std::env::temp_dir().join("blf-core-query-lin-message-checksum-tests.blf");
+    write_lin_bad_checksum_message_blf(&path);
+    let file = File::open(&path).unwrap();
+    let database = Arc::new(lin_database());
+    let binding = DatabaseBinding::new(BusKind::Lin, 3, Database::Lin(database)).unwrap();
+
+    let mut tolerant = file
+        .signal_query(binding.clone(), "Status.State", false)
+        .unwrap();
+    let sample = tolerant.next().unwrap().unwrap();
+    assert_eq!(sample.status, DecodeStatus::ChecksumError);
+    assert_eq!(sample.raw_value, Some(0x2A));
+    assert_eq!(sample.physical_value, Some(42.0_f64));
+    assert!(sample.error.as_deref().unwrap().contains("checksum"));
     assert!(tolerant.next().is_none());
 
     let mut strict = file.signal_query(binding, "Status.State", true).unwrap();

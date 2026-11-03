@@ -6,6 +6,7 @@
 //! valid payload.
 
 use crate::database::LinChecksum;
+use crate::ldf::validate_lin_identifier;
 use crate::types::{FieldValue, LinObject, ObjectType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -62,7 +63,10 @@ impl LinObservation {
     }
 
     pub fn has_safe_payload(&self) -> bool {
-        self.payload.is_some() && self.state.has_response()
+        self.payload
+            .as_ref()
+            .is_some_and(|payload| !payload.is_empty())
+            && self.state.has_response()
     }
 }
 
@@ -77,7 +81,7 @@ pub fn classify_lin_object(object: &LinObject) -> LinObservation {
         _ => None,
     });
 
-    match object.object_type {
+    let mut observation = match object.object_type {
         ObjectType::LinMessage | ObjectType::LinMessage2 => {
             let payload = bounded_payload(object, header_dlc);
             match payload {
@@ -179,7 +183,27 @@ pub fn classify_lin_object(object: &LinObject) -> LinObservation {
                 object.object_type.as_u32()
             )),
         },
+    };
+
+    // Vector BLF normally stores the normalized six-bit frame ID. Only
+    // validate parity when an adapter explicitly supplies the on-wire
+    // protected identifier, avoiding a false parity error from a six-bit ID.
+    if let Some(protected_id) = field_u8_any(
+        object,
+        &["protectedId", "protectedIdentifier", "protected_id", "pid"],
+    ) {
+        let frame_matches = observation
+            .frame_id
+            .is_none_or(|frame_id| frame_id == protected_id & 0x3F);
+        if !frame_matches {
+            observation = observation.mark_parity_error(format!(
+                "LIN protected identifier 0x{protected_id:02X} does not match frame ID"
+            ));
+        } else if let Err(error) = validate_lin_identifier(protected_id) {
+            observation = observation.mark_parity_error(error.to_string());
+        }
     }
+    observation
 }
 
 fn bounded_payload(object: &LinObject, header_dlc: Option<u8>) -> Option<Vec<u8>> {
@@ -196,6 +220,10 @@ fn field_u8(object: &LinObject, name: &str) -> Option<u8> {
         Some((_, FieldValue::U8(value))) => Some(*value),
         _ => None,
     }
+}
+
+fn field_u8_any(object: &LinObject, names: &[&str]) -> Option<u8> {
+    names.iter().find_map(|name| field_u8(object, name))
 }
 
 fn field_u16(object: &LinObject, name: &str) -> Option<u16> {

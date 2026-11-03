@@ -112,6 +112,24 @@ fn parity_error_can_downgrade_a_response_without_dropping_bytes() {
 }
 
 #[test]
+fn explicit_protected_identifier_is_validated_before_extraction() {
+    let observation = classify_lin_object(&object(
+        ObjectType::LinMessage,
+        vec![
+            ("id", FieldValue::U8(1)),
+            ("protectedId", FieldValue::U8(0x41)),
+            ("dlc", FieldValue::U8(1)),
+            ("data", FieldValue::Bytes(vec![9])),
+        ],
+    ));
+    assert_eq!(observation.state, LinResponseState::ParityError);
+    assert_eq!(observation.frame_id, Some(1));
+    assert_eq!(observation.payload, Some(vec![9]));
+    assert!(observation.has_safe_payload());
+    assert!(observation.error.unwrap().contains("protected identifier"));
+}
+
+#[test]
 fn unrelated_lin_event_is_not_treated_as_a_response() {
     let observation = classify_lin_object(&object(ObjectType::LinWakeup2, vec![]));
     assert_eq!(observation.state, LinResponseState::Unsupported);

@@ -16,8 +16,9 @@ pub use can::{
 pub use database::{
     BusKind, ByteOrder, CanMessageId, CanPayloadKind, CanSignal, CanSignalRef, Database,
     DatabaseBinding, DatabaseError, DatabaseResult, DbcDatabase, DbcMessage, LdfDatabase,
-    LdfOptionalSection, LinChecksum, LinEncoding, LinFrame, LinNode, LinPhysicalRange,
-    LinScheduleEntry, LinSignal, LinSignalRef, MultiplexRole, SignalType, SourceSpan, ValueTable,
+    LdfOptionalSection, LinChecksum, LinDynamicFrame, LinDynamicFrameKind, LinEncoding, LinFrame,
+    LinNode, LinPhysicalRange, LinScheduleEntry, LinSignal, LinSignalRef, MultiplexRole,
+    SignalType, SourceSpan, ValueTable,
 };
 pub use error::{BlfError, Result};
 pub use ldf::{

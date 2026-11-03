@@ -96,6 +96,17 @@ Event_triggered_frames { Trigger { Status, Status ; } }
         .map(|section| section.name.as_str())
         .collect();
     assert_eq!(sections, ["Sporadic_frames", "Event_triggered_frames"]);
+    let dynamic: Vec<_> = database.dynamic_frames().collect();
+    assert_eq!(dynamic.len(), 2);
+    assert_eq!(dynamic[0].name, "StatusGroup");
+    assert_eq!(dynamic[0].frame_names, ["Status"]);
+    assert_eq!(dynamic[1].name, "Trigger");
+    assert_eq!(dynamic[1].frame_names, ["Status", "Status"]);
+    assert_eq!(
+        database.dynamic_frame_for_id(1).unwrap().name,
+        "StatusGroup"
+    );
+    assert_eq!(database.dynamic_frames_for_id(1).count(), 2);
 }
 
 #[test]
@@ -132,6 +143,34 @@ UnknownBlock { arbitrary content ; }
 }
 
 #[test]
+fn lexer_errors_keep_one_based_source_locations() {
+    let comment = LdfDatabase::from_source("broken.ldf", "Nodes { /* unterminated").unwrap_err();
+    assert_eq!(comment.field, "comment");
+    assert_eq!(comment.line, 1);
+    assert!(comment.reason.contains("unterminated"));
+
+    let string =
+        LdfDatabase::from_source("broken.ldf", "Channel_name = \"unterminated").unwrap_err();
+    assert_eq!(string.field, "string");
+    assert_eq!(string.line, 1);
+    assert!(string.reason.contains("unterminated"));
+}
+
+#[test]
+fn dynamic_frame_metadata_rejects_invalid_trigger_tokens() {
+    let source = r#"
+LIN_description_file;
+Nodes { Master: ECU, 5 ms, 0.1 ms ; }
+Signals { State: 1, 0, ECU, ECU ; }
+Frames { Status: 1, ECU, 1 { State, 0 ; } }
+Event_triggered_frames { Trigger { not_a_frame, Status ; } }
+"#;
+    let error = LdfDatabase::from_str(source).unwrap_err();
+    assert_eq!(error.field, "dynamic_frames");
+    assert!(error.reason.contains("unknown dynamic-frame token"));
+}
+
+#[test]
 fn decodes_little_endian_lin_signals_and_rejects_bad_payload_state() {
     let mut signal = LinSignal {
         name: "Value".to_string(),
@@ -142,6 +181,7 @@ fn decodes_little_endian_lin_signals_and_rejects_bad_payload_state() {
         offset: -1.0,
         minimum: Some(-1.0),
         maximum: Some(61.0),
+        physical_ranges: Vec::new(),
         encoding: None,
         choices: ValueTable::new([(3, "Three".to_string())]),
         source: Some(SourceSpan::new(1, 1)),
@@ -153,6 +193,20 @@ fn decodes_little_endian_lin_signals_and_rejects_bad_payload_state() {
 
     signal.maximum = Some(2.0);
     assert!(decode_lin_signal(&signal, &[0x18]).is_err());
+
+    signal.maximum = Some(61.0);
+    signal.factor = f64::NAN;
+    assert!(matches!(
+        decode_lin_signal(&signal, &[0x18]),
+        Err(blf_core::LdfParseError::InvalidMetadata { .. })
+    ));
+    signal.factor = 2.0;
+    signal.minimum = Some(10.0);
+    signal.maximum = Some(1.0);
+    assert!(matches!(
+        decode_lin_signal(&signal, &[0x18]),
+        Err(blf_core::LdfParseError::InvalidMetadata { .. })
+    ));
 
     let observation = LinObservation {
         state: LinResponseState::HeaderOnly,
@@ -166,6 +220,69 @@ fn decodes_little_endian_lin_signals_and_rejects_bad_payload_state() {
     };
     let database = LdfDatabase::from_str(LDF).unwrap();
     assert!(decode_lin_frame(&database, 1, &observation).is_err());
+}
+
+#[test]
+fn preserves_and_selects_multiple_ldf_physical_ranges() {
+    let source = r#"
+LIN_description_file;
+Nodes { Master: ECU, 5 ms, 0.1 ms ; }
+Signals { Value: 8, 0, ECU, ECU ; }
+Frames { Status: 1, ECU, 1 { Value, 0 ; } }
+Signal_encoding_types {
+  ValueEncoding {
+    physical_value, 0, 10, 1, 0 ;
+    physical_value, 11, 20, 0.5, 5 ;
+  }
+}
+Signal_representation { ValueEncoding: Value ; }
+"#;
+    let database = LdfDatabase::from_str(source).unwrap();
+    let signal = &database.frame_by_name("Status").unwrap().signals[0];
+    assert_eq!(signal.physical_ranges.len(), 2);
+    assert_eq!(signal.factor, 1.0);
+    assert_eq!(signal.offset, 0.0);
+
+    let first = decode_lin_signal(signal, &[5]).unwrap();
+    assert_eq!(first.physical_value, 5.0);
+    let first_upper = decode_lin_signal(signal, &[10]).unwrap();
+    assert_eq!(first_upper.physical_value, 10.0);
+    let second = decode_lin_signal(signal, &[11]).unwrap();
+    assert_eq!(second.physical_value, 10.5);
+    let second_upper = decode_lin_signal(signal, &[20]).unwrap();
+    assert_eq!(second_upper.physical_value, 15.0);
+    assert!(matches!(
+        decode_lin_signal(signal, &[21]),
+        Err(blf_core::LdfParseError::NoPhysicalRange { .. })
+    ));
+}
+
+#[test]
+fn physical_ranges_select_raw_values_before_scaling() {
+    let source = r#"
+LIN_description_file;
+Nodes { Master: ECU, 5 ms, 0.1 ms ; }
+Signals { Value: 8, 0, ECU, ECU ; }
+Frames { Status: 1, ECU, 1 { Value, 0 ; } }
+Signal_encoding_types {
+  ValueEncoding {
+    physical_value, 0, 15, 100, 500 ;
+    physical_value, 16, 31, 1, -40 ;
+  }
+}
+Signal_representation { ValueEncoding: Value ; }
+"#;
+    let database = LdfDatabase::from_str(source).unwrap();
+    let signal = &database.frame_by_name("Status").unwrap().signals[0];
+
+    let lower = decode_lin_signal(signal, &[0]).unwrap();
+    assert_eq!(lower.physical_value, 500.0);
+    let upper = decode_lin_signal(signal, &[15]).unwrap();
+    assert_eq!(upper.physical_value, 2000.0);
+    let offset_range = decode_lin_signal(signal, &[16]).unwrap();
+    assert_eq!(offset_range.physical_value, -24.0);
+    let offset_upper = decode_lin_signal(signal, &[31]).unwrap();
+    assert_eq!(offset_upper.physical_value, -9.0);
 }
 
 #[test]
@@ -266,6 +383,23 @@ fn rejects_incomplete_and_unknown_encoding_clauses() {
         assert!(
             LdfDatabase::from_str(&source).is_err(),
             "clause should be rejected: {clause}"
+        );
+    }
+}
+
+#[test]
+fn rejects_non_finite_and_reversed_physical_encoding_ranges() {
+    for clause in [
+        "physical_value, NaN, 1, 1, 0 ;",
+        "physical_value, 0, inf, 1, 0 ;",
+        "physical_value, 2, 1, 1, 0 ;",
+    ] {
+        let source = format!(
+            "LIN_description_file;\nSignal_encoding_types {{ StateEncoding {{ {clause} }} }}\n"
+        );
+        assert!(
+            LdfDatabase::from_str(&source).is_err(),
+            "invalid physical range should be rejected: {clause}"
         );
     }
 }

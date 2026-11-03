@@ -374,6 +374,20 @@ fn rejects_signal_bit_ranges_that_do_not_fit_the_model() {
 }
 
 #[test]
+fn rejects_non_finite_and_reversed_signal_limits() {
+    for (limits, field) in [
+        ("[NaN|1]", "minimum"),
+        ("[0|inf]", "maximum"),
+        ("[2|1]", "limits"),
+    ] {
+        let source =
+            format!("BO_ 256 Status: 1 ECU\n SG_ Value : 0|8@1+ (1,0) {limits} \"\" ECU\n");
+        let error = DbcDatabase::from_str(&source).unwrap_err();
+        assert_eq!(error.field, field);
+    }
+}
+
+#[test]
 fn rejects_unpaired_value_table_tokens() {
     let source =
         "BO_ 256 Status: 8 ECU\n SG_ Mode : 0|2@1+ (1,0) [0|3] \"\" ECU\nVAL_ 256 Mode 1 \"On\" 2;\n";
