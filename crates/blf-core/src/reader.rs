@@ -24,6 +24,9 @@ const MAX_OBJECT_SIGNATURE_SCAN: usize = 16 * 1024 * 1024;
 #[derive(Debug, Clone, Copy)]
 pub struct ReaderOptions {
     pub strict: bool,
+    /// Preserve truly unknown object IDs as `Object::Raw` instead of skipping them.
+    /// The default follows the Vector-compatible reader contract and skips them.
+    pub preserve_unknown_objects: bool,
     pub max_uncompressed_container_size: u64,
     pub max_object_size: u64,
     pub max_object_signature_scan: usize,
@@ -33,6 +36,7 @@ impl Default for ReaderOptions {
     fn default() -> Self {
         Self {
             strict: false,
+            preserve_unknown_objects: false,
             max_uncompressed_container_size: MAX_UNCOMPRESSED_CONTAINER_SIZE,
             max_object_size: u64::from(u32::MAX),
             max_object_signature_scan: MAX_OBJECT_SIGNATURE_SCAN,
@@ -202,6 +206,9 @@ impl File {
     }
 
     pub fn read(&mut self) -> Result<Option<Object>> {
+        if !self.open {
+            return Ok(None);
+        }
         loop {
             match self.parse_next_from_decompressed() {
                 Ok(Some(object)) => {
@@ -271,6 +278,10 @@ impl File {
         // the declared strings and then skips the declared alignment bytes.
         let (object_end, stream_end) =
             recover_global_marker_size(&self.decompressed, signature_pos, declared_end, base)?;
+        let effective_size = object_end
+            .checked_sub(signature_pos)
+            .ok_or_else(|| BlfError::Format("recovered object size underflow".to_string()))?;
+        self.check_object_size_u64(effective_size as u64)?;
 
         let slice = self
             .decompressed
@@ -280,44 +291,58 @@ impl File {
             self.decompressed_pos = stream_end;
             return Ok(None);
         }
-        let object = if is_lin_type(base.object_type) {
-            Some(Object::Lin(parse_lin_object(slice, base)?))
-        } else {
-            match base.object_type {
-                ObjectType::CanMessage => Some(Object::CanMessage(parse_can_message(slice, base)?)),
-                ObjectType::CanMessage2 => {
-                    Some(Object::CanMessage2(parse_can_message2(slice, base)?))
-                }
-                ObjectType::CanFdMessage => {
-                    Some(Object::CanFdMessage(parse_can_fd_message(slice, base)?))
-                }
-                ObjectType::CanFdMessage64 => {
-                    Some(Object::CanFdMessage64(parse_can_fd_message64(slice, base)?))
-                }
-                ObjectType::CanError => {
-                    Some(Object::CanErrorFrame(parse_can_error_frame(slice, base)?))
-                }
-                ObjectType::CanErrorExt => Some(Object::CanErrorFrameExt(
-                    parse_can_error_frame_ext(slice, base)?,
-                )),
-                ObjectType::CanFdError64 => Some(Object::CanFdErrorFrame64(
-                    parse_can_fd_error_frame64(slice, base)?,
-                )),
-                ObjectType::AppText => Some(Object::AppText(parse_app_text(slice, base)?)),
-                ObjectType::Unknown115 => Some(Object::RestorePointContainer(
-                    parse_restore_point_container(slice, base)?,
-                )),
-                _ => {
-                    if self.strict && base.object_type == ObjectType::Unknown {
-                        return Err(BlfError::UnsupportedObject(base.raw_object_type));
+        let object = match (|| -> Result<Option<Object>> {
+            if is_lin_type(base.object_type) {
+                Ok(Some(Object::Lin(parse_lin_object(slice, base)?)))
+            } else {
+                match base.object_type {
+                    ObjectType::CanMessage => {
+                        Ok(Some(Object::CanMessage(parse_can_message(slice, base)?)))
                     }
-                    if base.object_type == ObjectType::Unknown {
-                        Some(Object::Raw(parse_raw_object(slice, base)?))
-                    } else {
-                        Some(Object::Structured(parse_structured_object(slice, base)?))
+                    ObjectType::CanMessage2 => {
+                        Ok(Some(Object::CanMessage2(parse_can_message2(slice, base)?)))
+                    }
+                    ObjectType::CanFdMessage => Ok(Some(Object::CanFdMessage(
+                        parse_can_fd_message(slice, base)?,
+                    ))),
+                    ObjectType::CanFdMessage64 => Ok(Some(Object::CanFdMessage64(
+                        parse_can_fd_message64(slice, base)?,
+                    ))),
+                    ObjectType::CanError => Ok(Some(Object::CanErrorFrame(parse_can_error_frame(
+                        slice, base,
+                    )?))),
+                    ObjectType::CanErrorExt => Ok(Some(Object::CanErrorFrameExt(
+                        parse_can_error_frame_ext(slice, base)?,
+                    ))),
+                    ObjectType::CanFdError64 => Ok(Some(Object::CanFdErrorFrame64(
+                        parse_can_fd_error_frame64(slice, base)?,
+                    ))),
+                    ObjectType::AppText => Ok(Some(Object::AppText(parse_app_text(slice, base)?))),
+                    ObjectType::Unknown115 => Ok(Some(Object::RestorePointContainer(
+                        parse_restore_point_container(slice, base)?,
+                    ))),
+                    _ => {
+                        if self.strict && base.object_type == ObjectType::Unknown {
+                            return Err(BlfError::UnsupportedObject(base.raw_object_type));
+                        }
+                        if base.object_type == ObjectType::Unknown {
+                            if self.options.preserve_unknown_objects {
+                                Ok(Some(Object::Raw(parse_raw_object(slice, base)?)))
+                            } else {
+                                self.decompressed_pos = stream_end;
+                                Ok(None)
+                            }
+                        } else {
+                            Ok(Some(Object::Structured(parse_structured_object(
+                                slice, base,
+                            )?)))
+                        }
                     }
                 }
             }
+        })() {
+            Err(BlfError::Incomplete) => return Err(BlfError::Truncated),
+            result => result?,
         };
 
         self.decompressed_pos = stream_end;
@@ -339,6 +364,7 @@ impl File {
             )));
         }
         validate_object_size(&base)?;
+        self.check_object_size(base.object_size)?;
         if (base.object_size as usize) < LOG_CONTAINER_HEADER_SIZE {
             return Err(BlfError::Format(
                 "log container is smaller than its fixed header".to_string(),
@@ -432,11 +458,15 @@ impl File {
     }
 
     fn check_object_size(&self, object_size: u32) -> Result<()> {
-        if u64::from(object_size) > self.options.max_object_size {
+        self.check_object_size_u64(u64::from(object_size))
+    }
+
+    fn check_object_size_u64(&self, object_size: u64) -> Result<()> {
+        if object_size > self.options.max_object_size {
             return Err(BlfError::Limit {
                 kind: "BLF object",
                 limit: self.options.max_object_size,
-                actual: u64::from(object_size),
+                actual: object_size,
             });
         }
         Ok(())

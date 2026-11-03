@@ -1,4 +1,8 @@
 use std::fs;
+use std::io::Write;
+
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
 
 use blf_core::{File, Object, ObjectType, ReaderOptions};
 
@@ -213,6 +217,27 @@ fn log_container(uncompressed: &[u8]) -> Vec<u8> {
     container
 }
 
+fn compressed_log_container(uncompressed: &[u8]) -> Vec<u8> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(uncompressed).unwrap();
+    let compressed = encoder.finish().unwrap();
+    let object_size = 32 + compressed.len() as u32;
+    let mut container = Vec::new();
+    push_u32(&mut container, 0x4A42_4F4C);
+    push_u16(&mut container, 16);
+    push_u16(&mut container, 1);
+    push_u32(&mut container, object_size);
+    push_u32(&mut container, 10);
+    push_u16(&mut container, 2);
+    push_u16(&mut container, 0);
+    push_u32(&mut container, 0);
+    push_u32(&mut container, uncompressed.len() as u32);
+    push_u32(&mut container, 0);
+    container.extend_from_slice(&compressed);
+    container.resize(container.len() + object_size as usize % 4, 0);
+    container
+}
+
 fn write_blf(path: &std::path::Path) {
     let inner = {
         let mut inner = Vec::new();
@@ -336,15 +361,30 @@ fn independent_cursors_do_not_share_read_state() {
 }
 
 #[test]
-fn reports_truncated_object_instead_of_eof() {
+fn tolerant_reader_reports_truncated_object_instead_of_eof() {
     let dir = std::env::temp_dir().join("blf-core-tests");
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join("truncated-object.blf");
+    let mut inner = can_message();
+    inner.extend_from_slice(&object_header(1, 48, 100));
+    inner.extend_from_slice(&[0; 4]);
+    write_blf_with_inner(&path, &inner, 2);
+
+    let mut reader = File::open(&path).unwrap();
+    assert!(reader.read().unwrap().is_some());
+    assert!(matches!(reader.read(), Err(blf_core::BlfError::Truncated)));
+}
+
+#[test]
+fn strict_reader_reports_truncated_object_instead_of_eof() {
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("strict-truncated-object.blf");
     let mut inner = object_header(1, 48, 100);
     inner.extend_from_slice(&[0; 4]);
     write_blf_with_inner(&path, &inner, 1);
 
-    let mut reader = File::open(&path).unwrap();
+    let mut reader = File::open_with_options(&path, true).unwrap();
     assert!(matches!(reader.read(), Err(blf_core::BlfError::Truncated)));
 }
 
@@ -401,7 +441,30 @@ fn enforces_configured_object_size_limit() {
         Err(blf_core::BlfError::Limit {
             kind: "BLF object",
             limit: 47,
-            actual: 48,
+            actual: 80,
+        })
+    ));
+}
+
+#[test]
+fn enforces_configured_container_size_limit_before_copying_payload() {
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("limited-container.blf");
+    let inner = vec![0u8; 64];
+    write_blf_with_inner(&path, &inner, 0);
+
+    let options = ReaderOptions {
+        max_object_size: 32 + 32,
+        ..ReaderOptions::default()
+    };
+    let mut reader = File::open_with_reader_options(&path, options).unwrap();
+    assert!(matches!(
+        reader.read(),
+        Err(blf_core::BlfError::Limit {
+            kind: "BLF object",
+            limit: 64,
+            actual: 96,
         })
     ));
 }
@@ -446,7 +509,19 @@ fn parses_structured_and_unknown_objects() {
         }
         _ => panic!("expected structured MOST object"),
     }
-    match reader.read().unwrap().unwrap() {
+    assert!(reader.read().unwrap().is_none());
+
+    let mut preserving = File::open_with_reader_options(
+        &path,
+        ReaderOptions {
+            preserve_unknown_objects: true,
+            ..ReaderOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(matches!(preserving.read(), Ok(Some(Object::Structured(_)))));
+    assert!(matches!(preserving.read(), Ok(Some(Object::Structured(_)))));
+    match preserving.read().unwrap().unwrap() {
         Object::Raw(raw) => {
             let raw_type = match raw.header {
                 blf_core::RawObjectHeader::Object(header) => header.base.raw_object_type,
@@ -457,9 +532,8 @@ fn parses_structured_and_unknown_objects() {
             assert_eq!(raw_type, 999);
             assert_eq!(raw.payload, vec![0xA5]);
         }
-        _ => panic!("expected unknown raw object"),
+        _ => panic!("expected unknown raw object when preservation is enabled"),
     }
-    assert!(reader.read().unwrap().is_none());
 }
 
 #[test]
@@ -640,6 +714,44 @@ fn recovers_upstream_global_marker_size_bug() {
         }
         _ => panic!("expected GlobalMarker"),
     }
+    assert!(reader.read().unwrap().is_none());
+}
+
+#[test]
+fn recovered_global_marker_size_is_limited() {
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("limited-malformed-global-marker.blf");
+    let inner = malformed_global_marker();
+    let mut file = file_statistics(inner.len() as u64, 1);
+    file.extend_from_slice(&compressed_log_container(&inner));
+    fs::write(&path, file).unwrap();
+
+    let options = ReaderOptions {
+        max_object_size: 572,
+        ..ReaderOptions::default()
+    };
+    let mut reader = File::open_with_reader_options(&path, options).unwrap();
+    assert!(matches!(
+        reader.read(),
+        Err(blf_core::BlfError::Limit {
+            kind: "BLF object",
+            limit: 572,
+            actual: 595,
+        })
+    ));
+}
+
+#[test]
+fn reads_after_close_return_eof() {
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("closed-reader.blf");
+    write_blf(&path);
+
+    let mut reader = File::open(&path).unwrap();
+    reader.close();
+    assert!(!reader.is_open());
     assert!(reader.read().unwrap().is_none());
 }
 
