@@ -103,6 +103,31 @@ for sample in query.samples:
     print(sample.timestamp_ns, sample.value, sample.raw_value, sample.status)
 ```
 
+Parsed database handles expose their native metadata through read-only Python
+views. `DbcDatabase` provides `version`, `attributes`, `scoped_attributes`,
+sorted `signal_names`, and `messages`. Each message includes `id`,
+`extended`, `name`, `dlc`, `is_fd`, `payload_kind`, `signals`, `comment`,
+`attributes`, and `source`; each signal includes its bit layout, byte order,
+signedness, scaling, limits, choice table, multiplex role, attributes,
+comment, and source location. Use `message_by_id()`, `message_by_name()`, and
+`signal()` for indexed lookup:
+
+```python
+dbc = DbcDatabase.from_file("vehicle.dbc")
+message = dbc.message_by_id(0x123, extended=False)
+print(message["signals"])
+print(dbc.signal("VehicleStatus.VehicleSpeed")["signal"])
+```
+
+`LdfDatabase` exposes `channel_name`, protocol and language versions,
+`speed_kbps`, `nodes`, `frames`, `schedules`, `encodings`, and
+`optional_sections`. Frame and signal dictionaries preserve checksum rules,
+publishers, bit layouts, initial values, scaling, limits, encoding names,
+choice tables, physical ranges, and source locations. Use `frame_by_id()`,
+`frame_by_name()`, and `signal()` for indexed lookup. These views contain
+copies of metadata and cannot mutate the Rust-owned database used by signal
+queries.
+
 `reader.signal()` resolves a qualified `Message.Signal` or `Frame.Signal`
 within one explicit binding. `reader.signals(name=...)` is the explicit
 same-name aggregation form. It returns every matching message/frame while

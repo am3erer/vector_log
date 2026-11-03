@@ -126,6 +126,58 @@ impl PyDbcDatabase {
     }
 
     #[getter]
+    fn version(&self) -> Option<&str> {
+        self.database.version()
+    }
+
+    #[getter]
+    fn attributes(&self, py: Python<'_>) -> PyResult<PyObject> {
+        string_map_to_dict(py, self.database.attributes())
+    }
+
+    #[getter]
+    fn scoped_attributes(&self, py: Python<'_>) -> PyResult<PyObject> {
+        string_map_to_dict(py, self.database.scoped_attributes())
+    }
+
+    #[getter]
+    fn messages(&self, py: Python<'_>) -> PyResult<Vec<PyObject>> {
+        self.database
+            .messages()
+            .map(|message| dbc_message_to_dict(py, message))
+            .collect()
+    }
+
+    #[getter]
+    fn signal_names(&self) -> Vec<&str> {
+        let mut names: Vec<_> = self.database.signal_names().collect();
+        names.sort_unstable();
+        names
+    }
+
+    #[pyo3(signature = (id, extended=false))]
+    fn message_by_id(&self, py: Python<'_>, id: u32, extended: bool) -> PyResult<Option<PyObject>> {
+        self.database
+            .message_by_id(id, extended)
+            .map(|message| dbc_message_to_dict(py, message))
+            .transpose()
+    }
+
+    fn message_by_name(&self, py: Python<'_>, name: &str) -> PyResult<Option<PyObject>> {
+        self.database
+            .message_by_name(name)
+            .map(|message| dbc_message_to_dict(py, message))
+            .transpose()
+    }
+
+    fn signal(&self, py: Python<'_>, qualified_name: &str) -> PyResult<Option<PyObject>> {
+        self.database
+            .signal(qualified_name)
+            .map(|(message, signal)| dbc_signal_to_dict(py, message, signal))
+            .transpose()
+    }
+
+    #[getter]
     fn message_count(&self) -> usize {
         self.database.len()
     }
@@ -133,6 +185,127 @@ impl PyDbcDatabase {
     fn __repr__(&self) -> String {
         format!("DbcDatabase(messages={})", self.database.len())
     }
+}
+
+fn string_map_to_dict<'py, I, K, V>(py: Python<'py>, values: I) -> PyResult<PyObject>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    let dict = PyDict::new(py);
+    for (name, value) in values {
+        dict.set_item(name.as_ref(), value.as_ref())?;
+    }
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+fn source_to_py(py: Python<'_>, source: Option<blf_core::SourceSpan>) -> PyResult<PyObject> {
+    let Some(source) = source else {
+        return Ok(py.None());
+    };
+    let dict = PyDict::new(py);
+    dict.set_item("line", source.line)?;
+    dict.set_item("column", source.column)?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+fn value_table_to_dict(py: Python<'_>, values: &blf_core::ValueTable) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    for (raw, text) in values.iter() {
+        dict.set_item(raw, text)?;
+    }
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+fn can_signal_to_dict(py: Python<'_>, signal: &blf_core::CanSignal) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("name", &signal.name)?;
+    dict.set_item("start_bit", signal.start_bit)?;
+    dict.set_item("bit_length", signal.bit_length)?;
+    dict.set_item(
+        "byte_order",
+        match signal.byte_order {
+            blf_core::ByteOrder::LittleEndian => "little_endian",
+            blf_core::ByteOrder::BigEndian => "big_endian",
+        },
+    )?;
+    dict.set_item(
+        "signal_type",
+        match signal.signal_type {
+            blf_core::SignalType::Unsigned => "unsigned",
+            blf_core::SignalType::Signed => "signed",
+        },
+    )?;
+    dict.set_item("factor", signal.factor)?;
+    dict.set_item("offset", signal.offset)?;
+    dict.set_item("minimum", signal.minimum)?;
+    dict.set_item("maximum", signal.maximum)?;
+    dict.set_item("choices", value_table_to_dict(py, &signal.choices)?)?;
+    dict.set_item(
+        "multiplex",
+        match &signal.multiplex {
+            blf_core::MultiplexRole::None => "none".into_pyobject(py)?.into_any(),
+            blf_core::MultiplexRole::Selector => "selector".into_pyobject(py)?.into_any(),
+            blf_core::MultiplexRole::Branch(values) => values
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+                .into_pyobject(py)?
+                .into_any(),
+        },
+    )?;
+    dict.set_item(
+        "attributes",
+        string_map_to_dict(py, signal.attributes.iter())?,
+    )?;
+    dict.set_item("comment", &signal.comment)?;
+    dict.set_item("source", source_to_py(py, signal.source)?)?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+fn dbc_signal_to_dict(
+    py: Python<'_>,
+    message: &blf_core::DbcMessage,
+    signal: &blf_core::CanSignal,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("message_id", message.id.id)?;
+    dict.set_item("message_extended", message.id.extended)?;
+    dict.set_item("message_name", &message.name)?;
+    dict.set_item("signal", can_signal_to_dict(py, signal)?)?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+fn dbc_message_to_dict(py: Python<'_>, message: &blf_core::DbcMessage) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("id", message.id.id)?;
+    dict.set_item("extended", message.id.extended)?;
+    dict.set_item("name", &message.name)?;
+    dict.set_item("dlc", message.dlc)?;
+    dict.set_item("is_fd", message.is_fd)?;
+    dict.set_item(
+        "payload_kind",
+        match message.payload_kind {
+            blf_core::CanPayloadKind::Physical => "physical",
+            blf_core::CanPayloadKind::LogicalContainer => "logical_container",
+        },
+    )?;
+    dict.set_item(
+        "signals",
+        message
+            .signals
+            .iter()
+            .map(|signal| can_signal_to_dict(py, signal))
+            .collect::<PyResult<Vec<_>>>()?,
+    )?;
+    dict.set_item("comment", &message.comment)?;
+    dict.set_item(
+        "attributes",
+        string_map_to_dict(py, message.attributes.iter())?,
+    )?;
+    dict.set_item("source", source_to_py(py, message.source)?)?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
 }
 
 #[pyclass(name = "LdfDatabase")]
@@ -167,6 +340,86 @@ impl PyLdfDatabase {
     }
 
     #[getter]
+    fn channel_name(&self) -> Option<&str> {
+        self.database.channel_name()
+    }
+
+    #[getter]
+    fn protocol_version(&self) -> Option<&str> {
+        self.database.protocol_version()
+    }
+
+    #[getter]
+    fn language_version(&self) -> Option<&str> {
+        self.database.language_version()
+    }
+
+    #[getter]
+    fn speed_kbps(&self) -> Option<f64> {
+        self.database.speed_kbps()
+    }
+
+    #[getter]
+    fn nodes(&self, py: Python<'_>) -> PyResult<Vec<PyObject>> {
+        self.database
+            .nodes()
+            .map(|node| lin_node_to_dict(py, node))
+            .collect()
+    }
+
+    #[getter]
+    fn frames(&self, py: Python<'_>) -> PyResult<Vec<PyObject>> {
+        self.database
+            .frames()
+            .map(|frame| lin_frame_to_dict(py, frame))
+            .collect()
+    }
+
+    #[getter]
+    fn schedules(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let schedules = PyDict::new(py);
+        for (name, entries) in self.database.schedules() {
+            let entries = entries
+                .iter()
+                .map(|entry| lin_schedule_entry_to_dict(py, entry))
+                .collect::<PyResult<Vec<_>>>()?;
+            schedules.set_item(name, entries)?;
+        }
+        Ok(schedules.into_pyobject(py)?.unbind().into())
+    }
+
+    #[getter]
+    fn encodings(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let encodings = PyDict::new(py);
+        for (name, encoding) in self.database.encodings() {
+            encodings.set_item(name, lin_encoding_to_dict(py, encoding)?)?;
+        }
+        Ok(encodings.into_pyobject(py)?.unbind().into())
+    }
+
+    #[pyo3(signature = (id))]
+    fn frame_by_id(&self, py: Python<'_>, id: u8) -> PyResult<Option<PyObject>> {
+        self.database
+            .frame_by_id(id)
+            .map(|frame| lin_frame_to_dict(py, frame))
+            .transpose()
+    }
+
+    fn frame_by_name(&self, py: Python<'_>, name: &str) -> PyResult<Option<PyObject>> {
+        self.database
+            .frame_by_name(name)
+            .map(|frame| lin_frame_to_dict(py, frame))
+            .transpose()
+    }
+
+    fn signal(&self, py: Python<'_>, qualified_name: &str) -> PyResult<Option<PyObject>> {
+        self.database
+            .signal(qualified_name)
+            .map(|(frame, signal)| lin_signal_ref_to_dict(py, frame, signal))
+            .transpose()
+    }
+
+    #[getter]
     fn frame_count(&self) -> usize {
         self.database.len()
     }
@@ -196,6 +449,111 @@ impl PyLdfDatabase {
     fn __repr__(&self) -> String {
         format!("LdfDatabase(frames={})", self.database.len())
     }
+}
+
+fn lin_node_to_dict(py: Python<'_>, node: &blf_core::LinNode) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("name", &node.name)?;
+    dict.set_item("configured_nad", node.configured_nad)?;
+    dict.set_item("source", source_to_py(py, node.source)?)?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+fn lin_schedule_entry_to_dict(
+    py: Python<'_>,
+    entry: &blf_core::LinScheduleEntry,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("frame_name", &entry.frame_name)?;
+    dict.set_item("delay_ms", entry.delay_ms)?;
+    dict.set_item("source", source_to_py(py, entry.source)?)?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+fn lin_signal_to_dict(py: Python<'_>, signal: &blf_core::LinSignal) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("name", &signal.name)?;
+    dict.set_item("start_bit", signal.start_bit)?;
+    dict.set_item("bit_length", signal.bit_length)?;
+    dict.set_item("initial_value", signal.initial_value)?;
+    dict.set_item("factor", signal.factor)?;
+    dict.set_item("offset", signal.offset)?;
+    dict.set_item("minimum", signal.minimum)?;
+    dict.set_item("maximum", signal.maximum)?;
+    dict.set_item("encoding", &signal.encoding)?;
+    dict.set_item("choices", value_table_to_dict(py, &signal.choices)?)?;
+    dict.set_item("source", source_to_py(py, signal.source)?)?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+fn lin_frame_to_dict(py: Python<'_>, frame: &blf_core::LinFrame) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("id", frame.id)?;
+    dict.set_item("name", &frame.name)?;
+    dict.set_item("dlc", frame.dlc)?;
+    dict.set_item("publisher", &frame.publisher)?;
+    dict.set_item(
+        "checksum",
+        match frame.checksum {
+            blf_core::LinChecksum::Classic => "classic",
+            blf_core::LinChecksum::Enhanced => "enhanced",
+        },
+    )?;
+    dict.set_item(
+        "signals",
+        frame
+            .signals
+            .iter()
+            .map(|signal| lin_signal_to_dict(py, signal))
+            .collect::<PyResult<Vec<_>>>()?,
+    )?;
+    dict.set_item("source", source_to_py(py, frame.source)?)?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+fn lin_signal_ref_to_dict(
+    py: Python<'_>,
+    frame: &blf_core::LinFrame,
+    signal: &blf_core::LinSignal,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("frame_id", frame.id)?;
+    dict.set_item("frame_name", &frame.name)?;
+    dict.set_item("signal", lin_signal_to_dict(py, signal)?)?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+fn lin_physical_range_to_dict(
+    py: Python<'_>,
+    range: &blf_core::LinPhysicalRange,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("minimum", range.minimum)?;
+    dict.set_item("maximum", range.maximum)?;
+    dict.set_item("factor", range.factor)?;
+    dict.set_item("offset", range.offset)?;
+    dict.set_item("unit", &range.unit)?;
+    dict.set_item("text", &range.text)?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
+}
+
+fn lin_encoding_to_dict(py: Python<'_>, encoding: &blf_core::LinEncoding) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("name", &encoding.name)?;
+    dict.set_item(
+        "logical_values",
+        value_table_to_dict(py, &encoding.logical_values)?,
+    )?;
+    dict.set_item(
+        "physical_ranges",
+        encoding
+            .physical_ranges
+            .iter()
+            .map(|range| lin_physical_range_to_dict(py, range))
+            .collect::<PyResult<Vec<_>>>()?,
+    )?;
+    dict.set_item("source", source_to_py(py, encoding.source)?)?;
+    Ok(dict.into_pyobject(py)?.unbind().into())
 }
 
 fn path_to_string(path: &Bound<'_, PyAny>) -> PyResult<String> {

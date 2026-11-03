@@ -135,6 +135,7 @@ pub struct CanSignal {
     pub maximum: Option<f64>,
     pub choices: ValueTable,
     pub multiplex: MultiplexRole,
+    pub attributes: BTreeMap<String, String>,
     pub comment: Option<String>,
     pub source: Option<SourceSpan>,
 }
@@ -159,6 +160,7 @@ impl CanSignal {
             maximum: None,
             choices: ValueTable::default(),
             multiplex: MultiplexRole::None,
+            attributes: BTreeMap::new(),
             comment: None,
             source: None,
         }
@@ -194,6 +196,10 @@ impl DbcMessage {
     pub fn signal(&self, name: &str) -> Option<&CanSignal> {
         self.signals.iter().find(|signal| signal.name == name)
     }
+
+    pub(crate) fn signal_mut(&mut self, name: &str) -> Option<&mut CanSignal> {
+        self.signals.iter_mut().find(|signal| signal.name == name)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -207,6 +213,7 @@ pub struct DbcDatabase {
     pub(crate) version: Option<String>,
     pub(crate) source_path: Option<String>,
     pub(crate) attributes: BTreeMap<String, String>,
+    pub(crate) scoped_attributes: BTreeMap<String, String>,
     messages_by_id: BTreeMap<CanMessageId, Arc<DbcMessage>>,
     messages_by_name: HashMap<String, CanMessageId>,
     signals_by_qualified_name: HashMap<String, CanSignalRef>,
@@ -224,6 +231,7 @@ impl DbcDatabase {
             version: None,
             source_path: None,
             attributes: BTreeMap::new(),
+            scoped_attributes: BTreeMap::new(),
             messages_by_id: BTreeMap::new(),
             messages_by_name: HashMap::new(),
             signals_by_qualified_name: HashMap::new(),
@@ -448,6 +456,118 @@ impl DbcDatabase {
             )
         })?;
         message.is_fd = is_fd;
+        Ok(())
+    }
+
+    pub(crate) fn set_signal_attribute(
+        &mut self,
+        id: CanMessageId,
+        signal_name: &str,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> DatabaseResult<()> {
+        let message = self.messages_by_id.get_mut(&id).ok_or_else(|| {
+            DatabaseError::new(
+                self.source_path.as_deref().unwrap_or("<memory>"),
+                0,
+                "BA_",
+                format!("unknown CAN message id 0x{:X}", id.id),
+            )
+        })?;
+        let message = Arc::get_mut(message).ok_or_else(|| {
+            DatabaseError::new(
+                self.source_path.as_deref().unwrap_or("<memory>"),
+                0,
+                "BA_",
+                "message is shared and cannot be modified",
+            )
+        })?;
+        let message_name = message.name.clone();
+        let signal = message.signal_mut(signal_name).ok_or_else(|| {
+            DatabaseError::new(
+                self.source_path.as_deref().unwrap_or("<memory>"),
+                0,
+                "BA_",
+                format!("unknown CAN signal {:?}.{:?}", message_name, signal_name),
+            )
+        })?;
+        signal.attributes.insert(name.into(), value.into());
+        Ok(())
+    }
+
+    pub(crate) fn set_scoped_attribute(
+        &mut self,
+        scope: &str,
+        object: &str,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) {
+        self.scoped_attributes
+            .insert(format!("{scope}:{object}:{}", name.into()), value.into());
+    }
+
+    pub fn scoped_attributes(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.scoped_attributes.iter()
+    }
+
+    pub(crate) fn add_multiplex_ranges(
+        &mut self,
+        id: CanMessageId,
+        signal_name: &str,
+        selector_name: &str,
+        ranges: impl IntoIterator<Item = (u32, u32)>,
+    ) -> DatabaseResult<()> {
+        let message = self.messages_by_id.get_mut(&id).ok_or_else(|| {
+            DatabaseError::new(
+                self.source_path.as_deref().unwrap_or("<memory>"),
+                0,
+                "SG_MUL_VAL_",
+                format!("unknown CAN message id 0x{:X}", id.id),
+            )
+        })?;
+        let message = Arc::get_mut(message).ok_or_else(|| {
+            DatabaseError::new(
+                self.source_path.as_deref().unwrap_or("<memory>"),
+                0,
+                "SG_MUL_VAL_",
+                "message is shared and cannot be modified",
+            )
+        })?;
+        let message_name = message.name.clone();
+        if !message.signals.iter().any(|signal| {
+            signal.name == selector_name && signal.multiplex == MultiplexRole::Selector
+        }) {
+            return Err(DatabaseError::new(
+                self.source_path.as_deref().unwrap_or("<memory>"),
+                0,
+                "SG_MUL_VAL_",
+                format!("unknown multiplex selector {:?}", selector_name),
+            ));
+        }
+        let signal = message.signal_mut(signal_name).ok_or_else(|| {
+            DatabaseError::new(
+                self.source_path.as_deref().unwrap_or("<memory>"),
+                0,
+                "SG_MUL_VAL_",
+                format!("unknown CAN signal {:?}.{:?}", message_name, signal_name),
+            )
+        })?;
+        let mut values = match &signal.multiplex {
+            MultiplexRole::Branch(values) => values.clone(),
+            MultiplexRole::None => BTreeSet::new(),
+            MultiplexRole::Selector => {
+                return Err(DatabaseError::new(
+                    self.source_path.as_deref().unwrap_or("<memory>"),
+                    0,
+                    "SG_MUL_VAL_",
+                    "multiplex selector cannot be a branch",
+                ));
+            }
+        };
+        for (start, end) in ranges {
+            values.extend(start..=end);
+        }
+        signal.multiplex = MultiplexRole::Branch(values);
         Ok(())
     }
 

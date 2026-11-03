@@ -37,6 +37,33 @@ VAL_ 256 Speed 1 "Moving";
 '''
 
 
+DBC_METADATA = r'''
+VERSION "1.0"
+NS_ :
+BS_:
+BU_: ECU
+
+BO_ 512 Multiplexed: 8 ECU
+ SG_ Mux M : 0|4@1+ (1,0) [0|15] "" ECU
+ SG_ Common : 8|8@1+ (1,0) [0|255] "" ECU
+ SG_ Branch m1 : 16|8@1+ (0.5,-1) [-1|126.5] "km/h" ECU
+ SG_ BranchMulti m2 : 24|8@1+ (1,10) [10|265] "" ECU
+
+CM_ BO_ 512 "multiplexed message";
+CM_ SG_ 512 Common "common signal";
+VAL_ 512 Common 0 "Idle" 1 "Active";
+BA_DEF_ BO_ "CycleTime" INT 0 10000;
+BA_DEF_ SG_ "SignalType" STRING ;
+BA_DEF_ BU_ "NodeRole" STRING ;
+BA_DEF_ EV_ "Environment" STRING ;
+BA_ "CycleTime" BO_ 512 10;
+BA_ "SignalType" SG_ 512 Common "status";
+BA_ "NodeRole" BU_ ECU "controller";
+BA_ "Environment" EV_ "Ambient" "outside";
+SG_MUL_VAL_ 512 Branch Mux 1-3,5,7-8;
+'''
+
+
 LDF = r'''
 LIN_description_file;
 LIN_protocol_version = "2.2";
@@ -57,6 +84,27 @@ Frames {
   Status: 1, SlaveA, 1 {
     State, 0 ;
   }
+}
+'''
+
+
+LDF_METADATA = LDF[:-1] + r'''
+
+Schedule_tables {
+  Normal {
+    Status delay 10 ms ;
+  }
+}
+
+Signal_encoding_types {
+  StateEncoding {
+    logical_value, 0, "Off" ;
+    logical_value, 1, "On" ;
+  }
+}
+
+Signal_representation {
+  StateEncoding: State ;
 }
 '''
 
@@ -233,6 +281,105 @@ def test_native_database_parsers_and_path_bindings(tmp_path):
     assert ldf.optional_sections == []
     assert repr(dbc) == "DbcDatabase(messages=3)"
     assert repr(ldf) == "LdfDatabase(frames=1)"
+
+
+def test_python_dbc_metadata_view_exposes_all_native_fields():
+    dbc = DbcDatabase.from_str(DBC_METADATA)
+
+    assert dbc.version == "1.0"
+    assert dbc.attributes == {}
+    assert dbc.signal_names == [
+        "Multiplexed.Branch",
+        "Multiplexed.BranchMulti",
+        "Multiplexed.Common",
+        "Multiplexed.Mux",
+    ]
+    assert dbc.scoped_attributes == {
+        "BU_:ECU:NodeRole": "controller",
+        "EV_:Ambient:Environment": "outside",
+    }
+
+    message = dbc.message_by_id(512)
+    assert message == dbc.message_by_name("Multiplexed")
+    assert message["id"] == 512
+    assert message["extended"] is False
+    assert message["name"] == "Multiplexed"
+    assert message["dlc"] == 8
+    assert message["is_fd"] is False
+    assert message["payload_kind"] == "physical"
+    assert message["comment"] == "multiplexed message"
+    assert message["attributes"] == {"CycleTime": "10"}
+    assert message["source"]["line"] > 0
+
+    signals = {signal["name"]: signal for signal in message["signals"]}
+    assert signals["Mux"]["multiplex"] == "selector"
+    assert signals["Common"]["choices"] == {0: "Idle", 1: "Active"}
+    assert signals["Common"]["attributes"] == {"SignalType": "status"}
+    assert signals["Common"]["comment"] == "common signal"
+    assert signals["Branch"]["multiplex"] == [1, 2, 3, 5, 7, 8]
+    assert signals["Branch"]["factor"] == 0.5
+    assert signals["Branch"]["offset"] == -1.0
+    assert signals["Branch"]["minimum"] == -1.0
+    assert signals["Branch"]["maximum"] == 126.5
+    assert signals["Branch"]["byte_order"] == "little_endian"
+    assert signals["Branch"]["signal_type"] == "unsigned"
+
+    qualified = dbc.signal("Multiplexed.Common")
+    assert qualified["message_id"] == 512
+    assert qualified["message_name"] == "Multiplexed"
+    assert qualified["signal"] == signals["Common"]
+    assert dbc.signal("Missing.Signal") is None
+    assert dbc.message_by_id(512, extended=True) is None
+
+
+def test_python_ldf_metadata_view_exposes_all_native_fields():
+    ldf = LdfDatabase.from_str(LDF_METADATA)
+
+    assert ldf.channel_name == "TEST_LIN"
+    assert ldf.protocol_version == "2.2"
+    assert ldf.language_version == "2.2"
+    assert ldf.speed_kbps == 19.2
+    assert [(node["name"], node["configured_nad"]) for node in ldf.nodes] == [
+        ("MasterNode", None),
+        ("SlaveA", None),
+    ]
+    assert all(node["source"]["line"] > 0 for node in ldf.nodes)
+
+    frame = ldf.frame_by_id(1)
+    assert frame == ldf.frame_by_name("Status")
+    assert frame["id"] == 1
+    assert frame["name"] == "Status"
+    assert frame["dlc"] == 1
+    assert frame["publisher"] == "SlaveA"
+    assert frame["checksum"] == "enhanced"
+    assert frame["source"]["line"] > 0
+
+    signal = frame["signals"][0]
+    assert signal["name"] == "State"
+    assert signal["start_bit"] == 0
+    assert signal["bit_length"] == 8
+    assert signal["initial_value"] == 0
+    assert signal["factor"] == 1.0
+    assert signal["offset"] == 0.0
+    assert signal["encoding"] == "StateEncoding"
+    assert signal["choices"] == {0: "Off", 1: "On"}
+
+    assert set(ldf.schedules) == {"Normal"}
+    assert ldf.schedules["Normal"][0]["frame_name"] == "Status"
+    assert ldf.schedules["Normal"][0]["delay_ms"] == 10
+    assert ldf.schedules["Normal"][0]["source"]["line"] > 0
+    assert ldf.encodings["StateEncoding"]["name"] == "StateEncoding"
+    assert ldf.encodings["StateEncoding"]["logical_values"] == {0: "Off", 1: "On"}
+    assert ldf.encodings["StateEncoding"]["physical_ranges"] == []
+    assert ldf.encodings["StateEncoding"]["source"]["line"] > 0
+    assert ldf.optional_sections == []
+
+    qualified = ldf.signal("Status.State")
+    assert qualified["frame_id"] == 1
+    assert qualified["frame_name"] == "Status"
+    assert qualified["signal"] == signal
+    assert ldf.signal("Missing.Signal") is None
+    assert ldf.frame_by_id(2) is None
 
 
 def test_python_signal_query_preserves_context_and_cursor(tmp_path):

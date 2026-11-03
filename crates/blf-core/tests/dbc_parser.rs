@@ -137,7 +137,24 @@ BO_ 2553607254 CLMIF: 196 ECU
  SG_ Selector : 0|8@1+ (1,0) [0|255] "" ECU
 "#;
     let database = DbcDatabase::from_str(source).unwrap();
-    assert_eq!(database.message_by_name("CLMIF").unwrap().dlc, 196);
+    let message = database.message_by_name("CLMIF").unwrap();
+    assert_eq!(message.dlc, 196);
+    assert_eq!(
+        message.payload_kind,
+        blf_core::CanPayloadKind::LogicalContainer
+    );
+
+    let physical = DbcDatabase::from_str(
+        "BO_ 256 MalformedPhysical: 196 ECU\n SG_ Value : 0|8@1+ (1,0) [0|255] \"\" ECU\n",
+    )
+    .unwrap();
+    assert_eq!(
+        physical
+            .message_by_name("MalformedPhysical")
+            .unwrap()
+            .payload_kind,
+        blf_core::CanPayloadKind::Physical
+    );
 }
 
 #[test]
@@ -233,11 +250,36 @@ BA_REL_ "Custom" BU_SG_REL_ ECU SG_ 256 Value 1;
 "#;
     let error = DbcDatabase::from_str(wrong_relationship).unwrap_err();
     assert!(error.reason.contains("relationship attribute"));
+
+    let retained = r#"
+BA_DEF_ SG_ "Custom" INT 0 1;
+BO_ 256 Status: 1 ECU
+ SG_ Value : 0|8@1+ (1,0) [0|255] "" ECU
+BA_ "Custom" SG_ 256 Value 1;
+"#;
+    let database = DbcDatabase::from_str(retained).unwrap();
+    let (_, signal) = database.signal("Status.Value").unwrap();
+    assert_eq!(
+        signal.attributes.get("Custom").map(String::as_str),
+        Some("1")
+    );
+}
+
+#[test]
+fn rejects_scoped_attribute_references_to_unknown_signals() {
+    let source = r#"
+BA_DEF_ SG_ "Custom" INT 0 1;
+BO_ 256 Status: 1 ECU
+ SG_ Value : 0|8@1+ (1,0) [0|255] "" ECU
+BA_ "Custom" SG_ 256 Missing 1;
+"#;
+    let error = DbcDatabase::from_str(source).unwrap_err();
+    assert!(error.reason.contains("unknown CAN signal"));
 }
 
 #[test]
 fn rejects_unimplemented_metadata_outside_namespace() {
-    for keyword in ["CAT_", "FILTER_", "SGTYPE_", "SG_MUL_VAL_"] {
+    for keyword in ["CAT_", "FILTER_", "SGTYPE_"] {
         let error = DbcDatabase::from_source(
             "metadata.dbc",
             &format!("VERSION \"1.0\"\n{keyword} malformed;\n"),
@@ -246,6 +288,22 @@ fn rejects_unimplemented_metadata_outside_namespace() {
         assert_eq!(error.field, keyword);
         assert!(error.reason.contains("unsupported"));
     }
+}
+
+#[test]
+fn parses_multi_value_multiplex_ranges() {
+    let source = r#"
+BO_ 256 Muxed: 2 ECU
+ SG_ Mux M : 0|8@1+ (1,0) [0|255] "" ECU
+ SG_ Value : 8|8@1+ (1,0) [0|255] "" ECU
+SG_MUL_VAL_ 256 Value Mux 1-3,5,7-8;
+"#;
+    let database = DbcDatabase::from_str(source).unwrap();
+    let (_, signal) = database.signal("Muxed.Value").unwrap();
+    assert_eq!(
+        signal.multiplex,
+        MultiplexRole::Branch([1, 2, 3, 5, 7, 8].into_iter().collect())
+    );
 }
 
 #[test]
@@ -333,6 +391,14 @@ fn recognizes_standard_can_fd_vframe_format_values() {
                 .is_fd
         );
     }
+}
+
+#[test]
+fn rejects_unknown_vframe_format_values() {
+    let source = "BO_ 256 Status: 8 ECU\nBA_ \"VFrameFormat\" BO_ 256 99;\n";
+    let error = DbcDatabase::from_str(source).unwrap_err();
+    assert_eq!(error.field, "VFrameFormat");
+    assert!(error.reason.contains("unsupported"));
 }
 
 #[test]

@@ -118,10 +118,7 @@ fn logical_vector_message_uses_signal_width_for_physical_query_decode() {
         .unwrap()
         .unwrap();
     assert_eq!(decoded.raw_value, 7);
-    assert!(matches!(
-        decode_message(&message, &[7]),
-        Err(CanDecodeError::PayloadTooShort { required: 196, .. })
-    ));
+    assert_eq!(decode_message(&message, &[7]).unwrap()[0].raw_value, 7);
 }
 
 #[test]
@@ -228,6 +225,92 @@ fn multiplex_decodes_selector_and_only_active_branch() {
             .collect::<Vec<_>>(),
         vec!["Mux", "Active"]
     );
+}
+
+#[test]
+fn rejects_invalid_and_ambiguous_multiplex_selectors() {
+    let mut selector = signal("Mux", 0, 8, ByteOrder::LittleEndian, SignalType::Signed);
+    selector.multiplex = MultiplexRole::Selector;
+    let mut branch = signal(
+        "Branch",
+        8,
+        8,
+        ByteOrder::LittleEndian,
+        SignalType::Unsigned,
+    );
+    branch.multiplex = MultiplexRole::Branch([0].into_iter().collect());
+    let message = DbcMessage {
+        id: CanMessageId::new(4, false),
+        name: "InvalidMux".to_string(),
+        dlc: 2,
+        is_fd: false,
+        payload_kind: CanPayloadKind::Physical,
+        signals: vec![selector.clone(), branch.clone()],
+        comment: None,
+        attributes: Default::default(),
+        source: None,
+    };
+    assert!(matches!(
+        decode_signal_for_message(&message, "Branch", &[0xFF, 1]),
+        Err(CanDecodeError::InvalidMultiplexSelector { value: -1, .. })
+    ));
+
+    let mut second_selector = selector;
+    second_selector.name = "Mux2".to_string();
+    second_selector.start_bit = 2;
+    let ambiguous = DbcMessage {
+        signals: vec![selector_from_message(&message), second_selector, branch],
+        ..message
+    };
+    assert!(matches!(
+        decode_signal_for_message(&ambiguous, "Branch", &[1, 1]),
+        Err(CanDecodeError::MultipleMultiplexSelectors { .. })
+    ));
+}
+
+#[test]
+fn rejects_common_signal_when_multiplex_branches_have_no_selector() {
+    let mut branch = signal(
+        "Branch",
+        0,
+        8,
+        ByteOrder::LittleEndian,
+        SignalType::Unsigned,
+    );
+    branch.multiplex = MultiplexRole::Branch([1].into_iter().collect());
+    let message = DbcMessage {
+        id: CanMessageId::new(5, false),
+        name: "MalformedMux".to_string(),
+        dlc: 1,
+        is_fd: false,
+        payload_kind: CanPayloadKind::Physical,
+        signals: vec![
+            signal(
+                "Common",
+                0,
+                8,
+                ByteOrder::LittleEndian,
+                SignalType::Unsigned,
+            ),
+            branch,
+        ],
+        comment: None,
+        attributes: Default::default(),
+        source: None,
+    };
+    assert!(matches!(
+        decode_signal_for_message(&message, "Common", &[1]),
+        Err(CanDecodeError::MissingMultiplexSelector { .. })
+    ));
+}
+
+fn selector_from_message(message: &DbcMessage) -> CanSignal {
+    message
+        .signals
+        .iter()
+        .find(|signal| signal.multiplex == MultiplexRole::Selector)
+        .cloned()
+        .expect("test message has a selector")
 }
 
 #[test]

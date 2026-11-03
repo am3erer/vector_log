@@ -269,7 +269,11 @@ fn parse_bo(path: &str, tokens: &[Token], database: &mut DbcDatabase) -> Databas
         name: tokens[2].text.clone(),
         dlc,
         is_fd: false,
-        payload_kind: if dlc > 64 {
+        // Vector's logical-container convention uses an extended identifier
+        // together with an application-level DLC above the CAN-FD wire limit.
+        // Keep ordinary oversized definitions physical so malformed DBC data
+        // cannot bypass payload validation by number alone.
+        payload_kind: if id.extended && dlc > 64 {
             CanPayloadKind::LogicalContainer
         } else {
             CanPayloadKind::Physical
@@ -633,10 +637,11 @@ fn parse_attribute(
                     .ok_or_else(|| error(path, tokens.last(), "BA_", "missing message id"))?,
             )?;
             let value = tokens[4].text.clone();
-            database.set_message_attribute(id, name.clone(), value.clone())?;
             if name == "VFrameFormat" {
-                database.set_message_is_fd(id, is_can_fd_format(&value))?;
+                let is_fd = parse_vframe_format(path, &tokens[4])?;
+                database.set_message_is_fd(id, is_fd)?;
             }
+            database.set_message_attribute(id, name.clone(), value.clone())?;
         }
         "SG_" | "BU_" | "EV_" => {
             if !is_defined {
@@ -660,10 +665,14 @@ fn parse_attribute(
                     "scoped attribute assignment has an invalid shape",
                 ));
             }
-            // Signal/node/environment attributes are intentionally kept out
-            // of the decoding AST for now, but their standard grammar is
-            // validated so real Vector databases can be loaded without
-            // silently accepting malformed scope syntax.
+            let value = tokens[expected_len - 1].text.clone();
+            match tokens[2].text.as_str() {
+                "SG_" => {
+                    let id = message_id(path, &tokens[3])?;
+                    database.set_signal_attribute(id, &tokens[4].text, name, value)?;
+                }
+                scope => database.set_scoped_attribute(scope, &tokens[3].text, name, value),
+            }
         }
         _ if tokens.len() == 3
             && !matches!(
@@ -706,6 +715,7 @@ enum AttributeScope {
 fn parse_standard_metadata(
     path: &str,
     tokens: &[Token],
+    database: &mut DbcDatabase,
     attribute_definitions: &mut HashMap<String, AttributeScope>,
 ) -> DatabaseResult<()> {
     let keyword = tokens
@@ -793,12 +803,12 @@ fn parse_standard_metadata(
         }
         "BA_REL_" => {
             require_quoted_token(path, tokens.get(1), keyword)?;
-            if tokens.len() < 6 {
+            if tokens.len() < 8 {
                 return Err(error(
                     path,
                     tokens.last(),
                     keyword,
-                    "unsupported or incomplete relationship attribute assignment",
+                    "relationship attribute assignment is incomplete",
                 ));
             }
             let relationship = tokens.get(2).ok_or_else(|| {
@@ -825,6 +835,54 @@ fn parse_standard_metadata(
                         Some(&tokens[1]),
                         keyword,
                         "relationship attribute is not defined",
+                    ));
+                }
+            }
+            if relationship.text == "BU_SG_REL_" {
+                if tokens.get(4).map(|token| token.text.as_str()) != Some("SG_") {
+                    return Err(error(
+                        path,
+                        tokens.get(4),
+                        keyword,
+                        "BU_SG_REL_ assignment must reference SG_",
+                    ));
+                }
+                let id = message_id(
+                    path,
+                    tokens.get(5).ok_or_else(|| {
+                        error(
+                            path,
+                            tokens.last(),
+                            keyword,
+                            "relationship is missing message id",
+                        )
+                    })?,
+                )?;
+                let signal_name = tokens.get(6).ok_or_else(|| {
+                    error(
+                        path,
+                        tokens.last(),
+                        keyword,
+                        "relationship is missing signal name",
+                    )
+                })?;
+                if database.message_by_id(id.id, id.extended).is_none() {
+                    return Err(error(
+                        path,
+                        Some(&tokens[5]),
+                        keyword,
+                        format!("unknown CAN message id 0x{:X}", id.id),
+                    ));
+                }
+                let message = database
+                    .message_by_id(id.id, id.extended)
+                    .expect("message was checked above");
+                if message.signal(&signal_name.text).is_none() {
+                    return Err(error(
+                        path,
+                        Some(signal_name),
+                        keyword,
+                        format!("unknown CAN signal {:?}", signal_name.text),
                     ));
                 }
             }
@@ -903,6 +961,117 @@ fn validate_name_list(path: &str, tokens: &[Token], field: &str) -> DatabaseResu
     Ok(())
 }
 
+fn parse_u32_text(path: &str, token: &Token, text: &str, field: &str) -> DatabaseResult<u32> {
+    let synthetic = Token {
+        text: text.to_string(),
+        line: token.line,
+        column: token.column,
+        quoted: false,
+    };
+    parse_u32(path, &synthetic, field)
+}
+
+fn parse_multiplex_ranges(
+    path: &str,
+    tokens: &[Token],
+    field: &str,
+) -> DatabaseResult<Vec<(u32, u32)>> {
+    if tokens.is_empty() {
+        return Err(error(path, None, field, "missing multiplex value range"));
+    }
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        if tokens[index].text == "," {
+            return Err(error(
+                path,
+                Some(&tokens[index]),
+                field,
+                "unexpected comma in multiplex value range",
+            ));
+        }
+        let token = &tokens[index];
+        let (start, end, consumed) = if let Some((start, end)) = token.text.split_once('-') {
+            if start.is_empty() || end.is_empty() {
+                return Err(error(
+                    path,
+                    Some(token),
+                    field,
+                    "invalid multiplex value range",
+                ));
+            }
+            (
+                parse_u32_text(path, token, start, field)?,
+                parse_u32_text(path, token, end, field)?,
+                1,
+            )
+        } else {
+            let start = parse_u32(path, token, field)?;
+            if tokens.get(index + 1).is_some_and(|value| value.text == "-") {
+                let end_token = tokens.get(index + 2).ok_or_else(|| {
+                    error(
+                        path,
+                        Some(token),
+                        field,
+                        "multiplex range is missing its end",
+                    )
+                })?;
+                (start, parse_u32(path, end_token, field)?, 3)
+            } else {
+                (start, start, 1)
+            }
+        };
+        if end < start {
+            return Err(error(
+                path,
+                Some(token),
+                field,
+                "multiplex range end precedes its start",
+            ));
+        }
+        ranges.push((start, end));
+        index += consumed;
+        if index < tokens.len() {
+            if tokens[index].text != "," {
+                return Err(error(
+                    path,
+                    Some(&tokens[index]),
+                    field,
+                    "multiplex ranges must be comma-separated",
+                ));
+            }
+            index += 1;
+            if index == tokens.len() {
+                return Err(error(
+                    path,
+                    tokens.last(),
+                    field,
+                    "multiplex range list cannot end with a comma",
+                ));
+            }
+        }
+    }
+    Ok(ranges)
+}
+
+fn parse_sg_mul_val(
+    path: &str,
+    tokens: &[Token],
+    database: &mut DbcDatabase,
+) -> DatabaseResult<()> {
+    if tokens.len() < 5 {
+        return Err(error(
+            path,
+            tokens.first(),
+            "SG_MUL_VAL_",
+            "statement must contain message id, signal, selector, and range",
+        ));
+    }
+    let id = message_id(path, &tokens[1])?;
+    let ranges = parse_multiplex_ranges(path, &tokens[4..], "SG_MUL_VAL_")?;
+    database.add_multiplex_ranges(id, &tokens[2].text, &tokens[3].text, ranges)
+}
+
 fn is_can_fd_format(value: &str) -> bool {
     value.eq_ignore_ascii_case("CAN FD")
         || value.eq_ignore_ascii_case("StandardCAN_FD")
@@ -910,6 +1079,34 @@ fn is_can_fd_format(value: &str) -> bool {
         || value == "2"
         || value == "14"
         || value == "15"
+}
+
+fn parse_vframe_format(path: &str, token: &Token) -> DatabaseResult<bool> {
+    let value = token.text.as_str();
+    if value.eq_ignore_ascii_case("CAN FD")
+        || value.eq_ignore_ascii_case("StandardCAN_FD")
+        || value.eq_ignore_ascii_case("ExtendedCAN_FD")
+    {
+        return Ok(true);
+    }
+    if value.eq_ignore_ascii_case("StandardCAN")
+        || value.eq_ignore_ascii_case("ExtendedCAN")
+        || value.eq_ignore_ascii_case("reserved")
+        || value.eq_ignore_ascii_case("J1939PG")
+    {
+        return Ok(false);
+    }
+    if let Ok(number) = value.parse::<u8>() {
+        if number <= 15 {
+            return Ok(is_can_fd_format(value));
+        }
+    }
+    Err(error(
+        path,
+        Some(token),
+        "VFrameFormat",
+        format!("unsupported VFrameFormat value {:?}", value),
+    ))
 }
 
 fn parse_line(
@@ -994,7 +1191,8 @@ fn parse_line(
             Ok(())
         }
         "BA_DEF_" | "BA_DEF_DEF_" | "BA_DEF_REL_" | "BA_DEF_DEF_REL_" | "BA_REL_" | "BO_TX_BU_"
-        | "SIG_GROUP_" => parse_standard_metadata(path, &tokens, attribute_definitions),
+        | "SIG_GROUP_" => parse_standard_metadata(path, &tokens, database, attribute_definitions),
+        "SG_MUL_VAL_" => parse_sg_mul_val(path, &tokens, database),
         other => Err(error(
             path,
             tokens.first(),

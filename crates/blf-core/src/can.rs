@@ -37,6 +37,10 @@ pub enum CanDecodeError {
     UnknownMessage { id: u32, kind: &'static str },
     #[error("CAN multiplex selector is missing from message {message:?}")]
     MissingMultiplexSelector { message: String },
+    #[error("CAN message {message:?} has multiple multiplex selectors")]
+    MultipleMultiplexSelectors { message: String },
+    #[error("CAN multiplex selector {value} is invalid for message {message:?}")]
+    InvalidMultiplexSelector { message: String, value: i128 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -93,37 +97,14 @@ pub fn decode_message(
     data: &[u8],
 ) -> Result<Vec<DecodedCanSignal>, CanDecodeError> {
     let required = usize::from(message.dlc);
-    if data.len() < required {
+    if message.payload_kind == CanPayloadKind::Physical && data.len() < required {
         return Err(CanDecodeError::PayloadTooShort {
             required,
             actual: data.len(),
         });
     }
 
-    let selector = message
-        .signals
-        .iter()
-        .find(|signal| signal.multiplex == MultiplexRole::Selector);
-    let selector_value = selector
-        .map(|signal| {
-            decode_signal(signal, data).and_then(|decoded| {
-                u32::try_from(decoded.raw_value).map_err(|_| {
-                    CanDecodeError::MissingMultiplexSelector {
-                        message: message.name.clone(),
-                    }
-                })
-            })
-        })
-        .transpose()?
-        .or_else(|| {
-            message
-                .signals
-                .iter()
-                .find_map(|signal| match signal.multiplex {
-                    MultiplexRole::Branch(_) => None,
-                    _ => None,
-                })
-        });
+    let selector_value = multiplex_selector_value(message, data)?;
 
     if message
         .signals
@@ -169,37 +150,48 @@ pub fn decode_signal_for_message(
     let Some(signal) = message.signal(signal_name) else {
         return Ok(None);
     };
-    if matches!(signal.multiplex, MultiplexRole::Branch(_))
-        && !signal_is_active(message, signal_name, data)?
-    {
-        return Ok(None);
+    let selector_value = multiplex_selector_value(message, data)?;
+    if let MultiplexRole::Branch(values) = &signal.multiplex {
+        if !selector_value.is_some_and(|value| values.contains(&value)) {
+            return Ok(None);
+        }
     }
     decode_signal(signal, data).map(Some)
 }
 
-/// Return whether a named signal is active for the message's current
-/// multiplex selector. Non-branch signals are always active.
-pub(crate) fn signal_is_active(
+fn multiplex_selector_value(
     message: &DbcMessage,
-    signal_name: &str,
     data: &[u8],
-) -> Result<bool, CanDecodeError> {
-    let Some(signal) = message.signal(signal_name) else {
-        return Ok(false);
-    };
-    let MultiplexRole::Branch(values) = &signal.multiplex else {
-        return Ok(true);
-    };
-    let selector = message
+) -> Result<Option<u32>, CanDecodeError> {
+    let selectors: Vec<_> = message
         .signals
         .iter()
-        .find(|candidate| candidate.multiplex == MultiplexRole::Selector)
-        .ok_or_else(|| CanDecodeError::MissingMultiplexSelector {
+        .filter(|signal| signal.multiplex == MultiplexRole::Selector)
+        .collect();
+    if selectors.len() > 1 {
+        return Err(CanDecodeError::MultipleMultiplexSelectors {
             message: message.name.clone(),
+        });
+    }
+    let Some(selector) = selectors.first() else {
+        if message
+            .signals
+            .iter()
+            .any(|signal| matches!(signal.multiplex, MultiplexRole::Branch(_)))
+        {
+            return Err(CanDecodeError::MissingMultiplexSelector {
+                message: message.name.clone(),
+            });
+        }
+        return Ok(None);
+    };
+    let decoded = decode_signal(selector, data)?;
+    let value =
+        u32::try_from(decoded.raw_value).map_err(|_| CanDecodeError::InvalidMultiplexSelector {
+            message: message.name.clone(),
+            value: decoded.raw_value,
         })?;
-    let selector_value = decode_signal(selector, data)?.raw_value;
-    let selector_value = u32::try_from(selector_value).unwrap_or_default();
-    Ok(values.contains(&selector_value))
+    Ok(Some(value))
 }
 
 fn extract_raw(signal: &CanSignal, data: &[u8]) -> Result<u64, CanDecodeError> {
