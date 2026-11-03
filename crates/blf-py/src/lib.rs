@@ -1,6 +1,7 @@
-use pyo3::exceptions::PyException;
+use pyo3::exceptions::{PyException, PyTypeError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::{PyAny, PyBytes, PyDict};
+use std::sync::Arc;
 
 pyo3::create_exception!(_core, BlfFormatError, PyException, "BLF format error.");
 pyo3::create_exception!(
@@ -9,6 +10,7 @@ pyo3::create_exception!(
     PyException,
     "BLF file is truncated."
 );
+pyo3::create_exception!(_core, SignalQueryError, PyException, "Signal query error.");
 pyo3::create_exception!(
     _core,
     BlfCompressionError,
@@ -61,6 +63,182 @@ fn blf_error_to_py(error: blf_core::BlfError) -> PyErr {
     }
 }
 
+fn database_error_to_py(error: blf_core::DatabaseError) -> PyErr {
+    BlfFormatError::new_err(error.to_string())
+}
+
+fn query_error_to_py(error: blf_core::QueryError) -> PyErr {
+    match error {
+        blf_core::QueryError::Blf(error) => blf_error_to_py(error),
+        other => SignalQueryError::new_err(other.to_string()),
+    }
+}
+
+fn parse_bus(value: &str) -> PyResult<blf_core::BusKind> {
+    match value.to_ascii_lowercase().as_str() {
+        "can" => Ok(blf_core::BusKind::Can),
+        "lin" => Ok(blf_core::BusKind::Lin),
+        _ => Err(SignalQueryError::new_err("bus must be 'can' or 'lin'")),
+    }
+}
+
+fn database_from_py(value: &Bound<'_, PyAny>) -> PyResult<blf_core::Database> {
+    if let Ok(database) = value.extract::<PyRef<'_, PyDbcDatabase>>() {
+        return Ok(blf_core::Database::Can(database.database.clone()));
+    }
+    if let Ok(database) = value.extract::<PyRef<'_, PyLdfDatabase>>() {
+        return Ok(blf_core::Database::Lin(database.database.clone()));
+    }
+    Err(SignalQueryError::new_err(
+        "database must be a DbcDatabase or LdfDatabase",
+    ))
+}
+
+#[pyclass(name = "DbcDatabase")]
+struct PyDbcDatabase {
+    database: Arc<blf_core::DbcDatabase>,
+}
+
+#[pymethods]
+impl PyDbcDatabase {
+    #[staticmethod]
+    fn from_file(path: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let path = path_to_string(path)?;
+        blf_core::DbcDatabase::from_file(&path)
+            .map(|database| Self {
+                database: Arc::new(database),
+            })
+            .map_err(database_error_to_py)
+    }
+
+    #[staticmethod]
+    fn from_str(source: String) -> PyResult<Self> {
+        blf_core::DbcDatabase::from_str(&source)
+            .map(|database| Self {
+                database: Arc::new(database),
+            })
+            .map_err(database_error_to_py)
+    }
+
+    #[getter]
+    fn source_path(&self) -> Option<&str> {
+        self.database.source_path()
+    }
+
+    #[getter]
+    fn message_count(&self) -> usize {
+        self.database.len()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("DbcDatabase(messages={})", self.database.len())
+    }
+}
+
+#[pyclass(name = "LdfDatabase")]
+struct PyLdfDatabase {
+    database: Arc<blf_core::LdfDatabase>,
+}
+
+#[pymethods]
+impl PyLdfDatabase {
+    #[staticmethod]
+    fn from_file(path: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let path = path_to_string(path)?;
+        blf_core::LdfDatabase::from_file(&path)
+            .map(|database| Self {
+                database: Arc::new(database),
+            })
+            .map_err(database_error_to_py)
+    }
+
+    #[staticmethod]
+    fn from_str(source: String) -> PyResult<Self> {
+        blf_core::LdfDatabase::from_str(&source)
+            .map(|database| Self {
+                database: Arc::new(database),
+            })
+            .map_err(database_error_to_py)
+    }
+
+    #[getter]
+    fn source_path(&self) -> Option<&str> {
+        self.database.source_path()
+    }
+
+    #[getter]
+    fn frame_count(&self) -> usize {
+        self.database.len()
+    }
+
+    #[getter]
+    fn optional_sections(&self, py: Python<'_>) -> PyResult<Vec<PyObject>> {
+        self.database
+            .optional_sections()
+            .map(|section| {
+                let dict = PyDict::new(py);
+                dict.set_item("name", &section.name)?;
+                match section.source {
+                    Some(source) => {
+                        dict.set_item("line", source.line)?;
+                        dict.set_item("column", source.column)?;
+                    }
+                    None => {
+                        dict.set_item("line", py.None())?;
+                        dict.set_item("column", py.None())?;
+                    }
+                }
+                Ok(dict.into_pyobject(py)?.unbind().into())
+            })
+            .collect()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("LdfDatabase(frames={})", self.database.len())
+    }
+}
+
+fn path_to_string(path: &Bound<'_, PyAny>) -> PyResult<String> {
+    if let Ok(path) = path.extract::<String>() {
+        return Ok(path);
+    }
+    path.call_method0("__fspath__")?
+        .extract::<String>()
+        .map_err(|_| PyTypeError::new_err("path must be a string or path-like object"))
+}
+
+#[pyclass(name = "SignalQuery")]
+struct PySignalQuery {
+    query: Option<blf_core::SignalQuery>,
+}
+
+#[pymethods]
+impl PySignalQuery {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        let Some(mut query) = self.query.take() else {
+            return Ok(None);
+        };
+        let item = py.allow_threads(|| query.next());
+        self.query = Some(query);
+        match item {
+            Some(Ok(sample)) => sample_to_dict(py, &sample).map(Some),
+            Some(Err(error)) => Err(query_error_to_py(error)),
+            None => Ok(None),
+        }
+    }
+
+    #[getter]
+    fn strict(&self) -> bool {
+        self.query
+            .as_ref()
+            .is_some_and(blf_core::SignalQuery::strict)
+    }
+}
+
 #[pyfunction]
 #[pyo3(signature = (path, strict=None, max_container_size=None, max_object_size=None, max_signature_scan=None))]
 fn open(
@@ -85,12 +263,21 @@ fn open(
     }
     let reader =
         blf_core::File::open_with_reader_options(path, options).map_err(blf_error_to_py)?;
-    Python::with_gil(|py| Py::new(py, PyFile { reader }))
+    Python::with_gil(|py| {
+        Py::new(
+            py,
+            PyFile {
+                reader,
+                bindings: Vec::new(),
+            },
+        )
+    })
 }
 
 #[pyclass(name = "File")]
 struct PyFile {
     reader: blf_core::File,
+    bindings: Vec<blf_core::DatabaseBinding>,
 }
 
 #[pymethods]
@@ -167,6 +354,100 @@ impl PyFile {
             .map(|object| object_to_dict(py, object))
             .collect()
     }
+
+    fn bind_database(
+        &mut self,
+        bus: String,
+        channel: u16,
+        database: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let bus = parse_bus(&bus)?;
+        let database = database_from_py(database)?;
+        let binding =
+            blf_core::DatabaseBinding::new(bus, channel, database).map_err(database_error_to_py)?;
+        self.bindings
+            .retain(|existing| !(existing.bus() == bus && existing.channel() == channel));
+        self.bindings.push(binding);
+        Ok(())
+    }
+
+    #[pyo3(signature = (signal_name, bus, channel, strict=None))]
+    fn signal(
+        &self,
+        py: Python<'_>,
+        signal_name: String,
+        bus: String,
+        channel: u16,
+        strict: Option<bool>,
+    ) -> PyResult<Py<PySignalQuery>> {
+        let bus_kind = parse_bus(&bus)?;
+        let binding = self
+            .bindings
+            .iter()
+            .find(|binding| binding.bus() == bus_kind && binding.channel() == channel)
+            .cloned()
+            .ok_or_else(|| {
+                SignalQueryError::new_err(format!(
+                    "no {bus_kind} database is bound to channel {channel}"
+                ))
+            })?;
+        let query = self
+            .reader
+            .signal_query(binding, signal_name, strict.unwrap_or(false))
+            .map_err(query_error_to_py)?;
+        Py::new(py, PySignalQuery { query: Some(query) })
+    }
+
+    #[pyo3(signature = (signal_name, bus, channel, strict=None))]
+    fn signals(
+        &self,
+        py: Python<'_>,
+        signal_name: String,
+        bus: String,
+        channel: u16,
+        strict: Option<bool>,
+    ) -> PyResult<Py<PySignalQuery>> {
+        let bus_kind = parse_bus(&bus)?;
+        let bindings = self
+            .bindings
+            .iter()
+            .filter(|binding| binding.bus() == bus_kind && binding.channel() == channel)
+            .cloned()
+            .collect();
+        let query = self
+            .reader
+            .aggregate_signal_query(bindings, signal_name, strict.unwrap_or(false))
+            .map_err(query_error_to_py)?;
+        Py::new(py, PySignalQuery { query: Some(query) })
+    }
+}
+
+fn sample_to_dict(py: Python<'_>, sample: &blf_core::SignalSample) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("timestamp_ns", sample.timestamp_ns)?;
+    dict.set_item("timestampNs", sample.timestamp_ns)?;
+    dict.set_item("bus", sample.bus.as_str())?;
+    dict.set_item("channel", sample.channel)?;
+    dict.set_item("frame_id", sample.frame_id)?;
+    dict.set_item("frameId", sample.frame_id)?;
+    dict.set_item("message_name", &sample.message_name)?;
+    dict.set_item("messageName", &sample.message_name)?;
+    dict.set_item("signal_name", &sample.signal_name)?;
+    dict.set_item("signalName", &sample.signal_name)?;
+    dict.set_item("raw_value", sample.raw_value)?;
+    dict.set_item("physical_value", sample.physical_value)?;
+    dict.set_item("value_text", &sample.value_text)?;
+    dict.set_item("status", sample.status.to_string())?;
+    dict.set_item("error", &sample.error)?;
+    dict.set_item("data", PyBytes::new(py, &sample.data))?;
+    let value = match &sample.value {
+        Some(blf_core::SampleValue::Text(value)) => value.clone().into_pyobject(py)?.into_any(),
+        Some(blf_core::SampleValue::Physical(value)) => value.into_pyobject(py)?.into_any(),
+        Some(blf_core::SampleValue::Raw(value)) => value.into_pyobject(py)?.into_any(),
+        None => py.None().into_bound(py),
+    };
+    dict.set_item("value", value)?;
+    Ok(dict.into_pyobject(py)?.into_any().unbind())
 }
 
 fn statistics_to_dict(py: Python<'_>, stats: &blf_core::FileStatistics) -> PyResult<PyObject> {
@@ -496,7 +777,7 @@ fn object_to_dict(py: Python<'_>, object: &blf_core::Object) -> PyResult<PyObjec
         blf_core::Object::Raw(value) => &value.data,
     };
     dict.set_item("rawData", PyBytes::new(py, raw_data))?;
-    if let Some(timestamp_ns) = object_timestamp_ns(object) {
+    if let Some(timestamp_ns) = blf_core::object_timestamp_ns(object) {
         dict.set_item("timestampNs", timestamp_ns)?;
     }
     if let Some(extensions) = typed_extensions(object) {
@@ -554,64 +835,6 @@ fn restore_points_to_dict(
         .collect::<PyResult<Vec<_>>>()?;
     dict.set_item("restorePoints", points)?;
     Ok(dict.into_pyobject(py)?.into_any().unbind())
-}
-
-fn object_timestamp_ns(object: &blf_core::Object) -> Option<u64> {
-    let (flags, timestamp) = match object {
-        blf_core::Object::CanMessage(value) => {
-            (value.header.object_flags, value.header.object_time_stamp)
-        }
-        blf_core::Object::CanMessage2(value) => {
-            (value.header.object_flags, value.header.object_time_stamp)
-        }
-        blf_core::Object::CanFdMessage(value) => {
-            (value.header.object_flags, value.header.object_time_stamp)
-        }
-        blf_core::Object::CanFdMessage64(value) => {
-            (value.header.object_flags, value.header.object_time_stamp)
-        }
-        blf_core::Object::CanErrorFrame(value) => {
-            (value.header.object_flags, value.header.object_time_stamp)
-        }
-        blf_core::Object::CanErrorFrameExt(value) => {
-            (value.header.object_flags, value.header.object_time_stamp)
-        }
-        blf_core::Object::CanFdErrorFrame64(value) => {
-            (value.header.object_flags, value.header.object_time_stamp)
-        }
-        blf_core::Object::AppText(value) => {
-            (value.header.object_flags, value.header.object_time_stamp)
-        }
-        blf_core::Object::RestorePointContainer(value) => {
-            (value.header.object_flags, value.header.object_time_stamp)
-        }
-        blf_core::Object::Lin(value) => (value.header.object_flags, value.header.object_time_stamp),
-        blf_core::Object::Structured(value) => raw_header_timestamp(&value.header)?,
-        blf_core::Object::Raw(value) => raw_header_timestamp(&value.header)?,
-    };
-
-    if flags & 0x2 != 0 {
-        Some(timestamp)
-    } else if flags & 0x1 != 0 {
-        timestamp.checked_mul(10_000)
-    } else {
-        None
-    }
-}
-
-fn raw_header_timestamp(header: &blf_core::RawObjectHeader) -> Option<(u32, u64)> {
-    match header {
-        blf_core::RawObjectHeader::Object(value) => {
-            Some((value.object_flags, value.object_time_stamp))
-        }
-        blf_core::RawObjectHeader::Object2(value) => {
-            Some((value.object_flags, value.object_time_stamp))
-        }
-        blf_core::RawObjectHeader::Var(value) => {
-            Some((value.object_flags, value.object_time_stamp))
-        }
-        blf_core::RawObjectHeader::Base(_) => None,
-    }
 }
 
 fn typed_extensions(object: &blf_core::Object) -> Option<&[u8]> {
@@ -882,6 +1105,9 @@ fn field_value_to_py(py: Python<'_>, value: &blf_core::FieldValue) -> PyResult<P
 fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(open, module)?)?;
     module.add_class::<PyFile>()?;
+    module.add_class::<PyDbcDatabase>()?;
+    module.add_class::<PyLdfDatabase>()?;
+    module.add_class::<PySignalQuery>()?;
     module.add("BlfFormatError", module.py().get_type::<BlfFormatError>())?;
     module.add("BlfIoError", module.py().get_type::<BlfIoError>())?;
     module.add("BlfLimitError", module.py().get_type::<BlfLimitError>())?;
@@ -900,6 +1126,10 @@ fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add(
         "BlfUnsupportedVersionError",
         module.py().get_type::<BlfUnsupportedVersionError>(),
+    )?;
+    module.add(
+        "SignalQueryError",
+        module.py().get_type::<SignalQueryError>(),
     )?;
     Ok(())
 }

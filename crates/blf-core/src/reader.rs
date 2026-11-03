@@ -1,6 +1,7 @@
 use std::fs::File as StdFile;
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 
 use flate2::read::ZlibDecoder;
 use memmap2::MmapOptions;
@@ -91,7 +92,7 @@ pub fn parse_file_statistics(data: &[u8]) -> Result<FileStatistics> {
 }
 
 pub struct File {
-    mmap: memmap2::Mmap,
+    mmap: Arc<memmap2::Mmap>,
     outer_pos: usize,
     decompressed: Vec<u8>,
     decompressed_pos: usize,
@@ -144,7 +145,7 @@ impl File {
         let file_statistics = parse_file_statistics(&mmap[..statistics_size])?;
 
         Ok(Self {
-            mmap,
+            mmap: Arc::new(mmap),
             outer_pos: statistics_size,
             decompressed: Vec::new(),
             decompressed_pos: 0,
@@ -158,6 +159,29 @@ impl File {
             open: true,
             eof: false,
         })
+    }
+
+    /// Create a fresh sequential cursor over the same immutable BLF source.
+    ///
+    /// The returned cursor does not share decompression buffers, logical
+    /// positions, EOF state, or object counters with this reader. Only the
+    /// memory-mapped source and immutable reader configuration are shared.
+    pub fn independent_cursor(&self) -> Self {
+        Self {
+            mmap: Arc::clone(&self.mmap),
+            outer_pos: self.file_statistics.statistics_size as usize,
+            decompressed: Vec::new(),
+            decompressed_pos: 0,
+            file_statistics: self.file_statistics.clone(),
+            current_uncompressed_file_size: self.file_statistics.statistics_size as u64,
+            current_object_count: 0,
+            compression_level: self.compression_level,
+            write_restore_points: self.write_restore_points,
+            strict: self.strict,
+            options: self.options,
+            open: true,
+            eof: false,
+        }
     }
 
     pub fn is_open(&self) -> bool {

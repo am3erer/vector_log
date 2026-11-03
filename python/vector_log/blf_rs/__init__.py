@@ -7,6 +7,8 @@ from .export import (
     objects_to_csv,
     objects_to_jsonl,
     objects_to_numpy,
+    samples_to_arrow,
+    samples_to_numpy,
     write_csv,
     write_jsonl,
 )
@@ -63,6 +65,43 @@ BlfTruncatedError = _core.BlfTruncatedError
 BlfCompressionError = _core.BlfCompressionError
 BlfUnsupportedObjectError = _core.BlfUnsupportedObjectError
 BlfUnsupportedVersionError = _core.BlfUnsupportedVersionError
+SignalQueryError = _core.SignalQueryError
+DbcDatabase = _core.DbcDatabase
+LdfDatabase = _core.LdfDatabase
+
+
+class SignalQuery:
+    """Lazy Python view over a Rust-owned signal query."""
+
+    def __init__(self, native):
+        self._native = native
+
+    def __iter__(self):
+        return self
+
+    @property
+    def samples(self):
+        """Return this query as the lazy iterable sample view."""
+        return self
+
+    def __next__(self):
+        value = next(self._native, None)
+        if value is None:
+            raise StopIteration
+        return SignalSample(value)
+
+    @property
+    def strict(self):
+        return self._native.strict
+
+    def collect(self):
+        return list(self)
+
+    def to_numpy(self):
+        return samples_to_numpy(self)
+
+    def to_arrow(self):
+        return samples_to_arrow(self)
 
 
 class File:
@@ -141,6 +180,22 @@ class File:
 
     def read_batch(self, max_objects):
         return [object_from_data(data) for data in self._native.read_batch(max_objects)]
+
+    def bind_database(self, bus, channel, database):
+        if isinstance(database, (str, bytes)) or hasattr(database, "__fspath__"):
+            database = _load_database(bus, database)
+        self._native.bind_database(str(bus), int(channel), database)
+        return self
+
+    def signal(self, signal_name, *, bus, channel, strict=False):
+        return SignalQuery(
+            self._native.signal(str(signal_name), str(bus), int(channel), bool(strict))
+        )
+
+    def signals(self, name, *, bus, channel, strict=False):
+        return SignalQuery(
+            self._native.signals(str(name), str(bus), int(channel), bool(strict))
+        )
 
     def read_numpy(self, max_objects=None, *, data_width=None):
         """Read objects and return columnar NumPy arrays."""
@@ -244,8 +299,9 @@ def open(
     max_container_size=None,
     max_object_size=None,
     max_signature_scan=None,
+    databases=None,
 ):
-    return File(
+    reader = File(
         _core.open(
             os.fspath(path),
             strict,
@@ -254,6 +310,22 @@ def open(
             max_signature_scan,
         )
     )
+    for binding, database in (databases or {}).items():
+        try:
+            bus, channel = binding
+        except (TypeError, ValueError) as error:
+            raise ValueError("database bindings must use (bus, channel) keys") from error
+        reader.bind_database(bus, channel, database)
+    return reader
+
+
+def _load_database(bus, path):
+    bus = str(bus).lower()
+    if bus == "can":
+        return DbcDatabase.from_file(os.fspath(path))
+    if bus == "lin":
+        return LdfDatabase.from_file(os.fspath(path))
+    raise ValueError("bus must be 'can' or 'lin'")
 
 
 def _filter_values(values):
@@ -298,8 +370,14 @@ __all__ = [
     "BlfCompressionError",
     "BlfUnsupportedObjectError",
     "BlfUnsupportedVersionError",
+    "SignalQueryError",
+    "DbcDatabase",
+    "LdfDatabase",
+    "SignalQuery",
     "objects_to_numpy",
     "objects_to_arrow",
+    "samples_to_numpy",
+    "samples_to_arrow",
     "objects_to_csv",
     "objects_to_jsonl",
     "write_csv",

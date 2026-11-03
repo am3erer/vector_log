@@ -389,6 +389,34 @@ class CanMessage(_Object):
     pass
 
 
+class SignalSample(_AttributeMapping):
+    """An owned database-decoded signal sample.
+
+    Numeric values remain nullable for response/error records. ``value`` is
+    the choice text when a database value table matched, otherwise the
+    physical numeric value.
+    """
+
+    @property
+    def value_text(self):
+        return self._data.get("value_text", self._data.get("valueText"))
+
+    @property
+    def raw_value(self):
+        return self._data.get("raw_value", self._data.get("rawValue"))
+
+    @property
+    def physical_value(self):
+        return self._data.get("physical_value", self._data.get("physicalValue"))
+
+    def __repr__(self):
+        return (
+            f"SignalSample({self.bus}:{self.channel} "
+            f"{self.message_name}.{self.signal_name} "
+            f"t={self.timestamp_ns} status={self.status!r} value={self.value!r})"
+        )
+
+
 class CanMessage2(_Object):
     pass
 
@@ -654,6 +682,7 @@ __all__ = [
     "RestorePoint",
     "RestorePoints",
     "FileStatistics",
+    "SignalSample",
     "RawObject",
     "StructuredObject",
     "object_from_data",

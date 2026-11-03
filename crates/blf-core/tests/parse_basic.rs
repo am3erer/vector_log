@@ -295,6 +295,47 @@ fn parses_p0_objects() {
 }
 
 #[test]
+fn independent_cursors_do_not_share_read_state() {
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("independent-cursors.blf");
+    write_blf(&path);
+
+    let mut ordinary = File::open(&path).unwrap();
+    let mut first = ordinary.independent_cursor();
+    let mut second = ordinary.independent_cursor();
+
+    assert_eq!(
+        ordinary.read().unwrap().unwrap().object_type(),
+        ObjectType::CanMessage
+    );
+    assert_eq!(
+        first.read().unwrap().unwrap().object_type(),
+        ObjectType::CanMessage
+    );
+    assert_eq!(
+        second.read().unwrap().unwrap().object_type(),
+        ObjectType::CanMessage
+    );
+
+    assert_eq!(
+        ordinary.read().unwrap().unwrap().object_type(),
+        ObjectType::CanMessage2
+    );
+    assert_eq!(
+        first.read().unwrap().unwrap().object_type(),
+        ObjectType::CanMessage2
+    );
+    assert_eq!(
+        second.read().unwrap().unwrap().object_type(),
+        ObjectType::CanMessage2
+    );
+    assert_eq!(ordinary.current_object_count, 2);
+    assert_eq!(first.current_object_count, 2);
+    assert_eq!(second.current_object_count, 2);
+}
+
+#[test]
 fn reports_truncated_object_instead_of_eof() {
     let dir = std::env::temp_dir().join("blf-core-tests");
     fs::create_dir_all(&dir).unwrap();
