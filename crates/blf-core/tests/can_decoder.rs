@@ -122,6 +122,39 @@ fn logical_vector_message_uses_signal_width_for_physical_query_decode() {
 }
 
 #[test]
+fn targeted_decode_ignores_unrelated_invalid_signals() {
+    let mut requested = signal(
+        "Requested",
+        0,
+        8,
+        ByteOrder::LittleEndian,
+        SignalType::Unsigned,
+    );
+    requested.maximum = Some(255.0);
+    let mut unrelated = signal(
+        "Unrelated",
+        8,
+        16,
+        ByteOrder::LittleEndian,
+        SignalType::Unsigned,
+    );
+    unrelated.maximum = Some(1.0);
+    let message = DbcMessage {
+        id: CanMessageId::new(0x123, false),
+        name: "Status".to_string(),
+        dlc: 1,
+        is_fd: false,
+        signals: vec![requested, unrelated],
+        comment: None,
+        attributes: Default::default(),
+        source: None,
+    };
+
+    let decoded = decode_signal_for_message(&message, "Requested", &[42]).unwrap();
+    assert_eq!(decoded.unwrap().raw_value, 42);
+}
+
+#[test]
 fn multiplex_decodes_selector_and_only_active_branch() {
     let selector = signal("Mux", 0, 4, ByteOrder::LittleEndian, SignalType::Unsigned);
     let mut active = signal(

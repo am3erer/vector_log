@@ -265,6 +265,36 @@ fn accepts_multiple_signal_receivers() {
 }
 
 #[test]
+fn accepts_comma_separated_signal_receivers() {
+    let source =
+        "BO_ 256 Status: 8 ECU\n SG_ Value : 0|8@1+ (1,0) [0|255] \"\" ECU_A,ECU_B,ECU_C\n";
+    let database = DbcDatabase::from_str(source).unwrap();
+    assert!(database.signal("Status.Value").is_some());
+
+    for malformed in [
+        "BO_ 256 Status: 8 ECU\n SG_ Value : 0|8@1+ (1,0) [0|255] \"\" ,ECU_B\n",
+        "BO_ 256 Status: 8 ECU\n SG_ Value : 0|8@1+ (1,0) [0|255] \"\" ECU_A,\n",
+        "BO_ 256 Status: 8 ECU\n SG_ Value : 0|8@1+ (1,0) [0|255] \"\" ECU_A,,ECU_B\n",
+    ] {
+        assert!(DbcDatabase::from_str(malformed).is_err());
+    }
+}
+
+#[test]
+fn recognizes_standard_can_fd_vframe_format_values() {
+    for value in ["14", "15", "StandardCAN_FD", "ExtendedCAN_FD"] {
+        let source = format!("BO_ 256 Status: 64 ECU\nBA_ \"VFrameFormat\" BO_ 256 {value};\n");
+        assert!(
+            DbcDatabase::from_str(&source)
+                .unwrap()
+                .message_by_id(256, false)
+                .unwrap()
+                .is_fd
+        );
+    }
+}
+
+#[test]
 fn rejects_trailing_structure_tokens_and_invalid_attribute_scopes() {
     let trailing = "BO_ 256 Status: 8 ECU extra\n SG_ Value : 0|8@1+ (1,0) [0|255] \"\" ECU\n";
     let error = DbcDatabase::from_str(trailing).unwrap_err();

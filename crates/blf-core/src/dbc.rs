@@ -1,5 +1,6 @@
 //! Small, dependency-free DBC parser.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
@@ -413,7 +414,7 @@ fn parse_signal(
         .get(index)
         .ok_or_else(|| error(path, tokens.last(), "receiver", "missing receiver"))?;
     let _ = unit;
-    if receiver.quoted {
+    if receiver.quoted || receiver.text == "," {
         return Err(error(
             path,
             Some(receiver),
@@ -423,16 +424,38 @@ fn parse_signal(
     }
     index += 1;
     while index < tokens.len() {
-        let receiver = &tokens[index];
-        if receiver.quoted || receiver.text == "," {
-            return Err(error(
-                path,
-                Some(receiver),
-                "receiver",
-                "receiver must be an ECU name",
-            ));
+        if tokens[index].text == "," {
+            let comma = &tokens[index];
+            index += 1;
+            let receiver = tokens.get(index).ok_or_else(|| {
+                error(
+                    path,
+                    Some(comma),
+                    "receiver",
+                    "receiver list cannot end with a comma",
+                )
+            })?;
+            if receiver.quoted || receiver.text == "," {
+                return Err(error(
+                    path,
+                    Some(receiver),
+                    "receiver",
+                    "receiver must be an ECU name after a comma",
+                ));
+            }
+            index += 1;
+        } else {
+            let receiver = &tokens[index];
+            if receiver.quoted {
+                return Err(error(
+                    path,
+                    Some(receiver),
+                    "receiver",
+                    "receiver must be an ECU name",
+                ));
+            }
+            index += 1;
         }
-        index += 1;
     }
     let start_bit = u16::try_from(start_bit).map_err(|_| {
         error(
@@ -554,7 +577,12 @@ fn parse_comment(path: &str, tokens: &[Token], database: &mut DbcDatabase) -> Da
     }
 }
 
-fn parse_attribute(path: &str, tokens: &[Token], database: &mut DbcDatabase) -> DatabaseResult<()> {
+fn parse_attribute(
+    path: &str,
+    tokens: &[Token],
+    database: &mut DbcDatabase,
+    attribute_definitions: &HashSet<String>,
+) -> DatabaseResult<()> {
     if tokens.len() < 3 || !tokens[1].quoted {
         return Err(error(
             path,
@@ -564,8 +592,17 @@ fn parse_attribute(path: &str, tokens: &[Token], database: &mut DbcDatabase) -> 
         ));
     }
     let name = tokens[1].text.clone();
+    let is_defined = name == "VFrameFormat" || attribute_definitions.contains(&name);
     match tokens[2].text.as_str() {
         "BO_" => {
+            if !is_defined {
+                return Err(error(
+                    path,
+                    Some(&tokens[1]),
+                    "BA_",
+                    format!("unsupported attribute scope for {:?}", name),
+                ));
+            }
             if tokens.len() != 5 {
                 return Err(error(
                     path,
@@ -583,9 +620,35 @@ fn parse_attribute(path: &str, tokens: &[Token], database: &mut DbcDatabase) -> 
             let value = tokens[4].text.clone();
             database.set_message_attribute(id, name.clone(), value.clone())?;
             if name == "VFrameFormat" {
-                database
-                    .set_message_is_fd(id, value.eq_ignore_ascii_case("CAN FD") || value == "2")?;
+                database.set_message_is_fd(id, is_can_fd_format(&value))?;
             }
+        }
+        "SG_" | "BU_" | "EV_" => {
+            if !is_defined {
+                return Err(error(
+                    path,
+                    Some(&tokens[1]),
+                    "BA_",
+                    format!("unsupported attribute scope for {:?}", name),
+                ));
+            }
+            let expected_len = match tokens[2].text.as_str() {
+                "SG_" => 6,
+                "BU_" | "EV_" => 5,
+                _ => unreachable!(),
+            };
+            if tokens.len() != expected_len {
+                return Err(error(
+                    path,
+                    tokens.first(),
+                    "BA_",
+                    "scoped attribute assignment has an invalid shape",
+                ));
+            }
+            // Signal/node/environment attributes are intentionally kept out
+            // of the decoding AST for now, but their standard grammar is
+            // validated so real Vector databases can be loaded without
+            // silently accepting malformed scope syntax.
         }
         _ if tokens.len() == 3
             && !matches!(
@@ -607,12 +670,167 @@ fn parse_attribute(path: &str, tokens: &[Token], database: &mut DbcDatabase) -> 
     Ok(())
 }
 
+fn require_quoted_token(path: &str, token: Option<&Token>, field: &str) -> DatabaseResult<()> {
+    match token {
+        Some(token) if token.quoted => Ok(()),
+        Some(token) => Err(error(path, Some(token), field, "expected a quoted name")),
+        None => Err(error(path, None, field, "missing quoted name")),
+    }
+}
+
+fn parse_standard_metadata(
+    path: &str,
+    tokens: &[Token],
+    attribute_definitions: &mut HashSet<String>,
+) -> DatabaseResult<()> {
+    let keyword = tokens
+        .first()
+        .map(|token| token.text.as_str())
+        .unwrap_or("DBC");
+    if tokens.len() < 2 {
+        return Err(error(
+            path,
+            tokens.first(),
+            keyword,
+            "unsupported or incomplete metadata statement",
+        ));
+    }
+    match keyword {
+        "BA_DEF_" => {
+            let quoted = tokens.iter().position(|token| token.quoted);
+            require_quoted_token(path, quoted.and_then(|index| tokens.get(index)), keyword)?;
+            if quoted.is_none_or(|index| index + 1 >= tokens.len()) {
+                return Err(error(
+                    path,
+                    tokens.last(),
+                    keyword,
+                    "attribute definition is missing its type",
+                ));
+            }
+            if let Some(index) = quoted {
+                attribute_definitions.insert(tokens[index].text.clone());
+            }
+        }
+        "BA_DEF_DEF_" | "BA_DEF_DEF_REL_" => {
+            require_quoted_token(path, tokens.get(1), keyword)?;
+            if tokens.len() < 3 {
+                return Err(error(
+                    path,
+                    tokens.last(),
+                    keyword,
+                    "unsupported or incomplete attribute default",
+                ));
+            }
+        }
+        "BA_DEF_REL_" => {
+            let quoted = tokens.iter().position(|token| token.quoted);
+            require_quoted_token(path, quoted.and_then(|index| tokens.get(index)), keyword)?;
+            if quoted.is_none_or(|index| index + 1 >= tokens.len()) {
+                return Err(error(
+                    path,
+                    tokens.last(),
+                    keyword,
+                    "unsupported or incomplete relationship attribute definition",
+                ));
+            }
+            if let Some(index) = quoted {
+                attribute_definitions.insert(tokens[index].text.clone());
+            }
+        }
+        "BA_REL_" => {
+            require_quoted_token(path, tokens.get(1), keyword)?;
+            if tokens.len() < 6 {
+                return Err(error(
+                    path,
+                    tokens.last(),
+                    keyword,
+                    "unsupported or incomplete relationship attribute assignment",
+                ));
+            }
+        }
+        "BO_TX_BU_" => {
+            if tokens.len() < 4 {
+                return Err(error(
+                    path,
+                    tokens.first(),
+                    keyword,
+                    "unsupported or incomplete transmitter list",
+                ));
+            }
+            parse_u32(path, &tokens[1], "message_id")?;
+            expect(path, tokens, 2, ":", keyword)?;
+            validate_name_list(path, &tokens[3..], keyword)?;
+        }
+        "SIG_GROUP_" => {
+            if tokens.len() < 6 {
+                return Err(error(
+                    path,
+                    tokens.first(),
+                    keyword,
+                    "unsupported or incomplete signal group definition",
+                ));
+            }
+            if !tokens.iter().any(|token| token.text == ":") {
+                return Err(error(
+                    path,
+                    tokens.last(),
+                    keyword,
+                    "unsupported signal group definition without ':'",
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_name_list(path: &str, tokens: &[Token], field: &str) -> DatabaseResult<()> {
+    let mut expect_name = true;
+    for token in tokens {
+        if token.text == "," {
+            if expect_name {
+                return Err(error(
+                    path,
+                    Some(token),
+                    field,
+                    "unexpected comma in name list",
+                ));
+            }
+            expect_name = true;
+        } else {
+            if token.quoted || !expect_name {
+                return Err(error(path, Some(token), field, "invalid name list"));
+            }
+            expect_name = false;
+        }
+    }
+    if expect_name {
+        return Err(error(
+            path,
+            tokens.last(),
+            field,
+            "name list cannot end with a comma",
+        ));
+    }
+    Ok(())
+}
+
+fn is_can_fd_format(value: &str) -> bool {
+    value.eq_ignore_ascii_case("CAN FD")
+        || value.eq_ignore_ascii_case("StandardCAN_FD")
+        || value.eq_ignore_ascii_case("ExtendedCAN_FD")
+        || value == "2"
+        || value == "14"
+        || value == "15"
+}
+
 fn parse_line(
     path: &str,
     line: &str,
     line_number: usize,
     current_message: Option<CanMessageId>,
     database: &mut DbcDatabase,
+    attribute_definitions: &mut HashSet<String>,
 ) -> DatabaseResult<()> {
     let content = without_line_comment(line);
     let mut tokens = lex_line(path, content, line_number)?;
@@ -662,7 +880,7 @@ fn parse_line(
         ),
         "VAL_" => parse_val(path, &tokens, database),
         "CM_" => parse_comment(path, &tokens, database),
-        "BA_" => parse_attribute(path, &tokens, database),
+        "BA_" => parse_attribute(path, &tokens, database, attribute_definitions),
         "BS_" => {
             if tokens.len() != 2 || tokens[1].text != ":" {
                 return Err(error(
@@ -686,6 +904,13 @@ fn parse_line(
                 ));
             }
             Ok(())
+        }
+        "BA_DEF_" | "BA_DEF_DEF_" | "BA_DEF_REL_" | "BA_DEF_DEF_REL_" | "BA_REL_" | "BO_TX_BU_"
+        | "SIG_GROUP_" | "CAT_DEF_" | "CAT_" | "FILTER_" | "EV_DATA_" | "ENVVAR_DATA_"
+        | "SGTYPE_" | "SGTYPE_VAL_" | "BA_DEF_SGTYPE_" | "BA_SGTYPE_" | "SIG_TYPE_REF_"
+        | "VAL_TABLE_" | "SIG_VALTYPE_" | "SIGTYPE_VALTYPE_" | "BU_SG_REL_" | "BU_EV_REL_"
+        | "BU_BO_REL_" | "SG_MUL_VAL_" => {
+            parse_standard_metadata(path, &tokens, attribute_definitions)
         }
         other => Err(error(
             path,
@@ -717,6 +942,7 @@ impl DbcDatabase {
         let mut in_namespace_declaration = false;
         let mut logical_line = String::new();
         let mut logical_start = 0;
+        let mut attribute_definitions = HashSet::new();
         for (line_index, line) in source.lines().enumerate() {
             if logical_line.is_empty() {
                 logical_start = line_index + 1;
@@ -749,7 +975,14 @@ impl DbcDatabase {
                         .ok_or_else(|| error(&path, tokens.first(), "BO_", "missing message id"))?,
                 )?);
             }
-            parse_line(&path, &line, logical_start, current_message, &mut database)?;
+            parse_line(
+                &path,
+                &line,
+                logical_start,
+                current_message,
+                &mut database,
+                &mut attribute_definitions,
+            )?;
         }
         if !logical_line.is_empty() {
             let content = without_line_comment(&logical_line);
@@ -761,6 +994,7 @@ impl DbcDatabase {
                     logical_start,
                     current_message,
                     &mut database,
+                    &mut attribute_definitions,
                 )?;
             }
         }

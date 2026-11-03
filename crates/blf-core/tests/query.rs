@@ -168,6 +168,15 @@ fn write_unknown_frame_blf(path: &Path) {
     fs::write(path, output).unwrap();
 }
 
+fn write_aggregate_can_blf(path: &Path) {
+    let mut inner = Vec::new();
+    inner.extend_from_slice(&can_message(1, 0x100, 10, &[42]));
+    inner.extend_from_slice(&can_message(1, 0x101, 20, &[7]));
+    let mut output = file_statistics(inner.len() as u64, 2);
+    output.extend_from_slice(&log_container(&inner));
+    fs::write(path, output).unwrap();
+}
+
 fn write_strict_blf(path: &Path) {
     let mut inner = Vec::new();
     inner.extend_from_slice(&can_message(1, 0x100, 10, &[42]));
@@ -192,6 +201,17 @@ fn can_database(name: &str) -> DbcDatabase {
         "VERSION \"1.0\"\nBO_ 256 {name}: 2 ECU\n SG_ Speed : 0|8@1+ (1,0) [0|255] \"\" ECU\n"
     );
     DbcDatabase::from_str(&source).unwrap()
+}
+
+fn aggregate_can_database() -> DbcDatabase {
+    DbcDatabase::from_str(
+        "VERSION \"1.0\"\n\
+         BO_ 256 FirstStatus: 1 ECU\n\
+          SG_ Speed : 0|8@1+ (1,0) [0|255] \"\" ECU\n\
+         BO_ 257 SecondStatus: 1 ECU\n\
+          SG_ Speed : 0|8@1+ (1,0) [0|255] \"\" ECU\n",
+    )
+    .unwrap()
 }
 
 fn lin_database() -> LdfDatabase {
@@ -256,6 +276,34 @@ fn aggregate_query_preserves_channel_context_and_decodes_lin() {
     assert_eq!(samples.len(), 1);
     assert_eq!(samples[0].status, DecodeStatus::Ok);
     assert_eq!(samples[0].raw_value, Some(9));
+    fs::remove_file(path).ok();
+}
+
+#[test]
+fn strict_aggregate_query_does_not_misclassify_other_same_name_messages() {
+    let path = std::env::temp_dir().join("blf-core-query-aggregate-same-name-tests.blf");
+    write_aggregate_can_blf(&path);
+    let file = File::open(&path).unwrap();
+    let binding = DatabaseBinding::new(
+        BusKind::Can,
+        1,
+        Database::Can(Arc::new(aggregate_can_database())),
+    )
+    .unwrap();
+
+    let samples = file
+        .aggregate_signal_query(vec![binding], "Speed", true)
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert_eq!(samples.len(), 2);
+    assert_eq!(samples[0].message_name, "FirstStatus");
+    assert_eq!(samples[0].raw_value, Some(42));
+    assert_eq!(samples[1].message_name, "SecondStatus");
+    assert_eq!(samples[1].raw_value, Some(7));
+    assert!(samples
+        .iter()
+        .all(|sample| sample.status == DecodeStatus::Ok));
     fs::remove_file(path).ok();
 }
 

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::can::{decode_message, decode_signal_for_message, CanDecodeError, DecodedCanSignal};
+use crate::can::{decode_signal_for_message, CanDecodeError, DecodedCanSignal};
 use crate::database::{
     BusKind, Database, DatabaseBinding, DatabaseError, DbcDatabase, DbcMessage, LdfDatabase,
     LinFrame, LinSignal,
@@ -297,6 +297,43 @@ impl SignalQuery {
             })
             .collect();
         let mut results = Vec::new();
+        let frame_known = channel_targets.iter().any(|target| {
+            matches!(
+                &target.target,
+                QueryTarget::Can { database, .. } if database.message_by_id(id, extended).is_some()
+            )
+        });
+        let has_matching_target = channel_targets.iter().any(|target| {
+            matches!(
+                &target.target,
+                QueryTarget::Can {
+                    id: target_id,
+                    extended: target_extended,
+                    ..
+                } if *target_id == id && *target_extended == extended
+            )
+        });
+        if !frame_known && !has_matching_target {
+            if let Some(QueryTarget::Can {
+                message_name,
+                signal_name,
+                ..
+            }) = channel_targets.first().map(|target| &target.target)
+            {
+                results.push(Ok(error_sample(
+                    timestamp_ns,
+                    BusKind::Can,
+                    channel,
+                    id,
+                    "<unknown>",
+                    signal_name,
+                    DecodeStatus::UnknownFrame,
+                    format!("unknown CAN frame 0x{id:X} for signal {message_name}.{signal_name}"),
+                    data,
+                )));
+            }
+            return results;
+        }
         for target in channel_targets {
             let QueryTarget::Can {
                 id: target_id,
@@ -309,32 +346,16 @@ impl SignalQuery {
             else {
                 continue;
             };
-            let Some(message) = database.message_by_id(id, extended) else {
-                results.push(Ok(error_sample(
-                    timestamp_ns,
-                    BusKind::Can,
-                    channel,
-                    id,
-                    "<unknown>",
-                    signal_name,
-                    DecodeStatus::UnknownFrame,
-                    format!("unknown CAN frame 0x{id:X} for signal {message_name}.{signal_name}"),
-                    data,
-                )));
-                continue;
-            };
+            // In an aggregate query, only the target that owns the observed
+            // frame may produce a sample. Check ownership before the lookup,
+            // otherwise another same-name target can emit a false unknown.
             if *target_id != id || *target_extended != extended {
                 continue;
             }
-            let decoded = if message.dlc > 64 {
-                decode_signal_for_message(message, signal_name, data)
-            } else {
-                decode_message(message, data).map(|signals| {
-                    signals
-                        .into_iter()
-                        .find(|signal| signal.signal_name == *signal_name)
-                })
+            let Some(message) = database.message_by_id(id, extended) else {
+                continue;
             };
+            let decoded = decode_signal_for_message(message, signal_name, data);
             match decoded {
                 Ok(Some(signal)) => results.push(Ok(can_sample(
                     timestamp_ns,
@@ -391,6 +412,39 @@ impl SignalQuery {
             })
             .collect();
         let mut results = Vec::new();
+        let frame_known = channel_targets.iter().any(|target| {
+            matches!(
+                &target.target,
+                QueryTarget::Lin { database, .. } if database.frame_by_id(frame_id).is_some()
+            )
+        });
+        let has_matching_target = channel_targets.iter().any(|target| {
+            matches!(
+                &target.target,
+                QueryTarget::Lin {
+                    frame_id: target_frame_id,
+                    ..
+                } if *target_frame_id == frame_id
+            )
+        });
+        if !frame_known && !has_matching_target {
+            if let Some(QueryTarget::Lin { signal_name, .. }) =
+                channel_targets.first().map(|target| &target.target)
+            {
+                results.push(Ok(error_sample(
+                    timestamp_ns,
+                    BusKind::Lin,
+                    channel,
+                    u32::from(frame_id),
+                    "<unknown>",
+                    signal_name,
+                    DecodeStatus::UnknownFrame,
+                    format!("unknown LIN frame 0x{frame_id:02X} for signal {signal_name}"),
+                    observation.payload.as_deref().unwrap_or_default(),
+                )));
+            }
+            return results;
+        }
         for target in channel_targets {
             let QueryTarget::Lin {
                 frame_id: target_frame_id,
@@ -401,26 +455,15 @@ impl SignalQuery {
             else {
                 continue;
             };
-            let payload = observation.payload.as_deref().unwrap_or_default();
-            let Some(frame) = database.frame_by_id(frame_id) else {
-                results.push(Ok(error_sample(
-                    timestamp_ns,
-                    BusKind::Lin,
-                    channel,
-                    u32::from(frame_id),
-                    "<unknown>",
-                    signal_name,
-                    DecodeStatus::UnknownFrame,
-                    format!(
-                        "unknown LIN frame 0x{frame_id:02X} for signal frame 0x{target_frame_id:02X}.{signal_name}"
-                    ),
-                    payload,
-                )));
-                continue;
-            };
+            // Do not let another same-name LIN frame manufacture an unknown
+            // frame sample for this target.
             if *target_frame_id != frame_id {
                 continue;
             }
+            let payload = observation.payload.as_deref().unwrap_or_default();
+            let Some(frame) = database.frame_by_id(frame_id) else {
+                continue;
+            };
             if !observation.state.has_response() {
                 results.push(Ok(error_sample(
                     timestamp_ns,

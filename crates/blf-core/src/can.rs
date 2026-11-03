@@ -155,6 +155,15 @@ pub fn decode_signal_for_message(
     signal_name: &str,
     data: &[u8],
 ) -> Result<Option<DecodedCanSignal>, CanDecodeError> {
+    // Ordinary CAN/CAN-FD messages have a physical DLC.  Logical Vector
+    // container messages may declare a larger application-level DLC, so those
+    // continue to validate only the requested signal's bit range below.
+    if message.dlc <= 64 && data.len() < usize::from(message.dlc) {
+        return Err(CanDecodeError::PayloadTooShort {
+            required: usize::from(message.dlc),
+            actual: data.len(),
+        });
+    }
     let Some(signal) = message.signal(signal_name) else {
         return Ok(None);
     };
