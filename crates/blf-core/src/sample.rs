@@ -75,6 +75,32 @@ pub struct SignalSample {
     pub status: DecodeStatus,
     pub error: Option<String>,
     pub data: Vec<u8>,
+    pub object_type: u32,
+    pub object_class: String,
+    pub direction: Option<String>,
+    pub raw_direction: Option<u8>,
+    pub is_tx: bool,
+    pub is_rx: bool,
+    pub dlc: Option<u8>,
+    pub payload_length: usize,
+    pub header_dlc: Option<u8>,
+    pub timestamp_source: Option<String>,
+    pub signal_timestamp_ns: Option<u64>,
+    pub databyte_timestamps: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SampleContext {
+    pub object_type: u32,
+    pub object_class: String,
+    pub direction: Option<String>,
+    pub raw_direction: Option<u8>,
+    pub dlc: Option<u8>,
+    pub header_dlc: Option<u8>,
+    pub payload_length: usize,
+    pub timestamp_source: Option<String>,
+    pub signal_timestamp_ns: Option<u64>,
+    pub databyte_timestamps: Vec<u64>,
 }
 
 impl SignalSample {
@@ -106,6 +132,18 @@ impl SignalSample {
             status: DecodeStatus::Ok,
             error: None,
             data: data.into(),
+            object_type: 0,
+            object_class: String::new(),
+            direction: None,
+            raw_direction: None,
+            is_tx: false,
+            is_rx: false,
+            dlc: None,
+            payload_length: 0,
+            header_dlc: None,
+            timestamp_source: None,
+            signal_timestamp_ns: None,
+            databyte_timestamps: Vec::new(),
         }
     }
 
@@ -136,7 +174,35 @@ impl SignalSample {
             status,
             error: Some(error.into()),
             data: data.into(),
+            object_type: 0,
+            object_class: String::new(),
+            direction: None,
+            raw_direction: None,
+            is_tx: false,
+            is_rx: false,
+            dlc: None,
+            payload_length: 0,
+            header_dlc: None,
+            timestamp_source: None,
+            signal_timestamp_ns: None,
+            databyte_timestamps: Vec::new(),
         }
+    }
+
+    pub fn with_context(mut self, context: SampleContext) -> Self {
+        self.object_type = context.object_type;
+        self.object_class = context.object_class;
+        self.raw_direction = context.raw_direction;
+        self.direction = context.direction;
+        self.is_tx = self.raw_direction == Some(1);
+        self.is_rx = self.raw_direction == Some(0);
+        self.dlc = context.dlc;
+        self.header_dlc = context.header_dlc;
+        self.payload_length = context.payload_length;
+        self.timestamp_source = context.timestamp_source;
+        self.signal_timestamp_ns = context.signal_timestamp_ns;
+        self.databyte_timestamps = context.databyte_timestamps;
+        self
     }
 
     pub fn has_value(&self) -> bool {

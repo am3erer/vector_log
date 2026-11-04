@@ -68,6 +68,11 @@ fn parses_ldf_sections_and_applies_signal_representation() {
         10
     );
     assert_eq!(database.encodings().count(), 2);
+    assert_eq!(database.signal_count(), 2);
+    let mut signal_names: Vec<_> = database.signal_names().collect();
+    signal_names.sort_unstable();
+    assert_eq!(signal_names, ["Status.Mode", "Status.Speed"]);
+    assert_eq!(database.diagnostic_signal_count(), 0);
 
     let frame = database.frame_by_name("Status").unwrap();
     assert_eq!(frame.id, 1);
@@ -176,6 +181,8 @@ fn decodes_little_endian_lin_signals_and_rejects_bad_payload_state() {
         name: "Value".to_string(),
         start_bit: 3,
         bit_length: 5,
+        publisher: Some("ECU".to_string()),
+        subscribers: vec!["Tester".to_string()],
         initial_value: Some(0),
         factor: 2.0,
         offset: -1.0,
@@ -475,6 +482,67 @@ Frames { Diagnostic: 60, ECU, 1 { State, 0 ; } }
     assert_eq!(
         database.frame_by_id(0x3C).unwrap().checksum,
         LinChecksum::Classic
+    );
+}
+
+#[test]
+fn parses_diagnostic_signals_frames_and_node_attributes() {
+    let source = r#"
+LIN_description_file;
+LIN_protocol_version = "2.2";
+Nodes { Master: Master, 5 ms, 0.1 ms ; Slaves: Slave ; }
+Signals { ResponseError: 1, 0, Slave, Master ; }
+Frames { Status: 1, Slave, 1 { ResponseError, 0 ; } }
+Diagnostic_signals {
+  MasterReqB0: 8, 0 ;
+  SlaveRespB0: 8, 0 ;
+}
+Diagnostic_frames {
+  MasterReq: 0x3c { MasterReqB0, 0 ; }
+  SlaveResp: 0x3d { SlaveRespB0, 0 ; }
+}
+Node_attributes {
+  Slave{
+    LIN_protocol = "2.2" ;
+    configured_NAD = 0x12 ;
+    initial_NAD = 0x10 ;
+    product_id = 0x1, 0x2, 255 ;
+    response_error = ResponseError ;
+    P2_min = 50 ms ;
+    ST_min = 0 ms ;
+    N_As_timeout = 1000 ms ;
+    N_Cr_timeout = 1000 ms ;
+    configurable_frames { Status ; }
+  }
+}
+"#;
+    let database = LdfDatabase::from_str(source).unwrap();
+
+    let diagnostic = database.diagnostic_frame_by_name("MasterReq").unwrap();
+    assert_eq!(diagnostic.id, 0x3C);
+    assert_eq!(diagnostic.dlc, 8);
+    assert_eq!(diagnostic.checksum, LinChecksum::Classic);
+    assert_eq!(diagnostic.signal("MasterReqB0").unwrap().start_bit, 0);
+    assert_eq!(database.diagnostic_frames().count(), 2);
+    assert_eq!(database.diagnostic_signals().count(), 2);
+    let (frame, signal) = database.diagnostic_signal("MasterReq.MasterReqB0").unwrap();
+    assert_eq!(frame.id, 0x3C);
+    assert_eq!(signal.bit_length, 8);
+
+    let attributes = database.node_attributes().next().unwrap().1;
+    assert_eq!(attributes.configured_nad, Some(0x12));
+    assert_eq!(attributes.initial_nad, Some(0x10));
+    assert_eq!(attributes.product_id, Some([1, 2, 255]));
+    assert_eq!(attributes.response_error.as_deref(), Some("ResponseError"));
+    assert_eq!(attributes.p2_min_ms, Some(50.0));
+    assert_eq!(attributes.configurable_frames, ["Status"]);
+    assert_eq!(
+        database
+            .nodes()
+            .find(|node| node.name == "Slave")
+            .unwrap()
+            .configured_nad,
+        Some(0x12)
     );
 }
 

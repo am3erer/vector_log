@@ -12,9 +12,10 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::database::{
-    DatabaseError, DatabaseResult, LdfDatabase, LdfOptionalSection, LinChecksum, LinDynamicFrame,
-    LinDynamicFrameKind, LinEncoding, LinFrame, LinNode, LinPhysicalRange, LinScheduleEntry,
-    LinSignal, SourceSpan, ValueTable,
+    DatabaseError, DatabaseResult, LdfDatabase, LdfOptionalSection, LinChecksum,
+    LinDiagnosticFrame, LinDiagnosticSignal, LinDynamicFrame, LinDynamicFrameKind, LinEncoding,
+    LinFrame, LinNode, LinNodeAttribute, LinPhysicalRange, LinScheduleEntry, LinSignal, SourceSpan,
+    ValueTable,
 };
 use crate::lin::{classify_lin_object, LinObservation, LinResponseState};
 use crate::types::LinObject;
@@ -337,9 +338,21 @@ fn parse_nodes(
                 let name = significant
                     .get(2)
                     .ok_or_else(|| db_error(path, Some(kind), "Master", "missing master name"))?;
+                if significant.len() != 7 {
+                    return Err(db_error(
+                        path,
+                        Some(kind),
+                        "Master",
+                        "master declaration must contain name, timebase, and jitter",
+                    ));
+                }
+                let timebase_ms = parse_time_value(path, &significant[3..5], "timebase")?;
+                let jitter_ms = parse_time_value(path, &significant[5..7], "jitter")?;
                 database.nodes.push(LinNode {
                     name: name.text.clone(),
                     configured_nad: None,
+                    timebase_ms: Some(timebase_ms),
+                    jitter_ms: Some(jitter_ms),
                     source: Some(SourceSpan::new(name.line, name.column)),
                 });
             }
@@ -351,6 +364,8 @@ fn parse_nodes(
                     database.nodes.push(LinNode {
                         name: name.text.clone(),
                         configured_nad: None,
+                        timebase_ms: None,
+                        jitter_ms: None,
                         source: Some(SourceSpan::new(name.line, name.column)),
                     });
                 }
@@ -416,7 +431,7 @@ fn parse_signal_definition(
             "publisher must be a node name",
         ));
     }
-    let mut subscribers = 0;
+    let mut subscriber_names = Vec::new();
     while index < statement.len() {
         expect(statement, &mut index, ",", path, "Signals")?;
         let subscriber = next(statement, &mut index, path, "subscriber")?;
@@ -428,9 +443,9 @@ fn parse_signal_definition(
                 "subscriber must be a node name",
             ));
         }
-        subscribers += 1;
+        subscriber_names.push(subscriber.text.clone());
     }
-    if subscribers == 0 {
+    if subscriber_names.is_empty() {
         return Err(db_error(
             path,
             Some(publisher),
@@ -443,6 +458,8 @@ fn parse_signal_definition(
         start_bit: 0,
         bit_length: u16::try_from(bit_length)
             .map_err(|_| db_error(path, Some(name), "bit_length", "outside u16"))?,
+        publisher: Some(publisher.text.clone()),
+        subscribers: subscriber_names,
         initial_value: Some(i64::from(initial_value)),
         factor: 1.0,
         offset: 0.0,
@@ -466,6 +483,271 @@ fn parse_signal_definition(
             ));
         }
     }
+    Ok(())
+}
+
+fn parse_diagnostic_signal_definition(
+    path: &str,
+    statement: &[Token],
+    pending: &mut HashMap<String, LinDiagnosticSignal>,
+) -> DatabaseResult<()> {
+    let mut index = 0;
+    let name = next(statement, &mut index, path, "Diagnostic_signals")?;
+    expect(statement, &mut index, ":", path, "Diagnostic_signals")?;
+    let bit_length = parse_u32(
+        path,
+        next(statement, &mut index, path, "bit_length")?,
+        "bit_length",
+    )?;
+    if bit_length == 0 || bit_length > 64 {
+        return Err(db_error(
+            path,
+            statement.get(index.saturating_sub(1)),
+            "bit_length",
+            "LIN diagnostic signal bit length must be between 1 and 64",
+        ));
+    }
+    expect(statement, &mut index, ",", path, "Diagnostic_signals")?;
+    let initial = next(statement, &mut index, path, "initial_value")?;
+    let initial_value = if initial.text == "{" {
+        let value = parse_u32(
+            path,
+            next(statement, &mut index, path, "initial_value")?,
+            "initial_value",
+        )?;
+        expect(statement, &mut index, "}", path, "initial_value")?;
+        value
+    } else {
+        parse_u32(path, initial, "initial_value")?
+    };
+    if index != statement.len() {
+        return Err(db_error(
+            path,
+            statement.get(index),
+            "Diagnostic_signals",
+            "unexpected tokens after diagnostic signal declaration",
+        ));
+    }
+    let signal = LinDiagnosticSignal {
+        name: name.text.clone(),
+        bit_length: u16::try_from(bit_length)
+            .map_err(|_| db_error(path, Some(name), "bit_length", "outside u16"))?,
+        initial_value: Some(i64::from(initial_value)),
+        source: Some(SourceSpan::new(name.line, name.column)),
+    };
+    if pending.insert(name.text.clone(), signal).is_some() {
+        return Err(db_error(
+            path,
+            Some(name),
+            "Diagnostic_signals",
+            format!("duplicate diagnostic signal definition {:?}", name.text),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_diagnostic_frame(
+    path: &str,
+    tokens: &[Token],
+    index: &mut usize,
+    database: &mut LdfDatabase,
+    pending: &HashMap<String, LinDiagnosticSignal>,
+) -> DatabaseResult<()> {
+    let name = next(tokens, index, path, "Diagnostic_frames")?.clone();
+    expect(tokens, index, ":", path, "Diagnostic_frames")?;
+    let id_token = next(tokens, index, path, "diagnostic_frame_id")?;
+    let id = parse_u8(path, id_token, "diagnostic_frame_id")?;
+    if id > 0x3F {
+        return Err(db_error(
+            path,
+            Some(id_token),
+            "diagnostic_frame_id",
+            format!("LIN frame identifier 0x{id:02X} exceeds the six-bit range"),
+        ));
+    }
+    expect(tokens, index, "{", path, "Diagnostic_frames")?;
+    let mut signals = Vec::new();
+    while *index < tokens.len() && tokens[*index].text != "}" {
+        let statement = statement_tokens(tokens, index, path)?;
+        let significant: Vec<&Token> = statement.iter().filter(|token| token.text != ",").collect();
+        if significant.len() != 2 {
+            return Err(db_error(
+                path,
+                statement.first(),
+                "diagnostic_frame_signal",
+                "diagnostic frame signal must contain a name and bit offset",
+            ));
+        }
+        let signal_name = significant[0].text.clone();
+        let offset = parse_u32(path, significant[1], "offset")?;
+        let offset = u16::try_from(offset)
+            .map_err(|_| db_error(path, Some(significant[1]), "offset", "outside u16"))?;
+        let diagnostic = pending.get(&signal_name).ok_or_else(|| {
+            db_error(
+                path,
+                Some(significant[0]),
+                "diagnostic_signal",
+                format!(
+                    "diagnostic frame {:?} references undefined signal {:?}",
+                    name.text, signal_name
+                ),
+            )
+        })?;
+        signals.push(LinSignal {
+            name: diagnostic.name.clone(),
+            start_bit: offset,
+            bit_length: diagnostic.bit_length,
+            publisher: None,
+            subscribers: Vec::new(),
+            initial_value: diagnostic.initial_value,
+            factor: 1.0,
+            offset: 0.0,
+            minimum: None,
+            maximum: None,
+            physical_ranges: Vec::new(),
+            encoding: None,
+            choices: ValueTable::default(),
+            source: diagnostic.source,
+        });
+    }
+    expect(tokens, index, "}", path, "Diagnostic_frames")?;
+    database.insert_diagnostic_frame(LinDiagnosticFrame {
+        id,
+        name: name.text,
+        dlc: 8,
+        checksum: LinChecksum::Classic,
+        signals,
+        source: Some(SourceSpan::new(name.line, name.column)),
+    })
+}
+
+fn parse_time_value(path: &str, statement: &[&Token], field: &str) -> DatabaseResult<f64> {
+    if statement.len() != 2 || !statement[1].text.eq_ignore_ascii_case("ms") {
+        return Err(db_error(
+            path,
+            statement.first().copied(),
+            field,
+            "time value must be '<number> ms'",
+        ));
+    }
+    parse_f64(path, statement[0], field)
+}
+
+fn parse_node_attributes(
+    path: &str,
+    tokens: &[Token],
+    index: &mut usize,
+    database: &mut LdfDatabase,
+) -> DatabaseResult<()> {
+    expect(tokens, index, "{", path, "Node_attributes")?;
+    while *index < tokens.len() && tokens[*index].text != "}" {
+        let node = next(tokens, index, path, "Node_attributes")?.clone();
+        expect(tokens, index, "{", path, "Node_attributes")?;
+        let mut attributes = LinNodeAttribute {
+            node_name: node.text.clone(),
+            lin_protocol: None,
+            configured_nad: None,
+            initial_nad: None,
+            product_id: None,
+            response_error: None,
+            p2_min_ms: None,
+            st_min_ms: None,
+            n_as_timeout_ms: None,
+            n_cr_timeout_ms: None,
+            configurable_frames: Vec::new(),
+            source: Some(SourceSpan::new(node.line, node.column)),
+        };
+        while *index < tokens.len() && tokens[*index].text != "}" {
+            if tokens[*index].text == "configurable_frames" {
+                *index += 1;
+                expect(tokens, index, "{", path, "configurable_frames")?;
+                while *index < tokens.len() && tokens[*index].text != "}" {
+                    let frame = next(tokens, index, path, "configurable_frames")?.clone();
+                    attributes.configurable_frames.push(frame.text);
+                    expect(tokens, index, ";", path, "configurable_frames")?;
+                }
+                expect(tokens, index, "}", path, "configurable_frames")?;
+                continue;
+            }
+            let statement = statement_tokens(tokens, index, path)?;
+            let significant: Vec<&Token> =
+                statement.iter().filter(|token| token.text != ",").collect();
+            if significant.len() < 3 || significant[1].text != "=" {
+                return Err(db_error(
+                    path,
+                    statement.first(),
+                    "Node_attributes",
+                    "node attribute must be an assignment",
+                ));
+            }
+            let field = significant[0].text.as_str();
+            match field {
+                "LIN_protocol" => {
+                    if significant.len() != 3 {
+                        return Err(db_error(path, statement.first(), field, "invalid protocol"));
+                    }
+                    attributes.lin_protocol = Some(significant[2].text.clone());
+                }
+                "configured_NAD" => {
+                    attributes.configured_nad = Some(parse_u8(path, significant[2], field)?);
+                }
+                "initial_NAD" => {
+                    attributes.initial_nad = Some(parse_u8(path, significant[2], field)?);
+                }
+                "product_id" => {
+                    if significant.len() != 5 {
+                        return Err(db_error(
+                            path,
+                            statement.first(),
+                            field,
+                            "expected three values",
+                        ));
+                    }
+                    attributes.product_id = Some([
+                        parse_u32(path, significant[2], field)?,
+                        parse_u32(path, significant[3], field)?,
+                        parse_u32(path, significant[4], field)?,
+                    ]);
+                }
+                "response_error" => {
+                    if significant.len() != 3 {
+                        return Err(db_error(
+                            path,
+                            statement.first(),
+                            field,
+                            "invalid signal name",
+                        ));
+                    }
+                    attributes.response_error = Some(significant[2].text.clone());
+                }
+                "P2_min" => {
+                    attributes.p2_min_ms = Some(parse_time_value(path, &significant[2..], field)?)
+                }
+                "ST_min" => {
+                    attributes.st_min_ms = Some(parse_time_value(path, &significant[2..], field)?)
+                }
+                "N_As_timeout" => {
+                    attributes.n_as_timeout_ms =
+                        Some(parse_time_value(path, &significant[2..], field)?)
+                }
+                "N_Cr_timeout" => {
+                    attributes.n_cr_timeout_ms =
+                        Some(parse_time_value(path, &significant[2..], field)?)
+                }
+                other => {
+                    return Err(db_error(
+                        path,
+                        significant.first().copied(),
+                        other,
+                        "unsupported node attribute",
+                    ));
+                }
+            }
+        }
+        expect(tokens, index, "}", path, "Node_attributes")?;
+        database.insert_node_attributes(attributes)?;
+    }
+    expect(tokens, index, "}", path, "Node_attributes")?;
     Ok(())
 }
 
@@ -840,6 +1122,7 @@ impl LdfDatabase {
         let tokens = lex(&path, source)?;
         let mut database = LdfDatabase::with_source_path(path.clone());
         let mut pending_signals = HashMap::new();
+        let mut pending_diagnostic_signals = HashMap::new();
         let mut index = 0;
         while index < tokens.len() {
             let keyword = tokens[index].text.clone();
@@ -924,6 +1207,69 @@ impl LdfDatabase {
                 "Signal_representation" => {
                     parse_signal_representation(&path, &tokens, &mut index, &mut database)?;
                 }
+                "Diagnostic_signals" => {
+                    expect(&tokens, &mut index, "{", &path, "Diagnostic_signals")?;
+                    while index < tokens.len() && tokens[index].text != "}" {
+                        let statement = statement_tokens(&tokens, &mut index, &path)?;
+                        if !statement.is_empty() {
+                            parse_diagnostic_signal_definition(
+                                &path,
+                                &statement,
+                                &mut pending_diagnostic_signals,
+                            )?;
+                            let signal = pending_diagnostic_signals
+                                .get(statement.first().map_or("", |token| token.text.as_str()))
+                                .cloned()
+                                .ok_or_else(|| {
+                                    db_error(
+                                        &path,
+                                        statement.first(),
+                                        "Diagnostic_signals",
+                                        "diagnostic signal was not retained",
+                                    )
+                                })?;
+                            database.insert_diagnostic_signal(signal)?;
+                        }
+                    }
+                    expect(&tokens, &mut index, "}", &path, "Diagnostic_signals")?;
+                    let source = tokens
+                        .get(index.saturating_sub(1))
+                        .map(|token| SourceSpan::new(token.line, token.column));
+                    database.optional_sections.push(LdfOptionalSection {
+                        name: keyword,
+                        source,
+                    });
+                }
+                "Diagnostic_frames" => {
+                    expect(&tokens, &mut index, "{", &path, "Diagnostic_frames")?;
+                    while index < tokens.len() && tokens[index].text != "}" {
+                        parse_diagnostic_frame(
+                            &path,
+                            &tokens,
+                            &mut index,
+                            &mut database,
+                            &pending_diagnostic_signals,
+                        )?;
+                    }
+                    expect(&tokens, &mut index, "}", &path, "Diagnostic_frames")?;
+                    let source = tokens
+                        .get(index.saturating_sub(1))
+                        .map(|token| SourceSpan::new(token.line, token.column));
+                    database.optional_sections.push(LdfOptionalSection {
+                        name: keyword,
+                        source,
+                    });
+                }
+                "Node_attributes" => {
+                    parse_node_attributes(&path, &tokens, &mut index, &mut database)?;
+                    let source = tokens
+                        .get(index.saturating_sub(1))
+                        .map(|token| SourceSpan::new(token.line, token.column));
+                    database.optional_sections.push(LdfOptionalSection {
+                        name: keyword,
+                        source,
+                    });
+                }
                 // Optional diagnostic, node attribute, and vendor sections do
                 // not affect ordinary signal decoding. Dynamic frame sections
                 // are parsed into explicit associations because a BLF record
@@ -960,8 +1306,7 @@ impl LdfDatabase {
                         LinDynamicFrameKind::EventTriggered,
                     )?;
                 }
-                "Diagnostic_signals" | "Diagnostic_frames" | "Node_attributes"
-                | "Table_conversion" => {
+                "Table_conversion" => {
                     let source = tokens
                         .get(index.saturating_sub(1))
                         .map(|token| SourceSpan::new(token.line, token.column));

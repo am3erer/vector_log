@@ -5,8 +5,9 @@ use std::fs;
 use std::path::Path;
 
 use crate::database::{
-    ByteOrder, CanMessageId, CanPayloadKind, CanSignal, DatabaseError, DatabaseResult, DbcDatabase,
-    DbcMessage, MultiplexRole, SignalType, SourceSpan, ValueTable,
+    ByteOrder, CanMessageId, CanPayloadKind, CanSignal, DatabaseError, DatabaseResult,
+    DbcAttributeAssignment, DbcAttributeDefinition, DbcDatabase, DbcMessage, DbcNode,
+    DbcRelationshipAttribute, DbcSignalGroup, MultiplexRole, SignalType, SourceSpan, ValueTable,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -277,6 +278,7 @@ fn parse_bo(path: &str, tokens: &[Token], database: &mut DbcDatabase) -> Databas
         // VFrameFormat marker is parsed.  An oversized DLC alone is not
         // sufficient to relax physical payload validation.
         payload_kind: CanPayloadKind::Physical,
+        transmitter: tokens[5].text.clone(),
         signals: Vec::new(),
         comment: None,
         attributes: Default::default(),
@@ -422,14 +424,20 @@ fn parse_signal(
     index += 1;
     expect(path, tokens, index, "]", "SG_")?;
     index += 1;
-    let unit = tokens
+    let unit_token = tokens
         .get(index)
         .ok_or_else(|| error(path, tokens.last(), "unit", "missing unit"))?;
+    if !unit_token.quoted {
+        return Err(error(path, Some(unit_token), "unit", "unit must be quoted"));
+    }
+    // An empty quoted unit is the DBC spelling for an absent unit. Match the
+    // nullable metadata contract used by database consumers.
+    let unit = (!unit_token.text.is_empty()).then(|| unit_token.text.clone());
     index += 1;
     let receiver = tokens
         .get(index)
         .ok_or_else(|| error(path, tokens.last(), "receiver", "missing receiver"))?;
-    let _ = unit;
+    let mut receivers = Vec::new();
     if receiver.quoted || receiver.text == "," {
         return Err(error(
             path,
@@ -438,6 +446,7 @@ fn parse_signal(
             "receiver must be an ECU name",
         ));
     }
+    receivers.push(receiver.text.clone());
     index += 1;
     while index < tokens.len() {
         if tokens[index].text == "," {
@@ -459,6 +468,7 @@ fn parse_signal(
                     "receiver must be an ECU name after a comma",
                 ));
             }
+            receivers.push(receiver.text.clone());
             index += 1;
         } else {
             let receiver = &tokens[index];
@@ -472,6 +482,7 @@ fn parse_signal(
             }
             // Accept both comma-separated and legacy whitespace-separated
             // receiver lists emitted by existing DBC generators.
+            receivers.push(receiver.text.clone());
             index += 1;
         }
     }
@@ -499,11 +510,21 @@ fn parse_signal(
             "signal bit length must be between 1 and 64",
         ));
     }
+    // DBC uses [0|0] as the conventional "no physical limits specified"
+    // marker. Keep both bounds absent so decoding does not reject valid raw
+    // values merely because a generator omitted signal limits.
+    let (minimum, maximum) = if minimum == 0.0 && maximum == 0.0 {
+        (None, None)
+    } else {
+        (Some(minimum), Some(maximum))
+    };
     let mut signal = CanSignal::new(name, start_bit, bit_length, byte_order, signal_type);
     signal.factor = factor;
     signal.offset = offset;
-    signal.minimum = Some(minimum);
-    signal.maximum = Some(maximum);
+    signal.minimum = minimum;
+    signal.maximum = maximum;
+    signal.unit = unit;
+    signal.receivers = receivers;
     signal.multiplex = multiplex;
     signal.source = Some(SourceSpan::new(tokens[0].line, tokens[0].column));
     database.add_signal(message_id, signal)
@@ -536,6 +557,115 @@ fn parse_val(path: &str, tokens: &[Token], database: &mut DbcDatabase) -> Databa
         index += 2;
     }
     database.set_signal_choices(id, signal, ValueTable::new(values))
+}
+
+fn parse_value_table(
+    path: &str,
+    tokens: &[Token],
+    database: &mut DbcDatabase,
+) -> DatabaseResult<()> {
+    if tokens.len() < 4 || !tokens.len().is_multiple_of(2) {
+        return Err(error(
+            path,
+            tokens.first(),
+            "VAL_TABLE_",
+            "value table must contain a name and raw/text pairs",
+        ));
+    }
+    let name = &tokens[1];
+    if name.quoted {
+        return Err(error(
+            path,
+            Some(name),
+            "VAL_TABLE_",
+            "value table name must be unquoted",
+        ));
+    }
+    let mut values = Vec::new();
+    let mut index = 2;
+    while index + 1 < tokens.len() {
+        let raw = parse_i128(path, &tokens[index], "VAL_TABLE_")?;
+        let text = &tokens[index + 1];
+        if !text.quoted {
+            return Err(error(
+                path,
+                Some(text),
+                "VAL_TABLE_",
+                "value table text must be quoted",
+            ));
+        }
+        values.push((raw, text.text.clone()));
+        index += 2;
+    }
+    database.set_value_table(name.text.clone(), ValueTable::new(values));
+    Ok(())
+}
+
+fn parse_signal_value_type(
+    path: &str,
+    tokens: &[Token],
+    database: &mut DbcDatabase,
+) -> DatabaseResult<()> {
+    if tokens.len() != 4 && tokens.len() != 5 {
+        return Err(error(
+            path,
+            tokens.first(),
+            "SIG_VALTYPE_",
+            "statement must contain message id, signal name, and value type",
+        ));
+    }
+    let id = message_id(path, &tokens[1])?;
+    let value_index = if tokens.len() == 5 {
+        expect(path, tokens, 3, ":", "SIG_VALTYPE_")?;
+        4
+    } else {
+        3
+    };
+    let value_type = parse_u32(path, &tokens[value_index], "value_type")?;
+    let value_type = u8::try_from(value_type).map_err(|_| {
+        error(
+            path,
+            Some(&tokens[value_index]),
+            "value_type",
+            "value type is outside the supported 0..255 range",
+        )
+    })?;
+    database.set_signal_value_type(id, &tokens[2].text, value_type)
+}
+
+fn parse_signal_type_value_type(
+    path: &str,
+    tokens: &[Token],
+    database: &mut DbcDatabase,
+) -> DatabaseResult<()> {
+    if tokens.len() != 3 {
+        return Err(error(
+            path,
+            tokens.first(),
+            "SIGTYPE_VALTYPE_",
+            "statement must contain signal type and value type",
+        ));
+    }
+    let signal_type = parse_u32(path, &tokens[1], "signal_type")?;
+    let value_type = parse_u32(path, &tokens[2], "value_type")?;
+    let signal_type = u8::try_from(signal_type).map_err(|_| {
+        error(
+            path,
+            Some(&tokens[1]),
+            "signal_type",
+            "signal type is outside the supported 0..255 range",
+        )
+    })?;
+    let value_type = u8::try_from(value_type).map_err(|_| {
+        error(
+            path,
+            Some(&tokens[2]),
+            "value_type",
+            "value type is outside the supported 0..255 range",
+        )
+    })?;
+    database.set_signal_type_value_type(signal_type, value_type);
+    Ok(())
 }
 
 fn parse_comment(path: &str, tokens: &[Token], database: &mut DbcDatabase) -> DatabaseResult<()> {
@@ -654,6 +784,15 @@ fn parse_attribute(
                 }
             }
             database.set_message_attribute(id, name.clone(), value.clone())?;
+            database.add_attribute_assignment(DbcAttributeAssignment {
+                name,
+                scope: "message".to_owned(),
+                message_id: Some(id),
+                signal_name: None,
+                object_name: None,
+                value,
+                source: Some(SourceSpan::new(tokens[0].line, tokens[0].column)),
+            });
         }
         "SG_" | "BU_" | "EV_" => {
             if !is_defined {
@@ -681,9 +820,36 @@ fn parse_attribute(
             match tokens[2].text.as_str() {
                 "SG_" => {
                     let id = message_id(path, &tokens[3])?;
-                    database.set_signal_attribute(id, &tokens[4].text, name, value)?;
+                    let signal_name = tokens[4].text.clone();
+                    database.set_signal_attribute(id, &signal_name, name.clone(), value.clone())?;
+                    database.add_attribute_assignment(DbcAttributeAssignment {
+                        name,
+                        scope: "signal".to_owned(),
+                        message_id: Some(id),
+                        signal_name: Some(signal_name),
+                        object_name: None,
+                        value,
+                        source: Some(SourceSpan::new(tokens[0].line, tokens[0].column)),
+                    });
                 }
-                scope => database.set_scoped_attribute(scope, &tokens[3].text, name, value),
+                scope => {
+                    let object_name = tokens[3].text.clone();
+                    database.set_scoped_attribute(scope, &object_name, name.clone(), value.clone());
+                    database.add_attribute_assignment(DbcAttributeAssignment {
+                        name,
+                        scope: match scope {
+                            "BU_" => "node",
+                            "EV_" => "environment",
+                            _ => scope,
+                        }
+                        .to_owned(),
+                        message_id: None,
+                        signal_name: None,
+                        object_name: Some(object_name),
+                        value,
+                        source: Some(SourceSpan::new(tokens[0].line, tokens[0].column)),
+                    });
+                }
             }
         }
         _ if tokens.len() == 3
@@ -692,7 +858,17 @@ fn parse_attribute(
                 "BO_" | "SG_" | "EV_" | "BU_" | "NS_" | "ENVVAR_"
             ) =>
         {
-            database.set_attribute(name, tokens[2].text.clone());
+            let value = tokens[2].text.clone();
+            database.set_attribute(name.clone(), value.clone());
+            database.add_attribute_assignment(DbcAttributeAssignment {
+                name,
+                scope: "global".to_owned(),
+                message_id: None,
+                signal_name: None,
+                object_name: None,
+                value,
+                source: Some(SourceSpan::new(tokens[0].line, tokens[0].column)),
+            });
         }
         other => {
             return Err(error(
@@ -721,7 +897,128 @@ enum AttributeScope {
     Signal,
     Node,
     Environment,
+    SignalType,
     Relationship(String),
+}
+
+fn attribute_scope_name(scope: &AttributeScope) -> (&'static str, Option<&str>) {
+    match scope {
+        AttributeScope::Global => ("global", None),
+        AttributeScope::Message => ("message", None),
+        AttributeScope::Signal => ("signal", None),
+        AttributeScope::Node => ("node", None),
+        AttributeScope::Environment => ("environment", None),
+        AttributeScope::SignalType => ("signal_type", None),
+        AttributeScope::Relationship(relationship) => ("relationship", Some(relationship)),
+    }
+}
+
+fn parse_attribute_definition(
+    path: &str,
+    tokens: &[Token],
+    database: &mut DbcDatabase,
+    attribute_definitions: &mut HashMap<String, AttributeScope>,
+    scope: AttributeScope,
+    name_index: usize,
+    type_index: usize,
+) -> DatabaseResult<()> {
+    let keyword = tokens
+        .first()
+        .map(|token| token.text.as_str())
+        .unwrap_or("BA_DEF_");
+    let name = tokens.get(name_index).ok_or_else(|| {
+        error(
+            path,
+            tokens.last(),
+            keyword,
+            "attribute definition is missing its name",
+        )
+    })?;
+    require_quoted_token(path, Some(name), keyword)?;
+    let value_type = tokens.get(type_index).ok_or_else(|| {
+        error(
+            path,
+            tokens.last(),
+            keyword,
+            "attribute definition is missing its type",
+        )
+    })?;
+    if value_type.quoted {
+        return Err(error(
+            path,
+            Some(value_type),
+            keyword,
+            "attribute definition type must be unquoted",
+        ));
+    }
+
+    let raw_arguments = tokens[type_index + 1..]
+        .iter()
+        .map(|token| token.text.clone())
+        .collect::<Vec<_>>();
+    let (minimum, maximum, enum_values) = match value_type.text.as_str() {
+        "INT" | "HEX" | "FLOAT" => {
+            if raw_arguments.len() != 2 {
+                return Err(error(
+                    path,
+                    tokens.last(),
+                    keyword,
+                    format!(
+                        "{} attribute definition must contain minimum and maximum",
+                        value_type.text
+                    ),
+                ));
+            }
+            (
+                Some(raw_arguments[0].clone()),
+                Some(raw_arguments[1].clone()),
+                Vec::new(),
+            )
+        }
+        "ENUM" => {
+            let mut values = Vec::new();
+            for token in &tokens[type_index + 1..] {
+                if token.text != "," {
+                    if !token.quoted {
+                        return Err(error(
+                            path,
+                            Some(token),
+                            keyword,
+                            "ENUM attribute values must be quoted",
+                        ));
+                    }
+                    values.push(token.text.clone());
+                }
+            }
+            (None, None, values)
+        }
+        "STRING" => {
+            if !raw_arguments.is_empty() {
+                return Err(error(
+                    path,
+                    tokens.last(),
+                    keyword,
+                    "STRING attribute definition must not have arguments",
+                ));
+            }
+            (None, None, Vec::new())
+        }
+        _ => (None, None, Vec::new()),
+    };
+    let (scope_name, relationship) = attribute_scope_name(&scope);
+    database.set_attribute_definition(DbcAttributeDefinition {
+        name: name.text.clone(),
+        scope: scope_name.to_owned(),
+        relationship: relationship.map(str::to_owned),
+        value_type: value_type.text.clone(),
+        minimum,
+        maximum,
+        enum_values,
+        raw_arguments,
+        source: Some(SourceSpan::new(tokens[0].line, tokens[0].column)),
+    });
+    attribute_definitions.insert(name.text.clone(), scope);
+    Ok(())
 }
 
 fn parse_standard_metadata(
@@ -762,19 +1059,20 @@ fn parse_standard_metadata(
                     ));
                 }
             };
-            let quoted = tokens.iter().position(|token| token.quoted);
-            require_quoted_token(path, quoted.and_then(|index| tokens.get(index)), keyword)?;
-            if quoted.is_none_or(|index| index + 1 >= tokens.len()) {
-                return Err(error(
-                    path,
-                    tokens.last(),
-                    keyword,
-                    "attribute definition is missing its type",
-                ));
-            }
-            if let Some(index) = quoted {
-                attribute_definitions.insert(tokens[index].text.clone(), scope);
-            }
+            let (name_index, type_index) = if tokens.get(1).is_some_and(|token| token.quoted) {
+                (1, 2)
+            } else {
+                (2, 3)
+            };
+            parse_attribute_definition(
+                path,
+                tokens,
+                database,
+                attribute_definitions,
+                scope,
+                name_index,
+                type_index,
+            )?;
         }
         "BA_DEF_DEF_" | "BA_DEF_DEF_REL_" => {
             require_quoted_token(path, tokens.get(1), keyword)?;
@@ -786,6 +1084,14 @@ fn parse_standard_metadata(
                     "unsupported or incomplete attribute default",
                 ));
             }
+            if keyword == "BA_DEF_DEF_REL_" {
+                database.set_relationship_attribute_default(
+                    tokens[1].text.clone(),
+                    tokens[2].text.clone(),
+                );
+            } else {
+                database.set_attribute_default(tokens[1].text.clone(), tokens[2].text.clone());
+            }
         }
         "BA_DEF_REL_" => {
             let relationship = tokens.get(1).filter(|token| !token.quoted).ok_or_else(|| {
@@ -796,22 +1102,32 @@ fn parse_standard_metadata(
                     "relationship attribute definition is missing its relationship scope",
                 )
             })?;
-            let quoted = tokens.iter().position(|token| token.quoted);
-            require_quoted_token(path, quoted.and_then(|index| tokens.get(index)), keyword)?;
-            if quoted.is_none_or(|index| index + 1 >= tokens.len()) {
-                return Err(error(
-                    path,
-                    tokens.last(),
-                    keyword,
-                    "unsupported or incomplete relationship attribute definition",
-                ));
-            }
-            if let Some(index) = quoted {
-                attribute_definitions.insert(
-                    tokens[index].text.clone(),
-                    AttributeScope::Relationship(relationship.text.clone()),
-                );
-            }
+            parse_attribute_definition(
+                path,
+                tokens,
+                database,
+                attribute_definitions,
+                AttributeScope::Relationship(relationship.text.clone()),
+                2,
+                3,
+            )?;
+        }
+        "BA_DEF_SGTYPE_" => {
+            let (name_index, type_index) =
+                if tokens.get(1).is_some_and(|token| token.text == "SGTYPE_") {
+                    (2, 3)
+                } else {
+                    (1, 2)
+                };
+            parse_attribute_definition(
+                path,
+                tokens,
+                database,
+                attribute_definitions,
+                AttributeScope::SignalType,
+                name_index,
+                type_index,
+            )?;
         }
         "BA_REL_" => {
             require_quoted_token(path, tokens.get(1), keyword)?;
@@ -897,6 +1213,15 @@ fn parse_standard_metadata(
                         format!("unknown CAN signal {:?}", signal_name.text),
                     ));
                 }
+                database.add_relationship_attribute(DbcRelationshipAttribute {
+                    name: tokens[1].text.clone(),
+                    relationship: relationship.text.clone(),
+                    source_node: tokens[3].text.clone(),
+                    message_id: id,
+                    signal_name: signal_name.text.clone(),
+                    value: tokens[7].text.clone(),
+                    source: Some(SourceSpan::new(tokens[0].line, tokens[0].column)),
+                })?;
             }
         }
         "BO_TX_BU_" => {
@@ -908,9 +1233,15 @@ fn parse_standard_metadata(
                     "unsupported or incomplete transmitter list",
                 ));
             }
-            parse_u32(path, &tokens[1], "message_id")?;
+            let id = message_id(path, &tokens[1])?;
             expect(path, tokens, 2, ":", keyword)?;
             validate_name_list(path, &tokens[3..], keyword)?;
+            let transmitters = tokens[3..]
+                .iter()
+                .filter(|token| token.text != ",")
+                .map(|token| token.text.as_str())
+                .collect::<Vec<_>>();
+            database.set_message_transmitter(id, transmitters.join(","))?;
         }
         "SIG_GROUP_" => {
             if tokens.len() < 6 {
@@ -929,6 +1260,62 @@ fn parse_standard_metadata(
                     "unsupported signal group definition without ':'",
                 ));
             }
+            let id = message_id(path, &tokens[1])?;
+            let group_name = &tokens[2];
+            if group_name.quoted || group_name.text == ":" {
+                return Err(error(
+                    path,
+                    Some(group_name),
+                    keyword,
+                    "signal group name must be an unquoted identifier",
+                ));
+            }
+            let repetition = parse_u32(path, &tokens[3], "repetition")?;
+            expect(path, tokens, 4, ":", keyword)?;
+            let signal_tokens = &tokens[5..];
+            if signal_tokens.is_empty() {
+                return Err(error(
+                    path,
+                    tokens.last(),
+                    keyword,
+                    "signal group must contain at least one signal",
+                ));
+            }
+            let message = database.message_by_id(id.id, id.extended).ok_or_else(|| {
+                error(
+                    path,
+                    Some(&tokens[1]),
+                    keyword,
+                    format!("unknown CAN message id 0x{:X}", id.id),
+                )
+            })?;
+            let mut signal_names = Vec::with_capacity(signal_tokens.len());
+            for signal in signal_tokens {
+                if signal.quoted || signal.text == "," {
+                    return Err(error(
+                        path,
+                        Some(signal),
+                        keyword,
+                        "signal group members must be unquoted signal names",
+                    ));
+                }
+                if message.signal(&signal.text).is_none() {
+                    return Err(error(
+                        path,
+                        Some(signal),
+                        keyword,
+                        format!("unknown CAN signal {:?}", signal.text),
+                    ));
+                }
+                signal_names.push(signal.text.clone());
+            }
+            database.add_signal_group(DbcSignalGroup {
+                message_id: id,
+                name: group_name.text.clone(),
+                repetition,
+                signal_names,
+                source: Some(SourceSpan::new(tokens[0].line, tokens[0].column)),
+            })?;
         }
         _ => {
             return Err(error(
@@ -943,10 +1330,11 @@ fn parse_standard_metadata(
 }
 
 fn validate_name_list(path: &str, tokens: &[Token], field: &str) -> DatabaseResult<()> {
+    let mut saw_name = false;
     let mut expect_name = true;
     for token in tokens {
         if token.text == "," {
-            if expect_name {
+            if !saw_name || expect_name {
                 return Err(error(
                     path,
                     Some(token),
@@ -956,13 +1344,17 @@ fn validate_name_list(path: &str, tokens: &[Token], field: &str) -> DatabaseResu
             }
             expect_name = true;
         } else {
-            if token.quoted || !expect_name {
+            if token.quoted {
                 return Err(error(path, Some(token), field, "invalid name list"));
             }
+            // DBC files in the wild use both `A,B` and `A B` for this list.
+            // Whitespace is already discarded by the lexer, so a name after
+            // another name is a valid whitespace-separated entry.
+            saw_name = true;
             expect_name = false;
         }
     }
-    if expect_name {
+    if !saw_name || expect_name {
         return Err(error(
             path,
             tokens.last(),
@@ -1200,10 +1592,37 @@ fn parse_line(
                     "node declaration must start with `BU_ :` and contain no extra separators",
                 ));
             }
+            if tokens.len() == 2 {
+                return Err(error(
+                    path,
+                    tokens.last(),
+                    "BU_",
+                    "node declaration must contain at least one node",
+                ));
+            }
+            for node in &tokens[2..] {
+                if node.quoted || node.text == "," {
+                    return Err(error(
+                        path,
+                        Some(node),
+                        "BU_",
+                        "node name must be an unquoted token",
+                    ));
+                }
+                database.add_node(DbcNode {
+                    name: node.text.clone(),
+                    source: Some(SourceSpan::new(node.line, node.column)),
+                })?;
+            }
             Ok(())
         }
-        "BA_DEF_" | "BA_DEF_DEF_" | "BA_DEF_REL_" | "BA_DEF_DEF_REL_" | "BA_REL_" | "BO_TX_BU_"
-        | "SIG_GROUP_" => parse_standard_metadata(path, &tokens, database, attribute_definitions),
+        "BA_DEF_" | "BA_DEF_DEF_" | "BA_DEF_REL_" | "BA_DEF_DEF_REL_" | "BA_DEF_SGTYPE_"
+        | "BA_REL_" | "BO_TX_BU_" | "SIG_GROUP_" => {
+            parse_standard_metadata(path, &tokens, database, attribute_definitions)
+        }
+        "VAL_TABLE_" => parse_value_table(path, &tokens, database),
+        "SIG_VALTYPE_" => parse_signal_value_type(path, &tokens, database),
+        "SIGTYPE_VALTYPE_" => parse_signal_type_value_type(path, &tokens, database),
         "SG_MUL_VAL_" => parse_sg_mul_val(path, &tokens, database),
         other => Err(error(
             path,

@@ -66,6 +66,7 @@ BlfCompressionError = _core.BlfCompressionError
 BlfUnsupportedObjectError = _core.BlfUnsupportedObjectError
 BlfUnsupportedVersionError = _core.BlfUnsupportedVersionError
 SignalQueryError = _core.SignalQueryError
+DatabaseParseError = _core.DatabaseParseError
 DbcDatabase = _core.DbcDatabase
 LdfDatabase = _core.LdfDatabase
 
@@ -73,8 +74,20 @@ LdfDatabase = _core.LdfDatabase
 class SignalQuery:
     """Lazy Python view over a Rust-owned signal query."""
 
-    def __init__(self, native):
+    def __init__(self, native, *, start_ns=None, end_ns=None, frame_ids=None,
+                 directions=None, object_types=None, max_samples=None):
         self._native = native
+        self._start_ns = start_ns
+        self._end_ns = end_ns
+        self._frame_ids = _filter_values(frame_ids)
+        self._directions = _filter_values(directions)
+        self._object_types = _filter_values(object_types)
+        if max_samples is not None and (
+            not isinstance(max_samples, int) or isinstance(max_samples, bool) or max_samples < 0
+        ):
+            raise ValueError("max_samples must be a non-negative integer or None")
+        self._max_samples = max_samples
+        self._yielded = 0
 
     def __iter__(self):
         return self
@@ -85,10 +98,30 @@ class SignalQuery:
         return self
 
     def __next__(self):
-        value = next(self._native, None)
-        if value is None:
+        if self._max_samples is not None and self._yielded >= self._max_samples:
             raise StopIteration
-        return SignalSample(value)
+        while True:
+            value = next(self._native, None)
+            if value is None:
+                raise StopIteration
+            sample = SignalSample(value)
+            if self._start_ns is not None and sample.timestamp_ns < self._start_ns:
+                continue
+            if self._end_ns is not None and sample.timestamp_ns > self._end_ns:
+                continue
+            if self._frame_ids is not None and sample.frame_id not in self._frame_ids:
+                continue
+            if self._directions is not None:
+                direction_values = {sample.direction, sample.raw_direction}
+                if not direction_values.intersection(self._directions):
+                    continue
+            if self._object_types is not None and not (
+                sample.object_type in self._object_types
+                or sample.object_class in self._object_types
+            ):
+                continue
+            self._yielded += 1
+            return sample
 
     @property
     def strict(self):
@@ -100,8 +133,8 @@ class SignalQuery:
     def to_numpy(self):
         return samples_to_numpy(self)
 
-    def to_arrow(self):
-        return samples_to_arrow(self)
+    def to_arrow(self, *, include_context=False):
+        return samples_to_arrow(self, include_context=include_context)
 
 
 class File:
@@ -225,6 +258,15 @@ class File:
         return self.current_object_count
 
     @property
+    def skipped_object_count(self):
+        """Number of malformed objects skipped by tolerant reading."""
+        return self._require_native().skipped_object_count
+
+    @property
+    def skippedObjectCount(self):
+        return self.skipped_object_count
+
+    @property
     def compressionLevel(self):
         return self.compression_level
 
@@ -265,16 +307,34 @@ class File:
         self._native.bind_database(str(bus), int(channel), database)
         return self
 
-    def signal(self, signal_name, *, bus, channel, strict=False):
+    def signal(self, signal_name, *, bus, channel, strict=False, **filters):
         native = self._require_open_native()
         return SignalQuery(
-            native.signal(str(signal_name), str(bus), int(channel), bool(strict))
+            native.signal(str(signal_name), str(bus), int(channel), bool(strict)),
+            **_signal_filters(filters),
         )
 
-    def signals(self, name, *, bus, channel, strict=False):
+    def signals(self, name, *, bus, channel, strict=False, **filters):
+        native = self._require_open_native()
+        if isinstance(name, (list, tuple)):
+            return self.signals_many(name, bus=bus, channel=channel, strict=strict, **filters)
+        return SignalQuery(
+            native.signals(str(name), str(bus), int(channel), bool(strict)),
+            **_signal_filters(filters),
+        )
+
+    def signal_many(self, names, *, bus, channel, strict=False, **filters):
         native = self._require_open_native()
         return SignalQuery(
-            native.signals(str(name), str(bus), int(channel), bool(strict))
+            native.signal_many([str(name) for name in names], str(bus), int(channel), bool(strict)),
+            **_signal_filters(filters),
+        )
+
+    def signals_many(self, names, *, bus, channel, strict=False, **filters):
+        native = self._require_open_native()
+        return SignalQuery(
+            native.signals_many([str(name) for name in names], str(bus), int(channel), bool(strict)),
+            **_signal_filters(filters),
         )
 
     def read_numpy(self, max_objects=None, *, data_width=None):
@@ -442,6 +502,15 @@ def _validate_batch_size(batch_size):
         raise ValueError("batch_size must be a positive integer")
 
 
+def _signal_filters(filters):
+    allowed = {"start_ns", "end_ns", "frame_ids", "directions", "object_types", "max_samples"}
+    unknown = set(filters).difference(allowed)
+    if unknown:
+        names = ", ".join(sorted(unknown))
+        raise TypeError(f"unknown signal filter(s): {names}")
+    return filters
+
+
 __all__ = [
     "File",
     "open",
@@ -453,6 +522,7 @@ __all__ = [
     "BlfUnsupportedObjectError",
     "BlfUnsupportedVersionError",
     "SignalQueryError",
+    "DatabaseParseError",
     "DbcDatabase",
     "LdfDatabase",
     "SignalQuery",

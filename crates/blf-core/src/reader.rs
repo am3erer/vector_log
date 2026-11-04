@@ -107,6 +107,8 @@ pub struct File {
     pub file_statistics: FileStatistics,
     pub current_uncompressed_file_size: u64,
     pub current_object_count: u32,
+    /// Number of malformed objects skipped while recovering in tolerant mode.
+    pub skipped_object_count: u64,
     pub compression_level: i32,
     pub write_restore_points: bool,
     pub strict: bool,
@@ -159,6 +161,7 @@ impl File {
             decompressed_pos: 0,
             current_uncompressed_file_size: file_statistics.statistics_size as u64,
             current_object_count: 0,
+            skipped_object_count: 0,
             compression_level: file_statistics.compression_level as i32,
             write_restore_points: true,
             file_statistics,
@@ -183,6 +186,7 @@ impl File {
             file_statistics: self.file_statistics.clone(),
             current_uncompressed_file_size: self.file_statistics.statistics_size as u64,
             current_object_count: 0,
+            skipped_object_count: 0,
             compression_level: self.compression_level,
             write_restore_points: self.write_restore_points,
             strict: self.strict,
@@ -227,18 +231,68 @@ impl File {
                     }
                 }
                 Err(BlfError::Incomplete) => {
+                    if self.strict {
+                        if !self.load_next_log_container()? {
+                            self.eof = true;
+                            let remaining = &self.decompressed[self.decompressed_pos..];
+                            if remaining.is_empty()
+                                || (remaining.len() <= 3 && remaining.iter().all(|byte| *byte == 0))
+                            {
+                                return Ok(None);
+                            }
+                            return Err(BlfError::Truncated);
+                        }
+                        continue;
+                    }
+
+                    let remaining = &self.decompressed[self.decompressed_pos..];
+                    let has_corrupt_tail = !remaining.is_empty()
+                        && !(remaining.len() <= 3 && remaining.iter().all(|byte| *byte == 0));
+                    if has_corrupt_tail {
+                        if self.recover_corrupt_object() {
+                            self.skipped_object_count = self.skipped_object_count.saturating_add(1);
+                            continue;
+                        }
+
+                        self.decompressed.clear();
+                        self.decompressed_pos = 0;
+                        self.skipped_object_count = self.skipped_object_count.saturating_add(1);
+                    }
+
                     if !self.load_next_log_container()? {
                         self.eof = true;
-                        let remaining = &self.decompressed[self.decompressed_pos..];
-                        if remaining.is_empty()
-                            || (remaining.len() <= 3 && remaining.iter().all(|byte| *byte == 0))
-                        {
+                        if has_corrupt_tail {
+                            return Err(BlfError::Truncated);
+                        }
+                        return Ok(None);
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    if self.strict || !is_recoverable_header_error(&error) {
+                        return Err(error);
+                    }
+                    if self.recover_corrupt_object() {
+                        self.skipped_object_count = self.skipped_object_count.saturating_add(1);
+                        continue;
+                    }
+
+                    // The remaining bytes in this decompressed container no
+                    // longer provide a trustworthy object boundary. Drop
+                    // them and continue with the next physical container when
+                    // one exists; otherwise treat the damaged tail as EOF.
+                    self.skipped_object_count = self.skipped_object_count.saturating_add(1);
+                    self.decompressed.clear();
+                    self.decompressed_pos = 0;
+                    match self.load_next_log_container() {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            self.eof = true;
                             return Ok(None);
                         }
-                        return Err(BlfError::Truncated);
+                        Err(container_error) => return Err(container_error),
                     }
                 }
-                Err(error) => return Err(error),
             }
         }
     }
@@ -274,6 +328,16 @@ impl File {
             .ok_or(BlfError::Format("object size overflow".to_string()))?;
 
         if declared_end > self.decompressed.len() {
+            return Err(BlfError::Incomplete);
+        }
+
+        // A corrupt record can claim a size that reaches into the next
+        // record. Prefer the later, independently validated LOBJ boundary so
+        // the current parser never consumes bytes belonging to that record.
+        if self
+            .find_recoverable_object(signature_pos + LOBJ_BYTES.len(), declared_end)
+            .is_some()
+        {
             return Err(BlfError::Incomplete);
         }
 
@@ -487,6 +551,98 @@ impl File {
         }
         Ok(())
     }
+
+    /// Try to resume after a malformed object without guessing its payload.
+    ///
+    /// A candidate is accepted only when its base header, declared bounds, and
+    /// concrete raw header are all readable. This lets tolerant readers skip a
+    /// damaged record while keeping strict readers and unrecoverable tails
+    /// lossless and explicit.
+    fn recover_corrupt_object(&mut self) -> bool {
+        let Ok(signature_pos) = find_lobj(
+            &self.decompressed,
+            self.decompressed_pos,
+            self.options.max_object_signature_scan,
+        ) else {
+            return false;
+        };
+        let search_start = signature_pos.saturating_add(LOBJ_BYTES.len());
+
+        if let Ok(base) = parse_object_header_base(&self.decompressed, signature_pos) {
+            if let Ok(object_size) = usize::try_from(base.object_size) {
+                if let Some(declared_end) = signature_pos.checked_add(object_size) {
+                    let aligned_end =
+                        object_stream_end(&self.decompressed, declared_end, object_size);
+                    if self.is_recoverable_object_at(aligned_end) {
+                        self.decompressed_pos = aligned_end;
+                        return true;
+                    }
+                }
+            }
+        }
+
+        let scan_end = self
+            .decompressed
+            .len()
+            .min(search_start.saturating_add(self.options.max_object_signature_scan));
+        let Some(relative) = self.decompressed[search_start..scan_end]
+            .windows(LOBJ_BYTES.len())
+            .position(|window| window == LOBJ_BYTES)
+        else {
+            return false;
+        };
+        let candidate = search_start + relative;
+        if self.is_recoverable_object_at(candidate) {
+            self.decompressed_pos = candidate;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn is_recoverable_object_at(&self, offset: usize) -> bool {
+        let Ok(base) = parse_object_header_base(&self.decompressed, offset) else {
+            return false;
+        };
+        if validate_object_size(&base).is_err() || self.check_object_size(base.object_size).is_err()
+        {
+            return false;
+        }
+        let Ok(object_size) = usize::try_from(base.object_size) else {
+            return false;
+        };
+        let Some(end) = offset.checked_add(object_size) else {
+            return false;
+        };
+        let Some(data) = self.decompressed.get(offset..end) else {
+            return false;
+        };
+        parse_raw_header(data, base).is_ok()
+    }
+
+    fn find_recoverable_object(&self, start: usize, end: usize) -> Option<usize> {
+        let end = end.min(self.decompressed.len());
+        if start >= end || end - start < LOBJ_BYTES.len() {
+            return None;
+        }
+        self.decompressed[start..end]
+            .windows(LOBJ_BYTES.len())
+            .enumerate()
+            .find_map(|(relative, window)| {
+                (window == LOBJ_BYTES)
+                    .then_some(start + relative)
+                    .filter(|candidate| self.is_recoverable_object_at(*candidate))
+            })
+    }
+}
+
+fn is_recoverable_header_error(error: &BlfError) -> bool {
+    match error {
+        BlfError::Format(message) => {
+            message.contains("complete ObjectHeader") || message.contains("complete ObjectHeader2")
+        }
+        _ => false,
+    }
 }
 
 fn find_lobj(data: &[u8], start: usize, max_scan: usize) -> Result<usize> {
@@ -644,7 +800,11 @@ fn parse_object_header(data: &[u8], offset: usize) -> Result<ObjectHeader> {
     if base.header_version != 1 {
         return Err(BlfError::UnsupportedHeaderVersion(base.header_version));
     }
-    if base.header_size < 32 || base.object_size < 32 {
+    // Some Vector recordings use zero as the header-size marker while still
+    // storing the complete 32-byte ObjectHeader layout. The payload offsets
+    // remain the normal offsets after the base header, so treat this marker as
+    // an implicit 32-byte header rather than rejecting every object.
+    if base.header_size != 0 && base.header_size < 32 || base.object_size < 32 {
         return Err(BlfError::Format(
             "object does not contain a complete ObjectHeader".to_string(),
         ));

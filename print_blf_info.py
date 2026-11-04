@@ -57,6 +57,22 @@ def format_direction(direction):
     return labels.get(direction, f"Unknown({direction})")
 
 
+def format_can_direction(direction):
+    labels = {0: "Rx", 1: "Tx"}
+    if direction is None:
+        return None
+    return labels.get(direction, f"Unknown({direction})")
+
+
+def object_direction(obj, class_name):
+    """Read the Vector direction field for LIN and CAN object variants."""
+    if class_name in {"CanMessage", "CanMessage2", "CanFdMessage"}:
+        flags = object_field(obj, "flags")
+        if isinstance(flags, int):
+            return flags & 0x0F
+    return object_field(obj, "dir")
+
+
 def object_field(obj, name, default=None):
     fields = getattr(obj, "fields", None)
     if isinstance(fields, dict) and name in fields:
@@ -142,7 +158,7 @@ def print_object(index, obj):
     channel = object_field(obj, "channel")
     frame_id = object_field(obj, "id")
     dlc = object_field(obj, "dlc")
-    direction = object_field(obj, "dir")
+    direction = object_direction(obj, class_name)
     data, data_length = message_data(obj, class_name)
     is_lin = class_name.startswith("Lin")
     event_description = lin_event_description(class_name)
@@ -158,7 +174,12 @@ def print_object(index, obj):
     if dlc is not None:
         parts.append(f"{'headerDlc' if is_lin else 'dlc'}={dlc}")
     if direction is not None:
-        parts.append(f"dir={format_direction(direction)}")
+        formatter = (
+            format_can_direction
+            if class_name in {"CanMessage", "CanMessage2", "CanFdMessage"}
+            else format_direction
+        )
+        parts.append(f"dir={formatter(direction)}")
     elif event_description is not None:
         parts.append(f"event={event_description}")
     if data is not None:
@@ -218,6 +239,12 @@ def main():
             print(f"total objects: {total}")
             for class_name, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
                 print(f"{class_name:<28} {count}")
+        skipped = getattr(reader, "skipped_object_count", 0)
+        if skipped:
+            print(
+                f"warning: skipped {skipped} malformed object(s); "
+                "remaining readable objects were preserved"
+            )
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 members = [
     "crates/blf-core",
     "crates/blf-py",
+    "crates/blf-tui",
 ]
 resolver = "2"
 

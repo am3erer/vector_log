@@ -15,10 +15,11 @@ pub use can::{
 };
 pub use database::{
     BusKind, ByteOrder, CanMessageId, CanPayloadKind, CanSignal, CanSignalRef, Database,
-    DatabaseBinding, DatabaseError, DatabaseResult, DbcDatabase, DbcMessage, LdfDatabase,
-    LdfOptionalSection, LinChecksum, LinDynamicFrame, LinDynamicFrameKind, LinEncoding, LinFrame,
-    LinNode, LinPhysicalRange, LinScheduleEntry, LinSignal, LinSignalRef, MultiplexRole,
-    SignalType, SourceSpan, ValueTable,
+    DatabaseBinding, DatabaseError, DatabaseResult, DbcAttributeAssignment, DbcAttributeDefinition,
+    DbcDatabase, DbcMessage, DbcNode, DbcRelationshipAttribute, DbcSignalGroup, LdfDatabase,
+    LdfOptionalSection, LinChecksum, LinDiagnosticFrame, LinDiagnosticSignal, LinDynamicFrame,
+    LinDynamicFrameKind, LinEncoding, LinFrame, LinNode, LinNodeAttribute, LinPhysicalRange,
+    LinScheduleEntry, LinSignal, LinSignalRef, MultiplexRole, SignalType, SourceSpan, ValueTable,
 };
 pub use error::{BlfError, Result};
 pub use ldf::{
@@ -29,7 +30,7 @@ pub use ldf::{
 pub use lin::{classify_lin_object, LinObservation, LinResponseState};
 pub use query::{QueryError, SignalQuery};
 pub use reader::{parse_file_statistics, File, ReaderOptions};
-pub use sample::{DecodeStatus, SampleValue, SignalSample};
+pub use sample::{DecodeStatus, SampleContext, SampleValue, SignalSample};
 pub use types::{
     AppText, CanErrorFrame, CanErrorFrameExt, CanFdErrorFrame64, CanFdExtFrameData, CanFdMessage,
     CanFdMessage64, CanMessage, CanMessage2, FieldValue, FileStatistics, LinObject, Object,
@@ -38,9 +39,39 @@ pub use types::{
     VarObjectHeader, FILE_SIGNATURE, OBJECT_SIGNATURE,
 };
 
+/// Return the direction encoded in the low four bits of a classic CAN BLF
+/// flags field. Vector uses zero for Rx and one for Tx; other values are
+/// retained so callers can report an unknown direction without losing data.
+pub fn can_flags_direction(flags: u8) -> u8 {
+    flags & 0x0f
+}
+
 /// Convert a BLF object timestamp to nanoseconds using the object flags.
 pub fn object_timestamp_ns(object: &Object) -> Option<u64> {
-    let (flags, timestamp) = match object {
+    let (flags, timestamp) = object_timestamp_parts(object)?;
+
+    if flags & 0x2 != 0 {
+        Some(timestamp)
+    } else if flags & 0x1 != 0 {
+        timestamp.checked_mul(10_000)
+    } else {
+        None
+    }
+}
+
+pub fn object_timestamp_source(object: &Object) -> Option<&'static str> {
+    let (flags, _) = object_timestamp_parts(object)?;
+    if flags & 0x2 != 0 {
+        Some("nanoseconds")
+    } else if flags & 0x1 != 0 {
+        Some("10_microseconds")
+    } else {
+        None
+    }
+}
+
+fn object_timestamp_parts(object: &Object) -> Option<(u32, u64)> {
+    Some(match object {
         Object::CanMessage(value) => (value.header.object_flags, value.header.object_time_stamp),
         Object::CanMessage2(value) => (value.header.object_flags, value.header.object_time_stamp),
         Object::CanFdMessage(value) => (value.header.object_flags, value.header.object_time_stamp),
@@ -61,15 +92,7 @@ pub fn object_timestamp_ns(object: &Object) -> Option<u64> {
         Object::Lin(value) => (value.header.object_flags, value.header.object_time_stamp),
         Object::Structured(value) => raw_header_timestamp(&value.header)?,
         Object::Raw(value) => raw_header_timestamp(&value.header)?,
-    };
-
-    if flags & 0x2 != 0 {
-        Some(timestamp)
-    } else if flags & 0x1 != 0 {
-        timestamp.checked_mul(10_000)
-    } else {
-        None
-    }
+    })
 }
 
 fn raw_header_timestamp(header: &RawObjectHeader) -> Option<(u32, u64)> {

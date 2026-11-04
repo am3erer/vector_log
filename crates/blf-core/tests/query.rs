@@ -266,7 +266,12 @@ fn query_owns_an_independent_cursor_and_resolves_explicit_channels() {
         .signal_query(binding_one, "Status.Speed", false)
         .unwrap();
     assert_eq!(file.current_object_count, 0);
-    assert_eq!(query.next().unwrap().unwrap().raw_value, Some(42));
+    let first_sample = query.next().unwrap().unwrap();
+    assert_eq!(first_sample.raw_value, Some(42));
+    assert_eq!(first_sample.direction.as_deref(), Some("Rx"));
+    assert_eq!(first_sample.raw_direction, Some(0));
+    assert!(first_sample.is_rx);
+    assert!(!first_sample.is_tx);
     assert_eq!(file.current_object_count, 0);
 
     let second = file

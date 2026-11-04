@@ -10,6 +10,7 @@ from collections.abc import Iterable
 import csv
 import io
 import json
+from typing import Optional
 
 
 EXPORT_FIELDS = (
@@ -40,11 +41,20 @@ def _payload(obj):
     return bytes(value) if isinstance(value, (bytes, bytearray, memoryview)) else b""
 
 
+def _direction(obj):
+    class_name = _value(obj, "class_name", type(obj).__name__)
+    if class_name in {"CanMessage", "CanMessage2", "CanFdMessage"}:
+        flags = _value(obj, "flags", None)
+        return -1 if flags is None else int(flags) & 0x0F
+    value = _value(obj, "dir", None)
+    return -1 if value is None else value
+
+
 def _records(objects):
     records = []
     for obj in objects:
         payload = _payload(obj)
-        direction = _value(obj, "dir", -1)
+        direction = _direction(obj)
         records.append(
             {
                 # BLF timestamps are unsigned.  Keep absent timestamps as
@@ -65,7 +75,7 @@ def _records(objects):
     return records
 
 
-def objects_to_numpy(objects: Iterable, *, data_width: int | None = None):
+def objects_to_numpy(objects: Iterable, *, data_width: Optional[int] = None):
     """Convert objects to columnar NumPy arrays.
 
     The result is a dictionary. ``data`` is a zero-padded ``uint8`` matrix;
@@ -111,7 +121,7 @@ def objects_to_numpy(objects: Iterable, *, data_width: int | None = None):
     }
 
 
-def objects_to_arrow(objects: Iterable, *, data_width: int | None = None):
+def objects_to_arrow(objects: Iterable, *, data_width: Optional[int] = None):
     """Convert objects to a PyArrow table.
 
     Arrow stores payloads as variable-length binary values. ``data_width`` is
@@ -203,10 +213,40 @@ def samples_to_numpy(samples: Iterable):
         "status": np.asarray([getattr(row, "status", "") for row in rows]),
         "error": np.asarray([getattr(row, "error", None) for row in rows], dtype=object),
         "data": np.asarray([bytes(getattr(row, "data", b"")) for row in rows], dtype=object),
+        "object_type": np.asarray([getattr(row, "object_type", 0) for row in rows], dtype=np.int64),
+        "object_class": np.asarray([getattr(row, "object_class", "") for row in rows]),
+        "direction": np.asarray([getattr(row, "direction", None) for row in rows], dtype=object),
+        "raw_direction": np.ma.array(
+            [0 if getattr(row, "raw_direction", None) is None else int(row.raw_direction) for row in rows],
+            mask=[getattr(row, "raw_direction", None) is None for row in rows],
+            dtype=np.int16,
+        ),
+        "is_tx": np.asarray([getattr(row, "is_tx", False) for row in rows], dtype=bool),
+        "is_rx": np.asarray([getattr(row, "is_rx", False) for row in rows], dtype=bool),
+        "dlc": np.ma.array(
+            [0 if getattr(row, "dlc", None) is None else int(row.dlc) for row in rows],
+            mask=[getattr(row, "dlc", None) is None for row in rows],
+            dtype=np.int16,
+        ),
+        "payload_length": np.asarray([getattr(row, "payload_length", 0) for row in rows], dtype=np.int64),
+        "header_dlc": np.ma.array(
+            [0 if getattr(row, "header_dlc", None) is None else int(row.header_dlc) for row in rows],
+            mask=[getattr(row, "header_dlc", None) is None for row in rows],
+            dtype=np.int16,
+        ),
+        "timestamp_source": np.asarray([getattr(row, "timestamp_source", None) for row in rows], dtype=object),
+        "signal_timestamp_ns": np.ma.array(
+            [0 if getattr(row, "signal_timestamp_ns", None) is None else int(row.signal_timestamp_ns) for row in rows],
+            mask=[getattr(row, "signal_timestamp_ns", None) is None for row in rows],
+            dtype=np.uint64,
+        ),
+        "databyte_timestamps": np.asarray(
+            [tuple(getattr(row, "databyte_timestamps", ())) for row in rows], dtype=object
+        ),
     }
 
 
-def samples_to_arrow(samples: Iterable):
+def samples_to_arrow(samples: Iterable, *, include_context: bool = False):
     """Convert signal samples to a nullable PyArrow table.
 
     Arrow columns have one scalar type.  Since Python ``SignalSample.value``
@@ -229,8 +269,7 @@ def samples_to_arrow(samples: Iterable):
             value_display.append(value)
         else:
             value_display.append(str(value))
-    return pa.table(
-        {
+    columns = {
             "timestamp_ns": pa.array(
                 [getattr(row, "timestamp_ns", None) for row in rows],
                 type=pa.uint64(),
@@ -266,7 +305,27 @@ def samples_to_arrow(samples: Iterable):
                 [bytes(getattr(row, "data", b"")) for row in rows], type=pa.binary()
             ),
         }
-    )
+    if include_context:
+        columns.update(
+            {
+                "object_type": pa.array([getattr(row, "object_type", 0) for row in rows], type=pa.uint32()),
+                "object_class": pa.array([getattr(row, "object_class", "") for row in rows], type=pa.string()),
+                "direction": pa.array([getattr(row, "direction", None) for row in rows], type=pa.string()),
+                "raw_direction": pa.array([getattr(row, "raw_direction", None) for row in rows], type=pa.uint8()),
+                "is_tx": pa.array([getattr(row, "is_tx", False) for row in rows], type=pa.bool_()),
+                "is_rx": pa.array([getattr(row, "is_rx", False) for row in rows], type=pa.bool_()),
+                "dlc": pa.array([getattr(row, "dlc", None) for row in rows], type=pa.uint8()),
+                "payload_length": pa.array([getattr(row, "payload_length", 0) for row in rows], type=pa.uint64()),
+                "header_dlc": pa.array([getattr(row, "header_dlc", None) for row in rows], type=pa.uint8()),
+                "timestamp_source": pa.array([getattr(row, "timestamp_source", None) for row in rows], type=pa.string()),
+                "signal_timestamp_ns": pa.array([getattr(row, "signal_timestamp_ns", None) for row in rows], type=pa.uint64()),
+                "databyte_timestamps": pa.array(
+                    [list(getattr(row, "databyte_timestamps", ())) for row in rows],
+                    type=pa.list_(pa.uint64()),
+                ),
+            }
+        )
+    return pa.table(columns)
 
 
 def _raw_arrow_array(pa, rows):

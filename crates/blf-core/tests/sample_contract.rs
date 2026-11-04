@@ -1,4 +1,4 @@
-use blf_core::{BusKind, DecodeStatus, SampleValue, SignalSample};
+use blf_core::{BusKind, DecodeStatus, SampleContext, SampleValue, SignalSample};
 
 #[test]
 fn successful_sample_exposes_raw_physical_and_choice_values() {
@@ -80,4 +80,44 @@ fn sample_contract_preserves_unsigned_64_bit_raw_values() {
         [],
     );
     assert_eq!(sample.raw_value, Some(i128::from(u64::MAX)));
+}
+
+#[test]
+fn sample_context_preserves_protocol_and_direction_metadata() {
+    let sample = SignalSample::ok(
+        10,
+        BusKind::Lin,
+        3,
+        1,
+        "Status",
+        "State",
+        1,
+        1.0,
+        SampleValue::Physical(1.0),
+        None,
+        [1],
+    )
+    .with_context(SampleContext {
+        object_type: 57,
+        object_class: "LinMessage2".to_string(),
+        direction: Some("Tx".to_string()),
+        raw_direction: Some(1),
+        dlc: Some(2),
+        header_dlc: Some(2),
+        payload_length: 1,
+        timestamp_source: Some("nanoseconds".to_string()),
+        signal_timestamp_ns: None,
+        databyte_timestamps: vec![11, 22],
+    });
+
+    assert_eq!(sample.object_type, 57);
+    assert_eq!(sample.object_class, "LinMessage2");
+    assert_eq!(sample.direction.as_deref(), Some("Tx"));
+    assert_eq!(sample.raw_direction, Some(1));
+    assert!(sample.is_tx);
+    assert!(!sample.is_rx);
+    assert_eq!(sample.dlc, Some(2));
+    assert_eq!(sample.header_dlc, Some(2));
+    assert_eq!(sample.payload_length, 1);
+    assert_eq!(sample.databyte_timestamps, vec![11, 22]);
 }

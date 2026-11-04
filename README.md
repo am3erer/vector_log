@@ -65,6 +65,44 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+### Terminal UI
+
+The workspace also provides `vector-log-tui`, a keyboard-first terminal viewer
+for BLF messages. It uses the Rust standard library and ANSI terminal control,
+so it does not add a `ratatui` or `crossterm` dependency and works well over
+SSH or inside `tmux`:
+
+```bash
+cargo run -p blf-tui -- trace.blf
+cargo run -p blf-tui -- trace.blf \
+  --dbc 1=vehicle.dbc \
+  --ldf 3=body.ldf
+```
+
+The application scans the BLF at startup, then allows message filtering and
+selection, per-message detail inspection, channel-specific DBC/LDF binding,
+signal decoding, and an ASCII signal curve. Database paths can also be bound
+while the viewer is running with `b`, using `can CHANNEL PATH` or
+`lin CHANNEL PATH`.
+
+Key controls are:
+
+```text
+j/k or Up/Down   move through messages or signals
+Enter            open the selected message
+/                filter messages
+b                bind a DBC/LDF database
+p                open a curve for the selected numeric signal
+Esc/Left         go back
+q                quit
+```
+
+The current viewer keeps message summaries in memory for responsive navigation;
+very large logs may use more memory than the streaming reader. Mouse input is
+supported for row selection and wheel navigation. In the curve view, Left/Right
+pans the visible sample window, `+`/`-` zooms it, and Home/End jump to either
+boundary. Background indexing and multi-signal plots remain future extensions.
+
 ## Python API
 
 The extension is exposed as `vector_log.blf_rs`:
@@ -106,12 +144,44 @@ for sample in query.samples:
 
 Parsed database handles expose their native metadata through read-only Python
 views. `DbcDatabase` provides `version`, `attributes`, `scoped_attributes`,
-sorted `signal_names`, and `messages`. Each message includes `id`,
-`extended`, `name`, `dlc`, `is_fd`, `payload_kind`, `signals`, `comment`,
-`attributes`, and `source`; each signal includes its bit layout, byte order,
-signedness, scaling, limits, choice table, multiplex role, attributes,
-comment, and source location. Use `message_by_id()`, `message_by_name()`, and
-`signal()` for indexed lookup:
+`nodes`, sorted `signal_names`, `messages`, and `signal_groups`. DBC nodes
+preserve their declared names and source locations. Each message includes
+`id`, `extended`, `name`, `dlc`, `transmitter`, `is_fd`, `payload_kind`,
+`signals`, `comment`, `attributes`, and `source`; each signal includes its bit
+layout, byte order, signedness, scaling, limits, `unit`, `receivers`, choice
+table, multiplex role, attributes, comment, and source location. Signal groups
+preserve their `message_id`, `message_extended`, `name`, `repetition`, member
+`signal_names`, and source location. Use `message_by_id()`,
+`message_by_name()`, and `signal()` for indexed lookup:
+
+An empty DBC unit (`""`) is exposed as `None`; non-empty units are preserved
+verbatim.
+
+DBC metadata views also preserve named `value_tables`, `attribute_defaults`,
+and the raw numeric `signal_type_value_types` mapping. Relationship metadata is
+kept separate through `relationship_attributes`,
+`relationship_attributes_for(name)`, and `relationship_attribute_defaults`.
+Relationship assignments preserve their relationship kind, source node, message
+ID, signal name, raw value, and source location; they are not merged into
+ordinary message or signal attributes. A CAN signal exposes its
+attribute definitions through `attribute_definitions`; each definition keeps its
+name, scope, optional relationship kind, DBC value type, raw numeric arguments,
+enumeration values, and source location. This includes `BA_DEF_SGTYPE_` signal
+type definitions, while raw bounds remain strings so hexadecimal and large
+integer spellings are not lost. Every ordinary `BA_` assignment is also
+available through `attribute_assignments`, preserving its target scope,
+message/signal or object target, raw value, and source location; the existing
+message, signal, and scoped attribute views remain available for convenient
+lookup.
+optional `value_type` declaration from `SIG_VALTYPE_`. Types `1` and `2` decode
+the signal as IEEE-754 binary32 and binary64 respectively, in the signal's DBC
+byte order, while retaining the exact raw bit pattern in `raw_value` and
+applying the normal DBC scale/offset to `physical_value`. Other value types
+retain the normal integer behavior. Float signals must be exactly 32 or 64 bits;
+IEEE NaN and Infinity are preserved. The parser accepts both standard
+colon-form and legacy no-colon `SIG_VALTYPE_` statements. DBC's conventional
+`[0|0]` signal limit marker is exposed as `None` for both bounds, meaning that
+the decoder does not apply an omitted physical range.
 
 ```python
 dbc = DbcDatabase.from_file("vehicle.dbc")
@@ -122,15 +192,31 @@ print(dbc.signal("VehicleStatus.VehicleSpeed")["signal"])
 
 `LdfDatabase` exposes `channel_name`, protocol and language versions,
 `speed_kbps`, `nodes`, `frames`, `schedules`, `encodings`, and
-`optional_sections`. Frame and signal dictionaries preserve checksum rules,
-publishers, bit layouts, initial values, scaling, limits, encoding names,
+`optional_sections`. Diagnostic LIN definitions are kept in their own
+namespace: `diagnostic_frames`, `diagnostic_signals`, and `node_attributes`
+expose the LDF `Diagnostic_signals`, `Diagnostic_frames`, and
+`Node_attributes` sections without mixing them into ordinary scheduled
+frames. Use `diagnostic_frame_by_id()`, `diagnostic_frame_by_name()`, and
+`diagnostic_signal()` for indexed lookup. Diagnostic frames preserve their
+classic checksum model, eight-byte payload definition, signal bit offsets, and
+source locations. Node attribute dictionaries preserve configured and initial
+NADs, product IDs, response-error signal names, LIN protocol, timing values in
+milliseconds, configurable frames, and source locations. LIN node dictionaries
+also preserve the master `timebase_ms` and `jitter_ms` values. Frame and signal dictionaries preserve checksum rules,
+publishers, signal publishers and subscribers, bit layouts, initial values, scaling, limits, encoding names,
 choice tables, physical ranges, and source locations. Use `frame_by_id()`,
-`frame_by_name()`, and `signal()` for indexed lookup. These views contain
-copies of metadata and cannot mutate the Rust-owned database used by signal
-queries.
+`frame_by_name()`, and `signal()` for indexed lookup. `signal_names` and
+`diagnostic_signal_names` provide sorted `Frame.Signal` names, while
+`signal_count` and `diagnostic_signal_count` provide signal counts. Dynamic LIN groups are
+available through `dynamic_frames`; use `dynamic_frames_for_id(frame_id)` or
+`dynamic_frame_for_id(frame_id)` when you need only groups containing one
+frame. These views contain copies of metadata and cannot mutate the Rust-owned
+database used by signal queries.
 
 `reader.signal()` resolves a qualified `Message.Signal` or `Frame.Signal`
-within one explicit binding. `reader.signals(name=...)` is the explicit
+within one explicit binding. This also applies to diagnostic names such as
+`MasterReq.MasterReqB0`; LIN diagnostic frame IDs `0x3c` and `0x3d` use the
+classic checksum rule. `reader.signals(name=...)` is the explicit
 same-name aggregation form. It returns every matching message/frame while
 preserving `message_name`, `signal_name`, `frame_id`, and channel context; it
 does not silently merge databases from other channels.
@@ -164,8 +250,17 @@ query = reader.signal("Status.Speed", bus="can", channel=1, strict=True)
 
 `SignalSample` fields are `timestamp_ns`, `bus`, `channel`, `frame_id`,
 `message_name`, `signal_name`, `raw_value`, `physical_value`, `value`,
-`value_text`, `status`, `error`, and owned `data` bytes. `value` contains the
-DBC/LDF choice text when a value table matches, otherwise the physical number.
+`value_text`, `status`, `error`, and owned `data` bytes. Samples also preserve
+`object_type`, `object_class`, `direction`, `raw_direction`, `is_tx`, `is_rx`,
+`dlc`, `payload_length`, `header_dlc`, `timestamp_source`,
+`signal_timestamp_ns`, and `databyte_timestamps`. For LIN, `header_dlc` is the
+protocol header declaration and `payload_length` is the number of response
+bytes actually available; they are intentionally separate. `databyte_timestamps`
+preserves Vector's raw per-byte values. Because their unit/base depends on the
+BLF format variant, the reader does not invent an absolute
+`signal_timestamp_ns`; it remains `None` until that metadata is explicit.
+`value` contains the DBC/LDF choice text when a value table matches, otherwise
+the physical number.
 Forensic LIN checksum-error samples may retain safely extracted values and
 payload bytes, but their non-`ok` status means those values are untrusted.
 
@@ -181,6 +276,15 @@ numpy_columns = query.to_numpy()  # raw_value is exact signed/unsigned integer d
 
 query = reader.signal("Status.Speed", bus="can", channel=1)
 arrow_table = query.to_arrow()  # nullable Arrow columns and variable-length binary data
+
+# One BLF scan can target multiple qualified signals. Filters remain lazy.
+query = reader.signal_many(
+    ["VehicleStatus.Speed", "VehicleStatus.Mode"],
+    bus="can", channel=1,
+    start_ns=1_000_000, end_ns=2_000_000, max_samples=10,
+)
+for sample in query:
+    print(sample.signal_name, sample.timestamp_ns, sample.value)
 ```
 
 Both methods consume the lazy query. Use `samples_to_numpy()` or
@@ -211,7 +315,24 @@ accident.
 
 Python `reader.bind_database(bus, channel, database)` is an explicit rebind
 operation: a later binding for the same `(bus, channel)` replaces the previous
-database. Signal queries always use the current binding.
+database. A query captures the binding when it is created, so an existing query
+is not changed by a later rebind. `signal_many()` and `signals_many()` share one
+lazy BLF cursor for their target signals; `signals([...])` is an alias for the
+aggregate form.
+
+Signal queries accept lazy filters `start_ns`, `end_ns`, `frame_ids`,
+`directions`, `object_types`, and `max_samples`. `directions` accepts the
+normalized names (`Rx`, `Tx`, `TxRq`) or raw Vector direction values. For
+classic CAN (`CanMessage`, `CanMessage2`, and the legacy `CanFdMessage`),
+Vector stores direction in the low four bits of `flags`: `0` is `Rx` and `1`
+is `Tx`; the remaining flag bits are RTR/WU/NERR protocol flags. `CanFdMessage64`
+and LIN objects use their explicit `dir` field. The original `flags` and raw
+direction are both preserved, and an undefined direction is reported as
+`Unknown` rather than being treated as LIN `TxRq`. For classic CAN, `dlc` is
+the number of valid payload bytes; for CAN-FD, `dlc` is the protocol data
+length code and `payload_length` is the actual `valid_data_bytes` count.
+Database parse failures raise `DatabaseParseError` with `path`, `line`,
+`field`, and `reason` attributes.
 
 For LIN, checksum validation uses valid BLF checksum metadata when present and
 otherwise falls back to the LDF frame rule, including classic checksum for
@@ -269,6 +390,11 @@ Reader methods and properties include:
   configurable safety limits for damaged or untrusted files. The default
   limits preserve the existing reader behavior. `BlfLimitError` and
   `BlfIoError` distinguish limit and I/O failures from format errors.
+- The default tolerant reader skips a malformed object when it can validate a
+  later object boundary, then continues reading subsequent messages. If a
+  damaged object is at the end of a container, it can continue with the next
+  container. `reader.skipped_object_count` reports how many malformed objects
+  were skipped. Use `strict=True` when corruption must remain an error.
 
 Every decoded object exposes its wire fields through `fields`, and the same
 fields are available as Python attributes where the name is valid. Both the

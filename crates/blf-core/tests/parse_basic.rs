@@ -361,18 +361,81 @@ fn independent_cursors_do_not_share_read_state() {
 }
 
 #[test]
-fn tolerant_reader_reports_truncated_object_instead_of_eof() {
+fn tolerant_reader_skips_truncated_object_and_reads_following_object() {
     let dir = std::env::temp_dir().join("blf-core-tests");
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join("truncated-object.blf");
     let mut inner = can_message();
     inner.extend_from_slice(&object_header(1, 48, 100));
     inner.extend_from_slice(&[0; 4]);
+    inner.extend_from_slice(&can_message2());
     write_blf_with_inner(&path, &inner, 2);
 
     let mut reader = File::open(&path).unwrap();
     assert!(reader.read().unwrap().is_some());
-    assert!(matches!(reader.read(), Err(blf_core::BlfError::Truncated)));
+    assert_eq!(
+        reader.read().unwrap().unwrap().object_type(),
+        ObjectType::CanMessage2
+    );
+    assert_eq!(reader.skipped_object_count, 1);
+    assert!(reader.read().unwrap().is_none());
+}
+
+#[test]
+fn tolerant_reader_recovers_incomplete_object_header() {
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("incomplete-object-header.blf");
+    let mut inner = object_header(1, 32, 100);
+    inner[4..6].copy_from_slice(&16u16.to_le_bytes());
+    inner.extend_from_slice(&can_message2());
+    write_blf_with_inner(&path, &inner, 2);
+
+    let mut reader = File::open(&path).unwrap();
+    assert_eq!(
+        reader.read().unwrap().unwrap().object_type(),
+        ObjectType::CanMessage2
+    );
+    assert_eq!(reader.skipped_object_count, 1);
+    assert!(reader.read().unwrap().is_none());
+}
+
+#[test]
+fn accepts_zero_header_size_vector_variant() {
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("zero-header-size-vector-variant.blf");
+    let mut inner = can_fd_message64();
+    inner[4..6].copy_from_slice(&0u16.to_le_bytes());
+    write_blf_with_inner(&path, &inner, 1);
+
+    let mut reader = File::open(&path).unwrap();
+    assert_eq!(
+        reader.read().unwrap().unwrap().object_type(),
+        ObjectType::CanFdMessage64
+    );
+    assert!(reader.read().unwrap().is_none());
+}
+
+#[test]
+fn tolerant_reader_skips_bad_container_tail_and_reads_next_container() {
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("truncated-container-tail.blf");
+    let mut output = file_statistics(0, 2);
+    let mut first = object_header(1, 48, 100);
+    first.extend_from_slice(&[0; 4]);
+    output.extend_from_slice(&log_container(&first));
+    output.extend_from_slice(&log_container(&can_message2()));
+    fs::write(&path, output).unwrap();
+
+    let mut reader = File::open(&path).unwrap();
+    assert_eq!(
+        reader.read().unwrap().unwrap().object_type(),
+        ObjectType::CanMessage2
+    );
+    assert_eq!(reader.skipped_object_count, 1);
+    assert!(reader.read().unwrap().is_none());
 }
 
 #[test]
@@ -386,6 +449,7 @@ fn strict_reader_reports_truncated_object_instead_of_eof() {
 
     let mut reader = File::open_with_options(&path, true).unwrap();
     assert!(matches!(reader.read(), Err(blf_core::BlfError::Truncated)));
+    assert_eq!(reader.skipped_object_count, 0);
 }
 
 #[test]

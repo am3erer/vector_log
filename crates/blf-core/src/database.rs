@@ -135,6 +135,11 @@ pub struct CanSignal {
     pub offset: f64,
     pub minimum: Option<f64>,
     pub maximum: Option<f64>,
+    pub unit: Option<String>,
+    pub receivers: Vec<String>,
+    /// Raw DBC `SIG_VALTYPE_` value type. The current decoder preserves this
+    /// declaration without changing its integer signal extraction rules.
+    pub value_type: Option<u8>,
     pub choices: ValueTable,
     pub multiplex: MultiplexRole,
     pub attributes: BTreeMap<String, String>,
@@ -160,6 +165,9 @@ impl CanSignal {
             offset: 0.0,
             minimum: None,
             maximum: None,
+            unit: None,
+            receivers: Vec::new(),
+            value_type: None,
             choices: ValueTable::default(),
             multiplex: MultiplexRole::None,
             attributes: BTreeMap::new(),
@@ -188,9 +196,73 @@ pub struct DbcMessage {
     pub dlc: u8,
     pub is_fd: bool,
     pub payload_kind: CanPayloadKind,
+    pub transmitter: String,
     pub signals: Vec<CanSignal>,
     pub comment: Option<String>,
     pub attributes: BTreeMap<String, String>,
+    pub source: Option<SourceSpan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbcSignalGroup {
+    pub message_id: CanMessageId,
+    pub name: String,
+    pub repetition: u32,
+    pub signal_names: Vec<String>,
+    pub source: Option<SourceSpan>,
+}
+
+/// A DBC `BA_REL_` assignment. Relationship attributes are distinct from
+/// ordinary message/signal attributes because they target a pair of objects,
+/// such as a node and a signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbcRelationshipAttribute {
+    pub name: String,
+    pub relationship: String,
+    pub source_node: String,
+    pub message_id: CanMessageId,
+    pub signal_name: String,
+    pub value: String,
+    pub source: Option<SourceSpan>,
+}
+
+/// A DBC `BA_DEF_`/`BA_DEF_REL_` attribute definition.
+///
+/// Numeric limits are kept as their source strings rather than eagerly
+/// converting them to a numeric type. This preserves hexadecimal spellings,
+/// large integer values, and the exact representation used by the database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbcAttributeDefinition {
+    pub name: String,
+    pub scope: String,
+    pub relationship: Option<String>,
+    pub value_type: String,
+    pub minimum: Option<String>,
+    pub maximum: Option<String>,
+    pub enum_values: Vec<String>,
+    pub raw_arguments: Vec<String>,
+    pub source: Option<SourceSpan>,
+}
+
+/// A DBC `BA_` assignment with its target represented explicitly.
+///
+/// Message and signal targets use `message_id`; signal targets additionally
+/// provide `signal_name`. Node and environment targets use `object_name`, and
+/// global assignments leave all target fields empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbcAttributeAssignment {
+    pub name: String,
+    pub scope: String,
+    pub message_id: Option<CanMessageId>,
+    pub signal_name: Option<String>,
+    pub object_name: Option<String>,
+    pub value: String,
+    pub source: Option<SourceSpan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DbcNode {
+    pub name: String,
     pub source: Option<SourceSpan>,
 }
 
@@ -215,7 +287,16 @@ pub struct DbcDatabase {
     pub(crate) version: Option<String>,
     pub(crate) source_path: Option<String>,
     pub(crate) attributes: BTreeMap<String, String>,
+    pub(crate) attribute_defaults: BTreeMap<String, String>,
+    pub(crate) relationship_attribute_defaults: BTreeMap<String, String>,
+    pub(crate) attribute_definitions: BTreeMap<String, DbcAttributeDefinition>,
+    pub(crate) attribute_assignments: Vec<DbcAttributeAssignment>,
+    pub(crate) nodes: Vec<DbcNode>,
     pub(crate) scoped_attributes: BTreeMap<String, String>,
+    pub(crate) signal_groups: Vec<DbcSignalGroup>,
+    pub(crate) relationship_attributes: Vec<DbcRelationshipAttribute>,
+    pub(crate) value_tables: BTreeMap<String, ValueTable>,
+    pub(crate) signal_type_value_types: BTreeMap<u8, u8>,
     messages_by_id: BTreeMap<CanMessageId, Arc<DbcMessage>>,
     messages_by_name: HashMap<String, CanMessageId>,
     signals_by_qualified_name: HashMap<String, CanSignalRef>,
@@ -233,7 +314,16 @@ impl DbcDatabase {
             version: None,
             source_path: None,
             attributes: BTreeMap::new(),
+            attribute_defaults: BTreeMap::new(),
+            relationship_attribute_defaults: BTreeMap::new(),
+            attribute_definitions: BTreeMap::new(),
+            attribute_assignments: Vec::new(),
+            nodes: Vec::new(),
             scoped_attributes: BTreeMap::new(),
+            signal_groups: Vec::new(),
+            relationship_attributes: Vec::new(),
+            value_tables: BTreeMap::new(),
+            signal_type_value_types: BTreeMap::new(),
             messages_by_id: BTreeMap::new(),
             messages_by_name: HashMap::new(),
             signals_by_qualified_name: HashMap::new(),
@@ -380,6 +470,56 @@ impl DbcDatabase {
 
     pub(crate) fn set_attribute(&mut self, name: impl Into<String>, value: impl Into<String>) {
         self.attributes.insert(name.into(), value.into());
+    }
+
+    pub(crate) fn set_attribute_default(
+        &mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) {
+        self.attribute_defaults.insert(name.into(), value.into());
+    }
+
+    pub(crate) fn set_value_table(&mut self, name: impl Into<String>, table: ValueTable) {
+        self.value_tables.insert(name.into(), table);
+    }
+
+    pub(crate) fn set_signal_value_type(
+        &mut self,
+        id: CanMessageId,
+        signal_name: &str,
+        value_type: u8,
+    ) -> DatabaseResult<()> {
+        let message = self.messages_by_id.get_mut(&id).ok_or_else(|| {
+            DatabaseError::new(
+                self.source_path.as_deref().unwrap_or("<memory>"),
+                0,
+                "SIG_VALTYPE_",
+                format!("unknown CAN message id 0x{:X}", id.id),
+            )
+        })?;
+        let message = Arc::get_mut(message).ok_or_else(|| {
+            DatabaseError::new(
+                self.source_path.as_deref().unwrap_or("<memory>"),
+                0,
+                "SIG_VALTYPE_",
+                "message is shared and cannot be modified",
+            )
+        })?;
+        let signal = message.signal_mut(signal_name).ok_or_else(|| {
+            DatabaseError::new(
+                self.source_path.as_deref().unwrap_or("<memory>"),
+                0,
+                "SIG_VALTYPE_",
+                format!("unknown CAN signal {:?}", signal_name),
+            )
+        })?;
+        signal.value_type = Some(value_type);
+        Ok(())
+    }
+
+    pub(crate) fn set_signal_type_value_type(&mut self, signal_type: u8, value_type: u8) {
+        self.signal_type_value_types.insert(signal_type, value_type);
     }
 
     pub(crate) fn set_message_comment(
@@ -719,6 +859,154 @@ impl DbcDatabase {
             .map(|(name, value)| (name.as_str(), value.as_str()))
     }
 
+    pub fn attribute_defaults(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.attribute_defaults
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+
+    pub fn relationship_attribute_defaults(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.relationship_attribute_defaults
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+
+    pub fn attribute_definitions(&self) -> impl Iterator<Item = &DbcAttributeDefinition> {
+        self.attribute_definitions.values()
+    }
+
+    pub fn attribute_assignments(&self) -> impl Iterator<Item = &DbcAttributeAssignment> {
+        self.attribute_assignments.iter()
+    }
+
+    pub fn nodes(&self) -> impl Iterator<Item = &DbcNode> {
+        self.nodes.iter()
+    }
+
+    pub(crate) fn set_attribute_definition(&mut self, definition: DbcAttributeDefinition) {
+        self.attribute_definitions
+            .insert(definition.name.clone(), definition);
+    }
+
+    pub(crate) fn add_attribute_assignment(&mut self, assignment: DbcAttributeAssignment) {
+        self.attribute_assignments.push(assignment);
+    }
+
+    pub(crate) fn add_node(&mut self, node: DbcNode) -> DatabaseResult<()> {
+        if self.nodes.iter().any(|existing| existing.name == node.name) {
+            return Err(DatabaseError::new(
+                self.source_path.as_deref().unwrap_or("<memory>"),
+                node.source.map_or(0, |span| span.line),
+                "BU_",
+                format!("duplicate CAN node name {:?}", node.name),
+            ));
+        }
+        self.nodes.push(node);
+        Ok(())
+    }
+
+    pub(crate) fn set_relationship_attribute_default(
+        &mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) {
+        self.relationship_attribute_defaults
+            .insert(name.into(), value.into());
+    }
+
+    pub fn value_tables(&self) -> impl Iterator<Item = (&str, &ValueTable)> {
+        self.value_tables
+            .iter()
+            .map(|(name, table)| (name.as_str(), table))
+    }
+
+    pub fn signal_type_value_types(&self) -> impl Iterator<Item = (&u8, &u8)> {
+        self.signal_type_value_types.iter()
+    }
+
+    pub fn signal_groups(&self) -> impl Iterator<Item = &DbcSignalGroup> {
+        self.signal_groups.iter()
+    }
+
+    pub fn relationship_attributes(&self) -> impl Iterator<Item = &DbcRelationshipAttribute> {
+        self.relationship_attributes.iter()
+    }
+
+    pub fn relationship_attributes_for<'a>(
+        &'a self,
+        name: &str,
+    ) -> impl Iterator<Item = &'a DbcRelationshipAttribute> + 'a {
+        let name = name.to_owned();
+        self.relationship_attributes
+            .iter()
+            .filter(move |attribute| attribute.name == name)
+    }
+
+    pub(crate) fn add_relationship_attribute(
+        &mut self,
+        attribute: DbcRelationshipAttribute,
+    ) -> DatabaseResult<()> {
+        if self
+            .message_by_id(attribute.message_id.id, attribute.message_id.extended)
+            .and_then(|message| message.signal(&attribute.signal_name))
+            .is_none()
+        {
+            return Err(DatabaseError::new(
+                self.source_path.as_deref().unwrap_or("<memory>"),
+                attribute.source.map_or(0, |span| span.line),
+                "BA_REL_",
+                format!(
+                    "unknown CAN signal {:?}.{:?}",
+                    attribute.message_id.id, attribute.signal_name
+                ),
+            ));
+        }
+        self.relationship_attributes.push(attribute);
+        Ok(())
+    }
+
+    pub(crate) fn set_message_transmitter(
+        &mut self,
+        id: CanMessageId,
+        transmitter: impl Into<String>,
+    ) -> DatabaseResult<()> {
+        let message = self.messages_by_id.get_mut(&id).ok_or_else(|| {
+            DatabaseError::new(
+                self.source_path.as_deref().unwrap_or("<memory>"),
+                0,
+                "BO_TX_BU_",
+                format!("unknown CAN message id 0x{:X}", id.id),
+            )
+        })?;
+        Arc::get_mut(message)
+            .ok_or_else(|| {
+                DatabaseError::new(
+                    self.source_path.as_deref().unwrap_or("<memory>"),
+                    0,
+                    "BO_TX_BU_",
+                    "message is shared and cannot be modified",
+                )
+            })?
+            .transmitter = transmitter.into();
+        Ok(())
+    }
+
+    pub(crate) fn add_signal_group(&mut self, group: DbcSignalGroup) -> DatabaseResult<()> {
+        if self
+            .message_by_id(group.message_id.id, group.message_id.extended)
+            .is_none()
+        {
+            return Err(DatabaseError::new(
+                self.source_path.as_deref().unwrap_or("<memory>"),
+                group.source.map_or(0, |span| span.line),
+                "SIG_GROUP_",
+                format!("unknown CAN message id 0x{:X}", group.message_id.id),
+            ));
+        }
+        self.signal_groups.push(group);
+        Ok(())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.messages_by_id.is_empty()
     }
@@ -735,6 +1023,8 @@ pub struct LinSignal {
     pub name: String,
     pub start_bit: u16,
     pub bit_length: u16,
+    pub publisher: Option<String>,
+    pub subscribers: Vec<String>,
     pub initial_value: Option<i64>,
     pub factor: f64,
     pub offset: f64,
@@ -783,10 +1073,57 @@ impl LinFrame {
     }
 }
 
+/// A LIN diagnostic signal declared in `Diagnostic_signals`.
+///
+/// Diagnostic signals use the same bit extraction rules as ordinary LIN
+/// signals, but are kept separate from the ordinary signal namespace because
+/// their frame declarations live in a different LDF section.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinDiagnosticSignal {
+    pub name: String,
+    pub bit_length: u16,
+    pub initial_value: Option<i64>,
+    pub source: Option<SourceSpan>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinDiagnosticFrame {
+    pub id: u8,
+    pub name: String,
+    pub dlc: u8,
+    pub checksum: LinChecksum,
+    pub signals: Vec<LinSignal>,
+    pub source: Option<SourceSpan>,
+}
+
+impl LinDiagnosticFrame {
+    pub fn signal(&self, name: &str) -> Option<&LinSignal> {
+        self.signals.iter().find(|signal| signal.name == name)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct LinNode {
     pub name: String,
     pub configured_nad: Option<u8>,
+    pub timebase_ms: Option<f64>,
+    pub jitter_ms: Option<f64>,
+    pub source: Option<SourceSpan>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinNodeAttribute {
+    pub node_name: String,
+    pub lin_protocol: Option<String>,
+    pub configured_nad: Option<u8>,
+    pub initial_nad: Option<u8>,
+    pub product_id: Option<[u32; 3]>,
+    pub response_error: Option<String>,
+    pub p2_min_ms: Option<f64>,
+    pub st_min_ms: Option<f64>,
+    pub n_as_timeout_ms: Option<f64>,
+    pub n_cr_timeout_ms: Option<f64>,
+    pub configurable_frames: Vec<String>,
     pub source: Option<SourceSpan>,
 }
 
@@ -832,10 +1169,15 @@ pub struct LdfDatabase {
     pub(crate) language_version: Option<String>,
     pub(crate) speed_kbps: Option<f64>,
     pub(crate) nodes: Vec<LinNode>,
+    pub(crate) node_attributes: BTreeMap<String, LinNodeAttribute>,
     pub(crate) schedules: BTreeMap<String, Vec<LinScheduleEntry>>,
     pub(crate) encodings: BTreeMap<String, LinEncoding>,
     pub(crate) optional_sections: Vec<LdfOptionalSection>,
     pub(crate) dynamic_frames: Vec<LinDynamicFrame>,
+    pub(crate) diagnostic_signals: BTreeMap<String, LinDiagnosticSignal>,
+    pub(crate) diagnostic_frames_by_id: BTreeMap<u8, Arc<LinDiagnosticFrame>>,
+    pub(crate) diagnostic_frames_by_name: HashMap<String, u8>,
+    diagnostic_signals_by_qualified_name: HashMap<String, (u8, usize)>,
     frames_by_id: BTreeMap<u8, Arc<LinFrame>>,
     frames_by_name: HashMap<String, u8>,
     signals_by_qualified_name: HashMap<String, LinSignalRef>,
@@ -856,10 +1198,15 @@ impl LdfDatabase {
             language_version: None,
             speed_kbps: None,
             nodes: Vec::new(),
+            node_attributes: BTreeMap::new(),
             schedules: BTreeMap::new(),
             encodings: BTreeMap::new(),
             optional_sections: Vec::new(),
             dynamic_frames: Vec::new(),
+            diagnostic_signals: BTreeMap::new(),
+            diagnostic_frames_by_id: BTreeMap::new(),
+            diagnostic_frames_by_name: HashMap::new(),
+            diagnostic_signals_by_qualified_name: HashMap::new(),
             frames_by_id: BTreeMap::new(),
             frames_by_name: HashMap::new(),
             signals_by_qualified_name: HashMap::new(),
@@ -928,10 +1275,148 @@ impl LdfDatabase {
         self.frames_by_id.get(id).map(Arc::as_ref)
     }
 
+    pub fn diagnostic_frame_by_id(&self, id: u8) -> Option<&LinDiagnosticFrame> {
+        self.diagnostic_frames_by_id.get(&id).map(Arc::as_ref)
+    }
+
+    pub fn diagnostic_frame_by_name(&self, name: &str) -> Option<&LinDiagnosticFrame> {
+        let id = self.diagnostic_frames_by_name.get(name)?;
+        self.diagnostic_frames_by_id.get(id).map(Arc::as_ref)
+    }
+
+    pub fn diagnostic_frames(&self) -> impl Iterator<Item = &LinDiagnosticFrame> {
+        self.diagnostic_frames_by_id.values().map(Arc::as_ref)
+    }
+
+    pub fn diagnostic_signals(&self) -> impl Iterator<Item = &LinDiagnosticSignal> {
+        self.diagnostic_signals.values()
+    }
+
+    pub fn node_attributes(&self) -> impl Iterator<Item = (&str, &LinNodeAttribute)> {
+        self.node_attributes
+            .iter()
+            .map(|(name, attributes)| (name.as_str(), attributes))
+    }
+
+    pub fn diagnostic_signal(
+        &self,
+        qualified_name: &str,
+    ) -> Option<(&LinDiagnosticFrame, &LinSignal)> {
+        let (frame_id, signal_index) = self
+            .diagnostic_signals_by_qualified_name
+            .get(qualified_name)?;
+        let frame = self.diagnostic_frames_by_id.get(frame_id)?;
+        Some((frame, frame.signals.get(*signal_index)?))
+    }
+
+    pub(crate) fn insert_diagnostic_signal(
+        &mut self,
+        signal: LinDiagnosticSignal,
+    ) -> DatabaseResult<()> {
+        if self.diagnostic_signals.contains_key(&signal.name) {
+            return Err(DatabaseError::new(
+                self.source_path.as_deref().unwrap_or("<memory>"),
+                signal.source.map_or(0, |span| span.line),
+                "Diagnostic_signals",
+                format!("duplicate diagnostic signal definition {:?}", signal.name),
+            ));
+        }
+        self.diagnostic_signals.insert(signal.name.clone(), signal);
+        Ok(())
+    }
+
+    pub(crate) fn insert_diagnostic_frame(
+        &mut self,
+        frame: LinDiagnosticFrame,
+    ) -> DatabaseResult<()> {
+        if self.diagnostic_frames_by_id.contains_key(&frame.id) {
+            return Err(DatabaseError::new(
+                self.source_path.as_deref().unwrap_or("<memory>"),
+                frame.source.map_or(0, |span| span.line),
+                "Diagnostic_frames",
+                format!("duplicate LIN diagnostic frame id 0x{:02X}", frame.id),
+            ));
+        }
+        if self.diagnostic_frames_by_name.contains_key(&frame.name) {
+            return Err(DatabaseError::new(
+                self.source_path.as_deref().unwrap_or("<memory>"),
+                frame.source.map_or(0, |span| span.line),
+                "Diagnostic_frames",
+                format!("duplicate LIN diagnostic frame name {:?}", frame.name),
+            ));
+        }
+        let frame_id = frame.id;
+        let frame_name = frame.name.clone();
+        let frame = Arc::new(frame);
+        for (signal_index, signal) in frame.signals.iter().enumerate() {
+            let qualified_name = format!("{}.{}", frame.name, signal.name);
+            if self
+                .diagnostic_signals_by_qualified_name
+                .insert(qualified_name.clone(), (frame_id, signal_index))
+                .is_some()
+            {
+                return Err(DatabaseError::new(
+                    self.source_path.as_deref().unwrap_or("<memory>"),
+                    signal.source.map_or(0, |span| span.line),
+                    "Diagnostic_frames",
+                    format!("duplicate diagnostic signal name {:?}", qualified_name),
+                ));
+            }
+        }
+        self.diagnostic_frames_by_name.insert(frame_name, frame_id);
+        self.diagnostic_frames_by_id.insert(frame_id, frame);
+        Ok(())
+    }
+
+    pub(crate) fn insert_node_attributes(
+        &mut self,
+        attributes: LinNodeAttribute,
+    ) -> DatabaseResult<()> {
+        if self.node_attributes.contains_key(&attributes.node_name) {
+            return Err(DatabaseError::new(
+                self.source_path.as_deref().unwrap_or("<memory>"),
+                attributes.source.map_or(0, |span| span.line),
+                "Node_attributes",
+                format!("duplicate node attribute block {:?}", attributes.node_name),
+            ));
+        }
+        if let Some(node) = self
+            .nodes
+            .iter_mut()
+            .find(|node| node.name == attributes.node_name)
+        {
+            node.configured_nad = attributes.configured_nad;
+        }
+        self.node_attributes
+            .insert(attributes.node_name.clone(), attributes);
+        Ok(())
+    }
+
     pub fn signal(&self, qualified_name: &str) -> Option<(&LinFrame, &LinSignal)> {
         let signal_ref = self.signals_by_qualified_name.get(qualified_name)?;
         let frame = self.frames_by_id.get(&signal_ref.frame_id)?;
         Some((frame, &frame.signals[signal_ref.signal_index]))
+    }
+
+    /// Return ordinary LIN signal names in their query form (`Frame.Signal`).
+    pub fn signal_names(&self) -> impl Iterator<Item = &str> {
+        self.signals_by_qualified_name.keys().map(String::as_str)
+    }
+
+    /// Return diagnostic LIN signal names in their query form
+    /// (`DiagnosticFrame.Signal`).
+    pub fn diagnostic_signal_names(&self) -> impl Iterator<Item = &str> {
+        self.diagnostic_signals_by_qualified_name
+            .keys()
+            .map(String::as_str)
+    }
+
+    pub fn signal_count(&self) -> usize {
+        self.signals_by_qualified_name.len()
+    }
+
+    pub fn diagnostic_signal_count(&self) -> usize {
+        self.diagnostic_signals_by_qualified_name.len()
     }
 
     pub(crate) fn set_signal_encoding_for_name(

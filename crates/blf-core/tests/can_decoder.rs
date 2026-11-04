@@ -60,6 +60,89 @@ fn applies_scaling_limits_and_choice_text() {
 }
 
 #[test]
+fn decodes_dbc_float32_in_both_byte_orders_and_applies_scaling() {
+    let mut little = signal(
+        "Float32LE",
+        0,
+        32,
+        ByteOrder::LittleEndian,
+        SignalType::Unsigned,
+    );
+    little.value_type = Some(1);
+    little.factor = 2.0;
+    little.offset = 3.0;
+    let decoded = decode_signal(&little, &0.5f32.to_le_bytes()).unwrap();
+    assert_eq!(decoded.raw_value, i128::from(0x3F00_0000u32));
+    assert_eq!(decoded.physical_value, 4.0);
+
+    let mut big = signal(
+        "Float32BE",
+        7,
+        32,
+        ByteOrder::BigEndian,
+        SignalType::Unsigned,
+    );
+    big.value_type = Some(1);
+    let decoded = decode_signal(&big, &0.5f32.to_be_bytes()).unwrap();
+    assert_eq!(decoded.raw_value, i128::from(0x3F00_0000u32));
+    assert_eq!(decoded.physical_value, 0.5);
+}
+
+#[test]
+fn decodes_dbc_float64_in_both_byte_orders() {
+    let mut little = signal(
+        "Float64LE",
+        0,
+        64,
+        ByteOrder::LittleEndian,
+        SignalType::Unsigned,
+    );
+    little.value_type = Some(2);
+    let decoded = decode_signal(&little, &1.5f64.to_le_bytes()).unwrap();
+    assert_eq!(decoded.raw_value, i128::from(1.5f64.to_bits()));
+    assert_eq!(decoded.physical_value, 1.5);
+
+    let mut big = signal(
+        "Float64BE",
+        7,
+        64,
+        ByteOrder::BigEndian,
+        SignalType::Unsigned,
+    );
+    big.value_type = Some(2);
+    let decoded = decode_signal(&big, &1.5f64.to_be_bytes()).unwrap();
+    assert_eq!(decoded.raw_value, i128::from(1.5f64.to_bits()));
+    assert_eq!(decoded.physical_value, 1.5);
+}
+
+#[test]
+fn preserves_float_special_values_and_rejects_wrong_float_width() {
+    let mut value = signal(
+        "Special",
+        0,
+        32,
+        ByteOrder::LittleEndian,
+        SignalType::Unsigned,
+    );
+    value.value_type = Some(1);
+    let nan = decode_signal(&value, &f32::NAN.to_le_bytes()).unwrap();
+    assert!(nan.physical_value.is_nan());
+    let infinity = decode_signal(&value, &f32::INFINITY.to_le_bytes()).unwrap();
+    assert!(infinity.physical_value.is_infinite());
+
+    value.bit_length = 16;
+    assert!(matches!(
+        decode_signal(&value, &[0; 2]),
+        Err(CanDecodeError::InvalidFloatBitLength {
+            value_type: 1,
+            bit_length: 16,
+            expected: 32,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn rejects_short_payload_and_out_of_range_physical_value() {
     let value = signal("Value", 0, 8, ByteOrder::LittleEndian, SignalType::Unsigned);
     let message = DbcMessage {
@@ -68,6 +151,7 @@ fn rejects_short_payload_and_out_of_range_physical_value() {
         dlc: 8,
         is_fd: false,
         payload_kind: CanPayloadKind::Physical,
+        transmitter: String::new(),
         signals: vec![value.clone()],
         comment: None,
         attributes: Default::default(),
@@ -84,6 +168,16 @@ fn rejects_short_payload_and_out_of_range_physical_value() {
         decode_signal(&limited, &[1]),
         Err(CanDecodeError::ValueOutOfRange { .. })
     ));
+}
+
+#[test]
+fn decodes_signals_without_physical_limits() {
+    let mut value = signal("Value", 0, 8, ByteOrder::LittleEndian, SignalType::Unsigned);
+    value.minimum = None;
+    value.maximum = None;
+    let decoded = decode_signal(&value, &[255]).unwrap();
+    assert_eq!(decoded.raw_value, 255);
+    assert_eq!(decoded.physical_value, 255.0);
 }
 
 #[test]
@@ -121,6 +215,7 @@ fn logical_vector_message_uses_signal_width_for_physical_query_decode() {
         dlc: 196,
         is_fd: false,
         payload_kind: CanPayloadKind::LogicalContainer,
+        transmitter: String::new(),
         signals: vec![signal(
             "Selector",
             0,
@@ -147,6 +242,7 @@ fn physical_oversized_message_still_requires_the_declared_payload() {
         dlc: 196,
         is_fd: false,
         payload_kind: CanPayloadKind::Physical,
+        transmitter: String::new(),
         signals: vec![signal(
             "Selector",
             0,
@@ -188,6 +284,7 @@ fn targeted_decode_ignores_unrelated_invalid_signals() {
         dlc: 1,
         is_fd: false,
         payload_kind: CanPayloadKind::Physical,
+        transmitter: String::new(),
         signals: vec![requested, unrelated],
         comment: None,
         attributes: Default::default(),
@@ -223,6 +320,7 @@ fn multiplex_decodes_selector_and_only_active_branch() {
         dlc: 3,
         is_fd: false,
         payload_kind: CanPayloadKind::Physical,
+        transmitter: String::new(),
         signals: vec![
             CanSignal {
                 multiplex: MultiplexRole::Selector,
@@ -263,6 +361,7 @@ fn rejects_invalid_and_ambiguous_multiplex_selectors() {
         dlc: 2,
         is_fd: false,
         payload_kind: CanPayloadKind::Physical,
+        transmitter: String::new(),
         signals: vec![selector.clone(), branch.clone()],
         comment: None,
         attributes: Default::default(),
@@ -302,6 +401,7 @@ fn rejects_common_signal_when_multiplex_branches_have_no_selector() {
         dlc: 1,
         is_fd: false,
         payload_kind: CanPayloadKind::Physical,
+        transmitter: String::new(),
         signals: vec![
             signal(
                 "Common",

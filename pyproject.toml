@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "vector-log-blf"
 version = "0.1.0"
 description = "Rust-backed Vector BLF parser with Python bindings"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = []
 
 [tool.maturin]

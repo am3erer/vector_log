@@ -5,6 +5,7 @@ import pytest
 
 from vector_log.blf_rs.classes import SignalSample, object_from_data
 from vector_log.blf_rs import (
+    DatabaseParseError,
     DbcDatabase,
     File,
     LdfDatabase,
@@ -48,10 +49,12 @@ BU_: ECU
 
 BO_ 512 Multiplexed: 8 ECU
  SG_ Mux M : 0|4@1+ (1,0) [0|15] "" ECU
- SG_ Common : 8|8@1+ (1,0) [0|255] "" ECU
+ SG_ Common : 8|8@1+ (1,0) [0|255] "" ECU,Gateway
  SG_ Branch m1 : 16|8@1+ (0.5,-1) [-1|126.5] "km/h" ECU
  SG_ BranchMulti m2 : 24|8@1+ (1,10) [10|265] "" ECU
 
+BO_TX_BU_ 512 : Gateway,ECU;
+SIG_GROUP_ 512 StatusGroup 10 : Common Branch;
 CM_ BO_ 512 "multiplexed message";
 CM_ SG_ 512 Common "common signal";
 VAL_ 512 Common 0 "Idle" 1 "Active";
@@ -261,8 +264,8 @@ def _write_strict_blf(path):
     path.write_bytes(_file_statistics(len(inner), 2) + container)
 
 
-def _write_lin_blf(path):
-    inner = _lin_message(3, 1, 40, (0x2A,))
+def _write_lin_blf(path, frame_id=1, data=(0x2A,)):
+    inner = _lin_message(3, frame_id, 40, data)
     container_size = 32 + len(inner)
     container = bytearray()
     container += struct.pack(
@@ -296,6 +299,10 @@ def test_native_database_parsers_and_path_bindings(tmp_path):
     assert dbc.message_count == 3
     assert ldf.source_path == str(ldf_path)
     assert ldf.frame_count == 1
+    assert ldf.signal_count == 1
+    assert ldf.signal_names == ["Status.State"]
+    assert ldf.diagnostic_signal_count == 0
+    assert ldf.diagnostic_signal_names == []
     assert ldf.optional_sections == []
     assert repr(dbc) == "DbcDatabase(messages=3)"
     assert repr(ldf) == "LdfDatabase(frames=1)"
@@ -316,6 +323,64 @@ def test_python_dbc_metadata_view_exposes_all_native_fields():
         "BU_:ECU:NodeRole": "controller",
         "EV_:Ambient:Environment": "outside",
     }
+    assert dbc.nodes == [{"name": "ECU", "source": {"line": 5, "column": 6}}]
+    assert dbc.attribute_assignments == [
+        {
+            "name": "CycleTime",
+            "scope": "message",
+            "message_id": 512,
+            "message_extended": False,
+            "signal_name": None,
+            "object_name": None,
+            "value": "10",
+            "source": {"line": 22, "column": 1},
+        },
+        {
+            "name": "SignalType",
+            "scope": "signal",
+            "message_id": 512,
+            "message_extended": False,
+            "signal_name": "Common",
+            "object_name": None,
+            "value": "status",
+            "source": {"line": 23, "column": 1},
+        },
+        {
+            "name": "NodeRole",
+            "scope": "node",
+            "message_id": None,
+            "message_extended": None,
+            "signal_name": None,
+            "object_name": "ECU",
+            "value": "controller",
+            "source": {"line": 24, "column": 1},
+        },
+        {
+            "name": "Environment",
+            "scope": "environment",
+            "message_id": None,
+            "message_extended": None,
+            "signal_name": None,
+            "object_name": "Ambient",
+            "value": "outside",
+            "source": {"line": 25, "column": 1},
+        },
+    ]
+    definitions = {definition["name"]: definition for definition in dbc.attribute_definitions}
+    assert definitions["CycleTime"] == {
+        "name": "CycleTime",
+        "scope": "message",
+        "relationship": None,
+        "value_type": "INT",
+        "minimum": "0",
+        "maximum": "10000",
+        "enum_values": [],
+        "raw_arguments": ["0", "10000"],
+        "source": {"line": 18, "column": 1},
+    }
+    assert definitions["SignalType"]["scope"] == "signal"
+    assert definitions["NodeRole"]["scope"] == "node"
+    assert definitions["Environment"]["scope"] == "environment"
 
     message = dbc.message_by_id(512)
     assert message == dbc.message_by_name("Multiplexed")
@@ -323,6 +388,7 @@ def test_python_dbc_metadata_view_exposes_all_native_fields():
     assert message["extended"] is False
     assert message["name"] == "Multiplexed"
     assert message["dlc"] == 8
+    assert message["transmitter"] == "Gateway,ECU"
     assert message["is_fd"] is False
     assert message["payload_kind"] == "physical"
     assert message["comment"] == "multiplexed message"
@@ -334,9 +400,22 @@ def test_python_dbc_metadata_view_exposes_all_native_fields():
     assert signals["Common"]["choices"] == {0: "Idle", 1: "Active"}
     assert signals["Common"]["attributes"] == {"SignalType": "status"}
     assert signals["Common"]["comment"] == "common signal"
+    assert signals["Common"]["unit"] is None
+    assert signals["Common"]["receivers"] == ["ECU", "Gateway"]
     assert signals["Branch"]["multiplex"] == [1, 2, 3, 5, 7, 8]
     assert signals["Branch"]["factor"] == 0.5
     assert signals["Branch"]["offset"] == -1.0
+
+    assert dbc.signal_groups == [
+        {
+            "message_id": 512,
+            "message_extended": False,
+            "name": "StatusGroup",
+            "repetition": 10,
+            "signal_names": ["Common", "Branch"],
+            "source": {"line": 14, "column": 1},
+        }
+    ]
     assert signals["Branch"]["minimum"] == -1.0
     assert signals["Branch"]["maximum"] == 126.5
     assert signals["Branch"]["byte_order"] == "little_endian"
@@ -350,6 +429,79 @@ def test_python_dbc_metadata_view_exposes_all_native_fields():
     assert dbc.message_by_id(512, extended=True) is None
 
 
+def test_python_dbc_relationship_attributes_are_structured():
+    dbc = DbcDatabase.from_str(
+        r'''
+BA_DEF_REL_ BU_SG_REL_ "GenSigTimeoutTime" INT 0 65535;
+BA_DEF_DEF_REL_ "GenSigTimeoutTime" 0;
+BO_ 256 Status: 1 ECU
+ SG_ Value : 0|8@1+ (1,0) [0|255] "" ECU
+BA_REL_ "GenSigTimeoutTime" BU_SG_REL_ ECU SG_ 256 Value 75;
+'''
+    )
+    assert dbc.relationship_attributes == [
+        {
+            "name": "GenSigTimeoutTime",
+            "relationship": "BU_SG_REL_",
+            "source_node": "ECU",
+            "message_id": 256,
+            "message_extended": False,
+            "signal_name": "Value",
+            "value": "75",
+            "source": {"line": 6, "column": 1},
+        }
+    ]
+    assert dbc.relationship_attributes_for("GenSigTimeoutTime") == dbc.relationship_attributes
+    assert dbc.relationship_attributes_for("Missing") == []
+    assert dbc.relationship_attribute_defaults == {"GenSigTimeoutTime": "0"}
+    assert dbc.attribute_defaults == {}
+    assert dbc.attribute_definitions == [
+        {
+            "name": "GenSigTimeoutTime",
+            "scope": "relationship",
+            "relationship": "BU_SG_REL_",
+            "value_type": "INT",
+            "minimum": "0",
+            "maximum": "65535",
+            "enum_values": [],
+            "raw_arguments": ["0", "65535"],
+            "source": {"line": 2, "column": 1},
+        }
+    ]
+    assert dbc.message_by_id(256)["signals"][0]["attributes"] == {}
+
+
+def test_python_dbc_value_metadata_view():
+    dbc = DbcDatabase.from_str(
+        '''
+BA_DEF_ BO_ "CycleTime" INT 0 10000;
+BA_DEF_DEF_ "CycleTime" 100;
+VAL_TABLE_ IgnitionState 0 "Off" 1 "On";
+SIGTYPE_VALTYPE_ 7 1;
+BO_ 256 Status: 1 ECU
+ SG_ State : 0|8@1+ (1,0) [0|255] "" ECU
+SIG_VALTYPE_ 256 State : 1;
+'''
+    )
+
+    assert dbc.attribute_defaults == {"CycleTime": "100"}
+    assert dbc.value_tables == {"IgnitionState": {0: "Off", 1: "On"}}
+    assert dbc.signal_type_value_types == {7: 1}
+    assert dbc.message_by_id(256)["signals"][0]["value_type"] == 1
+
+
+def test_python_dbc_zero_zero_limits_are_exposed_as_unspecified():
+    dbc = DbcDatabase.from_str(
+        r'''
+BO_ 256 Status: 1 ECU
+ SG_ Value : 0|8@1+ (1,0) [0|0] "" ECU
+'''
+    )
+    signal = dbc.message_by_id(256)["signals"][0]
+    assert signal["minimum"] is None
+    assert signal["maximum"] is None
+
+
 def test_python_ldf_metadata_view_exposes_all_native_fields():
     ldf = LdfDatabase.from_str(LDF_METADATA)
 
@@ -357,9 +509,12 @@ def test_python_ldf_metadata_view_exposes_all_native_fields():
     assert ldf.protocol_version == "2.2"
     assert ldf.language_version == "2.2"
     assert ldf.speed_kbps == 19.2
-    assert [(node["name"], node["configured_nad"]) for node in ldf.nodes] == [
-        ("MasterNode", None),
-        ("SlaveA", None),
+    assert [
+        (node["name"], node["configured_nad"], node["timebase_ms"], node["jitter_ms"])
+        for node in ldf.nodes
+    ] == [
+        ("MasterNode", None, 5.0, 0.1),
+        ("SlaveA", None, None, None),
     ]
     assert all(node["source"]["line"] > 0 for node in ldf.nodes)
 
@@ -376,6 +531,8 @@ def test_python_ldf_metadata_view_exposes_all_native_fields():
     assert signal["name"] == "State"
     assert signal["start_bit"] == 0
     assert signal["bit_length"] == 8
+    assert signal["publisher"] == "SlaveA"
+    assert signal["subscribers"] == ["MasterNode"]
     assert signal["initial_value"] == 0
     assert signal["factor"] == 1.0
     assert signal["offset"] == 0.0
@@ -398,6 +555,88 @@ def test_python_ldf_metadata_view_exposes_all_native_fields():
     assert qualified["signal"] == signal
     assert ldf.signal("Missing.Signal") is None
     assert ldf.frame_by_id(2) is None
+
+
+def test_python_ldf_diagnostic_and_node_metadata_views():
+    source = LDF[:-1] + r'''
+Diagnostic_signals {
+  MasterReqB0: 8, 0 ;
+  SlaveRespB0: 8, 0 ;
+}
+
+Diagnostic_frames {
+  MasterReq: 0x3c { MasterReqB0, 0 ; }
+  SlaveResp: 0x3d { SlaveRespB0, 0 ; }
+}
+
+Node_attributes {
+  SlaveA{
+    LIN_protocol = "2.2" ;
+    configured_NAD = 0x12 ;
+    initial_NAD = 0x10 ;
+    product_id = 0x1, 0x2, 255 ;
+    response_error = State ;
+    P2_min = 50 ms ;
+    ST_min = 0 ms ;
+    N_As_timeout = 1000 ms ;
+    N_Cr_timeout = 1000 ms ;
+    configurable_frames { Status ; }
+  }
+}
+'''
+    ldf = LdfDatabase.from_str(source)
+
+    assert ldf.diagnostic_frame_count == 2
+    assert ldf.diagnostic_signal_count == 2
+    assert ldf.diagnostic_signal_names == [
+        "MasterReq.MasterReqB0",
+        "SlaveResp.SlaveRespB0",
+    ]
+    assert ldf.diagnostic_frames[0]["checksum"] == "classic"
+    master = ldf.diagnostic_frame_by_id(0x3C)
+    assert master["name"] == "MasterReq"
+    assert master["signals"][0]["name"] == "MasterReqB0"
+    assert master["signals"][0]["bit_length"] == 8
+    assert ldf.diagnostic_signals == [
+        {"name": "MasterReqB0", "bit_length": 8, "initial_value": 0, "source": ldf.diagnostic_signals[0]["source"]},
+        {"name": "SlaveRespB0", "bit_length": 8, "initial_value": 0, "source": ldf.diagnostic_signals[1]["source"]},
+    ]
+    assert ldf.diagnostic_signal("MasterReq.MasterReqB0")["frame_id"] == 0x3C
+    assert ldf.node_attributes["SlaveA"] == {
+        "node_name": "SlaveA",
+        "lin_protocol": "2.2",
+        "configured_nad": 0x12,
+        "initial_nad": 0x10,
+        "product_id": [1, 2, 255],
+        "response_error": "State",
+        "p2_min_ms": 50.0,
+        "st_min_ms": 0.0,
+        "n_as_timeout_ms": 1000.0,
+        "n_cr_timeout_ms": 1000.0,
+        "configurable_frames": ["Status"],
+        "source": ldf.node_attributes["SlaveA"]["source"],
+    }
+
+
+def test_python_lin_diagnostic_signal_query(tmp_path):
+    blf_path = tmp_path / "lin-diagnostic.blf"
+    ldf_path = tmp_path / "diagnostic.ldf"
+    _write_lin_blf(blf_path, frame_id=0x3C, data=(0x2A, 0, 0, 0, 0, 0, 0, 0))
+    ldf_path.write_text(
+        LDF[:-1] + r'''
+Diagnostic_signals { MasterReqB0: 8, 0 ; }
+Diagnostic_frames { MasterReq: 0x3c { MasterReqB0, 0 ; } }
+''',
+        encoding="utf-8",
+    )
+
+    reader = open(blf_path, databases={("lin", 3): ldf_path})
+    sample = next(reader.signal("MasterReq.MasterReqB0", bus="lin", channel=3))
+    assert sample.frame_id == 0x3C
+    assert sample.message_name == "MasterReq"
+    assert sample.signal_name == "MasterReqB0"
+    assert sample.raw_value == 0x2A
+    assert sample.physical_value == 0x2A
 
 
 def test_python_ldf_signal_view_preserves_multiple_physical_ranges():
@@ -455,6 +694,10 @@ Event_triggered_frames { Trigger { Status, Status ; } }
             "source": {"line": 7, "column": 26},
         },
     ]
+    assert ldf.dynamic_frames_for_id(1) == ldf.dynamic_frames
+    assert ldf.dynamic_frame_for_id(1) == ldf.dynamic_frames[0]
+    assert ldf.dynamic_frames_for_id(2) == []
+    assert ldf.dynamic_frame_for_id(2) is None
 
 
 def test_python_signal_query_preserves_context_and_cursor(tmp_path):
@@ -486,6 +729,97 @@ def test_python_signal_query_preserves_context_and_cursor(tmp_path):
     first_object = reader.read()
     assert first_object.frame_id == 0x100
     assert first_object.payload == b"\x01\x00"
+
+
+def test_python_signal_query_decodes_dbc_ieee_float(tmp_path):
+    blf_path = tmp_path / "float.blf"
+    dbc_path = tmp_path / "float.dbc"
+    data = struct.pack("<f", 0.5)
+    inner = _can_message(1, 0x100, 10, data)
+    container_size = 32 + len(inner)
+    container = bytearray(
+        struct.pack(
+            "<IHHIIHHIII",
+            0x4A424F4C,
+            16,
+            1,
+            container_size,
+            10,
+            0,
+            0,
+            0,
+            len(inner),
+            0,
+        )
+    )
+    container += inner
+    container += b"\0" * (container_size % 4)
+    blf_path.write_bytes(_file_statistics(len(inner), 1) + container)
+    dbc_path.write_text(
+        r'''
+VERSION "1.0"
+NS_ :
+BS_:
+BU_: ECU
+
+BO_ 256 FloatStatus: 4 ECU
+ SG_ Value : 0|32@1+ (2,3) [-100|100] "unit" ECU
+SIG_VALTYPE_ 256 Value : 1;
+''',
+        encoding="utf-8",
+    )
+
+    reader = open(blf_path, databases={("can", 1): dbc_path})
+    sample = next(reader.signal("FloatStatus.Value", bus="can", channel=1))
+
+    assert sample.raw_value == 0x3F00_0000
+    assert sample.physical_value == 4.0
+    assert sample.value == 4.0
+    assert sample.value_text is None
+
+
+def test_signal_many_decodes_multiple_targets_in_one_query(tmp_path):
+    blf_path = tmp_path / "many-signals.blf"
+    dbc_path = tmp_path / "vehicle.dbc"
+    _write_blf(blf_path)
+    dbc_path.write_text(DBC, encoding="utf-8")
+
+    reader = open(blf_path, databases={("can", 1): dbc_path})
+    samples = reader.signal_many(
+        ["FirstStatus.Speed", "SecondStatus.Speed"], bus="can", channel=1
+    ).collect()
+
+    assert [(sample.message_name, sample.signal_name, sample.raw_value) for sample in samples] == [
+        ("FirstStatus", "Speed", 1),
+        ("SecondStatus", "Speed", 7),
+    ]
+
+
+def test_signal_query_filters_and_limits_are_lazy(tmp_path):
+    blf_path = tmp_path / "filtered-signals.blf"
+    dbc_path = tmp_path / "vehicle.dbc"
+    _write_blf(blf_path)
+    dbc_path.write_text(DBC, encoding="utf-8")
+
+    reader = open(blf_path, databases={("can", 1): dbc_path})
+    samples = reader.signals(
+        "Speed", bus="can", channel=1, start_ns=20, max_samples=1
+    ).collect()
+
+    assert [(sample.timestamp_ns, sample.message_name) for sample in samples] == [
+        (20, "SecondStatus")
+    ]
+
+
+def test_database_parse_error_exposes_structured_location():
+    with pytest.raises(DatabaseParseError) as captured:
+        DbcDatabase.from_str("BO_ bad Message: 1 ECU")
+
+    error = captured.value
+    assert error.path == "<memory>"
+    assert error.line == 1
+    assert error.field == "message_id"
+    assert "invalid integer" in error.reason
 
 
 def test_aggregate_query_returns_each_matching_message(tmp_path):
@@ -976,6 +1310,28 @@ def test_structured_protocol_payload_aliases():
         assert obj.payload_length == 2
 
 
+def test_mapping_access_supports_snake_and_camel_case_aliases():
+    obj = object_from_data(
+        {
+            "class": "CanFdMessage64",
+            "className": "CanFdMessage64",
+            "objectType": 101,
+            "frameLength": 1234,
+            "validDataBytes": 2,
+            "data": b"\x01\x02\x03",
+            "fields": {"frameLength": 1234, "validDataBytes": 2},
+        }
+    )
+
+    assert obj.frame_length == 1234
+    assert obj.frameLength == 1234
+    assert obj["frame_length"] == 1234
+    assert obj["frameLength"] == 1234
+    assert obj.get("valid_data_bytes") == 2
+    assert obj.get("validDataBytes") == 2
+    assert obj.get("missing_field") is None
+
+
 def test_can_fd_flags_do_not_leak_into_classic_can():
     classic = object_from_data(
         {
@@ -1010,6 +1366,57 @@ def test_can_fd_flags_do_not_leak_into_classic_can():
     assert can_fd_64.is_remote_frame
     assert can_fd_64.is_fd
     assert can_fd_64.bit_rate_switch
+
+
+def test_classic_can_direction_comes_from_flags_low_nibble():
+    rx = object_from_data(
+        {
+            "class": "CanMessage",
+            "className": "CanMessage",
+            "objectType": 1,
+            "flags": 0xE0,
+        }
+    )
+    tx = object_from_data(
+        {
+            "class": "CanMessage2",
+            "className": "CanMessage2",
+            "objectType": 86,
+            "flags": 0xE1,
+        }
+    )
+    unknown = object_from_data(
+        {
+            "class": "CanFdMessage",
+            "className": "CanFdMessage",
+            "objectType": 100,
+            "flags": 0xE2,
+        }
+    )
+
+    assert rx.raw_direction == 0
+    assert rx.direction == "Rx"
+    assert rx.is_rx and not rx.is_tx
+    assert tx.raw_direction == 1
+    assert tx.direction == "Tx"
+    assert tx.is_tx and not tx.is_rx
+    assert unknown.raw_direction == 2
+    assert unknown.direction == 2
+    assert not unknown.is_rx and not unknown.is_tx
+
+
+def test_object_export_preserves_classic_can_direction():
+    obj = object_from_data(
+        {
+            "class": "CanMessage",
+            "className": "CanMessage",
+            "objectType": 1,
+            "flags": 0xE1,
+            "data": b"\x01",
+            "dlc": 1,
+        }
+    )
+    assert objects_to_numpy([obj])["direction"].tolist() == [1]
 
 
 def test_filtering_and_text_exports_are_stable():

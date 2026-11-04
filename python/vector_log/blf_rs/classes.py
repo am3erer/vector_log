@@ -1,3 +1,4 @@
+import re
 from enum import IntEnum
 
 
@@ -143,6 +144,24 @@ def _snake_to_camel(name):
     return parts[0] + "".join(part[:1].upper() + part[1:] for part in parts[1:])
 
 
+def _camel_to_snake(name):
+    """Convert BLF-style camelCase keys for mapping lookup aliases."""
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+
+
+def _lookup_key(data, key):
+    """Find an exact, snake_case, or camelCase spelling of a mapping key."""
+    if key in data:
+        return key
+    if not isinstance(key, str):
+        return None
+    candidates = (_snake_to_camel(key), _camel_to_snake(key))
+    for candidate in candidates:
+        if candidate in data:
+            return candidate
+    return None
+
+
 def _wrap_value(value):
     if isinstance(value, dict):
         return _AttributeMapping(value)
@@ -159,18 +178,20 @@ class _AttributeMapping:
 
     def __getattr__(self, name):
         data = object.__getattribute__(self, "_data")
-        if name in data:
-            return _wrap_value(data[name])
-        camel_name = _snake_to_camel(name)
-        if camel_name in data:
-            return _wrap_value(data[camel_name])
+        key = _lookup_key(data, name)
+        if key is not None:
+            return _wrap_value(data[key])
         raise AttributeError(name)
 
     def __getitem__(self, key):
-        return _wrap_value(self._data[key])
+        actual_key = _lookup_key(self._data, key)
+        if actual_key is None:
+            raise KeyError(key)
+        return _wrap_value(self._data[actual_key])
 
     def get(self, key, default=None):
-        return self._data.get(key, default)
+        actual_key = _lookup_key(self._data, key)
+        return default if actual_key is None else _wrap_value(self._data[actual_key])
 
     def keys(self):
         return self._data.keys()
@@ -248,20 +269,34 @@ class _Object(_AttributeMapping):
 
     @property
     def direction(self):
-        """Human-readable direction for objects that expose ``dir``."""
-        value = self._data.get("dir")
+        """Human-readable BLF direction, including classic CAN flags."""
+        value = self._direction_value()
+        if self.class_name in {"CanMessage", "CanMessage2", "CanFdMessage"}:
+            return {0: "Rx", 1: "Tx"}.get(value, value)
         return {0: "Rx", 1: "Tx", 2: "TxRq"}.get(value, value)
 
     @property
     def is_rx(self):
-        return self._data.get("dir") == 0
+        return self._direction_value() == 0
 
     @property
     def is_tx(self):
-        return self._data.get("dir") == 1
+        return self._direction_value() == 1
 
     @property
     def raw_direction(self):
+        return self._direction_value()
+
+    def _direction_value(self):
+        """Return the normalized raw direction without changing raw fields.
+
+        Classic CAN objects encode direction in the low nibble of ``flags``.
+        CAN-FD Message 64 and LIN objects have an explicit ``dir`` field.
+        """
+        if self.class_name in {"CanMessage", "CanMessage2", "CanFdMessage"}:
+            flags = self._data.get("flags")
+            if isinstance(flags, int):
+                return flags & 0x0F
         return self._data.get("dir")
 
     @property

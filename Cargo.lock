@@ -32,6 +32,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "blf-tui"
+version = "0.1.0"
+dependencies = [
+ "blf-core",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

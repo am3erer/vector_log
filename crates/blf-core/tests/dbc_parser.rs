@@ -1,4 +1,4 @@
-use blf_core::{ByteOrder, DbcDatabase, MultiplexRole, SignalType};
+use blf_core::{ByteOrder, CanMessageId, DbcDatabase, MultiplexRole, SignalType};
 
 const DBC: &str = r#"
 VERSION "1.0"
@@ -55,6 +55,257 @@ fn parses_messages_signals_choices_comments_and_attributes() {
     assert_eq!(temperature.byte_order, ByteOrder::BigEndian);
     assert_eq!(temperature.signal_type, SignalType::Signed);
     assert_eq!(temperature.offset, -40.0);
+
+    assert_eq!(database.signal("VehicleStatus.Mux").unwrap().1.unit, None);
+    let nodes: Vec<_> = database.nodes().collect();
+    assert_eq!(
+        nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["Vector__XXX", "BCM",]
+    );
+    assert!(nodes.iter().all(|node| node.source.is_some()));
+}
+
+#[test]
+fn treats_zero_zero_signal_limits_as_unspecified() {
+    let source = r#"
+BO_ 256 Status: 1 ECU
+ SG_ Value : 0|8@1+ (1,0) [0|0] "" ECU
+"#;
+    let database = DbcDatabase::from_str(source).unwrap();
+    let (_, signal) = database.signal("Status.Value").unwrap();
+    assert_eq!(signal.minimum, None);
+    assert_eq!(signal.maximum, None);
+}
+
+#[test]
+fn parses_signal_metadata_transmitters_and_signal_groups() {
+    let source = r#"
+BO_ 256 Status: 8 ECU_A
+ SG_ Speed : 0|8@1+ (1,0) [0|255] "km/h" ECU_B,ECU_C
+ SG_ State : 8|2@1+ (1,0) [0|3] "" ECU_B
+BO_TX_BU_ 256 : ECU_A,ECU_GATEWAY;
+SIG_GROUP_ 256 StatusGroup 10 : Speed State;
+"#;
+    let database = DbcDatabase::from_str(source).unwrap();
+    let message = database.message_by_id(256, false).unwrap();
+    assert_eq!(message.transmitter, "ECU_A,ECU_GATEWAY");
+
+    let speed = message.signal("Speed").unwrap();
+    assert_eq!(speed.unit.as_deref(), Some("km/h"));
+    assert_eq!(speed.receivers, ["ECU_B", "ECU_C"]);
+
+    let groups: Vec<_> = database.signal_groups().collect();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].message_id.id, 256);
+    assert_eq!(groups[0].name, "StatusGroup");
+    assert_eq!(groups[0].repetition, 10);
+    assert_eq!(groups[0].signal_names, ["Speed", "State"]);
+}
+
+#[test]
+fn preserves_structured_dbc_attribute_assignments() {
+    let source = r#"
+BA_DEF_ "DatabaseName" STRING;
+BA_DEF_ BO_ "CycleTime" INT 0 10000;
+BA_DEF_ SG_ "SignalType" STRING;
+BA_DEF_ BU_ "NodeRole" STRING;
+BA_DEF_ EV_ "Environment" STRING;
+BA_ "DatabaseName" "Vehicle";
+BO_ 256 Status: 1 ECU
+ SG_ Value : 0|8@1+ (1,0) [0|255] "" ECU
+BA_ "CycleTime" BO_ 256 10;
+BA_ "SignalType" SG_ 256 Value "status";
+BA_ "NodeRole" BU_ ECU "controller";
+BA_ "Environment" EV_ Ambient "outside";
+"#;
+    let database = DbcDatabase::from_str(source).unwrap();
+    let assignments: Vec<_> = database.attribute_assignments().collect();
+    assert_eq!(assignments.len(), 5);
+
+    assert_eq!(assignments[0].name, "DatabaseName");
+    assert_eq!(assignments[0].scope, "global");
+    assert_eq!(assignments[0].message_id, None);
+    assert_eq!(assignments[0].object_name, None);
+    assert_eq!(assignments[0].value, "Vehicle");
+
+    assert_eq!(assignments[1].scope, "message");
+    assert_eq!(
+        assignments[1].message_id,
+        Some(CanMessageId::new(256, false))
+    );
+    assert_eq!(assignments[1].value, "10");
+
+    assert_eq!(assignments[2].scope, "signal");
+    assert_eq!(
+        assignments[2].message_id,
+        Some(CanMessageId::new(256, false))
+    );
+    assert_eq!(assignments[2].signal_name.as_deref(), Some("Value"));
+    assert_eq!(assignments[2].value, "status");
+
+    assert_eq!(assignments[3].scope, "node");
+    assert_eq!(assignments[3].object_name.as_deref(), Some("ECU"));
+    assert_eq!(assignments[3].value, "controller");
+
+    assert_eq!(assignments[4].scope, "environment");
+    assert_eq!(assignments[4].object_name.as_deref(), Some("Ambient"));
+    assert_eq!(assignments[4].value, "outside");
+    assert!(assignments
+        .iter()
+        .all(|assignment| assignment.source.is_some()));
+}
+
+#[test]
+fn preserves_relationship_attributes_separately_from_signal_attributes() {
+    let source = r#"
+BA_DEF_REL_ BU_SG_REL_ "GenSigTimeoutTime" INT 0 65535;
+BA_DEF_DEF_REL_ "GenSigTimeoutTime" 0;
+BO_ 256 Status: 1 ECU
+ SG_ Value : 0|8@1+ (1,0) [0|255] "" ECU
+BA_REL_ "GenSigTimeoutTime" BU_SG_REL_ ECU SG_ 256 Value 75;
+"#;
+    let database = DbcDatabase::from_str(source).unwrap();
+    let relationships: Vec<_> = database.relationship_attributes().collect();
+    assert_eq!(relationships.len(), 1);
+    assert_eq!(relationships[0].name, "GenSigTimeoutTime");
+    assert_eq!(relationships[0].relationship, "BU_SG_REL_");
+    assert_eq!(relationships[0].source_node, "ECU");
+    assert_eq!(relationships[0].message_id.id, 256);
+    assert!(!relationships[0].message_id.extended);
+    assert_eq!(relationships[0].signal_name, "Value");
+    assert_eq!(relationships[0].value, "75");
+    assert_eq!(
+        database
+            .relationship_attributes_for("GenSigTimeoutTime")
+            .count(),
+        1
+    );
+    assert_eq!(
+        database
+            .relationship_attribute_defaults()
+            .collect::<Vec<_>>(),
+        vec![("GenSigTimeoutTime", "0")]
+    );
+    assert!(database.attribute_defaults().next().is_none());
+    let definitions: Vec<_> = database.attribute_definitions().collect();
+    assert_eq!(definitions.len(), 1);
+    assert_eq!(definitions[0].name, "GenSigTimeoutTime");
+    assert_eq!(definitions[0].scope, "relationship");
+    assert_eq!(definitions[0].relationship.as_deref(), Some("BU_SG_REL_"));
+    assert_eq!(definitions[0].value_type, "INT");
+    assert_eq!(definitions[0].minimum.as_deref(), Some("0"));
+    assert_eq!(definitions[0].maximum.as_deref(), Some("65535"));
+    assert_eq!(definitions[0].raw_arguments, ["0", "65535"]);
+    assert!(database
+        .signal("Status.Value")
+        .unwrap()
+        .1
+        .attributes
+        .is_empty());
+}
+
+#[test]
+fn preserves_dbc_attribute_definition_types_and_arguments() {
+    let source = r#"
+BA_DEF_ "GlobalString" STRING;
+BA_DEF_ BO_ "CycleTime" INT 0 10000;
+BA_DEF_ SG_ "SignalScale" FLOAT -10.5 10.5;
+BA_DEF_ BU_ "NodeAddress" HEX 0 0x7F;
+BA_DEF_ EV_ "EnvironmentKind" ENUM "Unknown","Cabin","Outside";
+BA_DEF_SGTYPE_ "SignalTypeKind" STRING;
+"#;
+    let database = DbcDatabase::from_str(source).unwrap();
+    let definitions: Vec<_> = database.attribute_definitions().collect();
+    assert_eq!(definitions.len(), 6);
+
+    let by_name = |name: &str| {
+        definitions
+            .iter()
+            .find(|definition| definition.name == name)
+            .unwrap()
+    };
+    assert_eq!(by_name("GlobalString").scope, "global");
+    assert_eq!(by_name("GlobalString").value_type, "STRING");
+    assert_eq!(by_name("CycleTime").scope, "message");
+    assert_eq!(by_name("CycleTime").minimum.as_deref(), Some("0"));
+    assert_eq!(by_name("CycleTime").maximum.as_deref(), Some("10000"));
+    assert_eq!(by_name("SignalScale").minimum.as_deref(), Some("-10.5"));
+    assert_eq!(by_name("SignalScale").maximum.as_deref(), Some("10.5"));
+    assert_eq!(by_name("NodeAddress").raw_arguments, ["0", "0x7F"]);
+    assert_eq!(
+        by_name("EnvironmentKind").enum_values,
+        ["Unknown", "Cabin", "Outside"]
+    );
+    assert_eq!(by_name("SignalTypeKind").scope, "signal_type");
+}
+
+#[test]
+fn preserves_dbc_value_tables_types_and_attribute_defaults() {
+    let source = r#"
+BA_DEF_ BO_ "CycleTime" INT 0 10000;
+BA_DEF_DEF_ "CycleTime" 100;
+VAL_TABLE_ IgnitionState 0 "Off" 1 "On";
+SIGTYPE_VALTYPE_ 7 1;
+BO_ 256 Status: 1 ECU
+ SG_ State : 0|8@1+ (1,0) [0|255] "" ECU
+SIG_VALTYPE_ 256 State : 1;
+"#;
+    let database = DbcDatabase::from_str(source).unwrap();
+
+    assert_eq!(
+        database.attribute_defaults().collect::<Vec<_>>(),
+        vec![("CycleTime", "100")]
+    );
+    let tables: Vec<_> = database.value_tables().collect();
+    assert_eq!(tables.len(), 1);
+    assert_eq!(tables[0].0, "IgnitionState");
+    assert_eq!(tables[0].1.get(0), Some("Off"));
+    assert_eq!(tables[0].1.get(1), Some("On"));
+    assert_eq!(
+        database.signal_type_value_types().collect::<Vec<_>>(),
+        vec![(&7, &1)]
+    );
+    assert_eq!(
+        database.signal("Status.State").unwrap().1.value_type,
+        Some(1)
+    );
+}
+
+#[test]
+fn rejects_invalid_dbc_signal_value_type_references() {
+    let source = "SIG_VALTYPE_ 256 Missing : 1;\n";
+    let error = DbcDatabase::from_str(source).unwrap_err();
+    assert_eq!(error.field, "SIG_VALTYPE_");
+    assert!(error.reason.contains("unknown CAN message"));
+
+    let source = r#"
+BO_ 256 Status: 1 ECU
+ SG_ State : 0|8@1+ (1,0) [0|255] "" ECU
+SIG_VALTYPE_ 256 Missing : 1;
+"#;
+    let error = DbcDatabase::from_str(source).unwrap_err();
+    assert_eq!(error.field, "SIG_VALTYPE_");
+    assert!(error.reason.contains("unknown CAN signal"));
+}
+
+#[test]
+fn rejects_signal_group_references_to_unknown_objects() {
+    let unknown_message = "SIG_GROUP_ 256 Group 1 : Speed;\n";
+    let error = DbcDatabase::from_str(unknown_message).unwrap_err();
+    assert_eq!(error.field, "SIG_GROUP_");
+    assert!(error.reason.contains("unknown CAN message"));
+
+    let unknown_signal = r#"
+BO_ 256 Status: 8 ECU
+ SG_ Speed : 0|8@1+ (1,0) [0|255] "" ECU
+SIG_GROUP_ 256 Group 1 : Missing;
+"#;
+    let error = DbcDatabase::from_str(unknown_signal).unwrap_err();
+    assert_eq!(error.field, "SIG_GROUP_");
+    assert!(error.reason.contains("unknown CAN signal"));
 }
 
 #[test]

@@ -26,6 +26,15 @@ pub enum CanDecodeError {
     },
     #[error("CAN signal {signal:?} has an unsupported length {bit_length}")]
     UnsupportedBitLength { signal: String, bit_length: u16 },
+    #[error(
+        "CAN floating-point signal {signal:?} uses value type {value_type} but has length {bit_length}; expected {expected} bits"
+    )]
+    InvalidFloatBitLength {
+        signal: String,
+        value_type: u8,
+        bit_length: u16,
+        expected: u16,
+    },
     #[error("CAN signal {signal:?} decoded value {value} outside [{minimum}, {maximum}]")]
     ValueOutOfRange {
         signal: String,
@@ -96,12 +105,28 @@ pub fn decode_signal(signal: &CanSignal, data: &[u8]) -> Result<DecodedCanSignal
         }
     }
     let raw_bits = extract_raw(signal, data)?;
-    let raw_value = match signal.signal_type {
-        SignalType::Unsigned => i128::from(raw_bits),
-        SignalType::Signed => i128::from(sign_extend(raw_bits, signal.bit_length)),
+    let (raw_value, physical_value) = match signal.value_type {
+        Some(1) => {
+            validate_float_length(signal, 1, 32)?;
+            let raw_value = i128::from(raw_bits);
+            let decoded = f32::from_bits(raw_bits as u32) as f64;
+            (raw_value, decoded * signal.factor + signal.offset)
+        }
+        Some(2) => {
+            validate_float_length(signal, 2, 64)?;
+            let raw_value = i128::from(raw_bits);
+            let decoded = f64::from_bits(raw_bits);
+            (raw_value, decoded * signal.factor + signal.offset)
+        }
+        _ => {
+            let raw_value = match signal.signal_type {
+                SignalType::Unsigned => i128::from(raw_bits),
+                SignalType::Signed => i128::from(sign_extend(raw_bits, signal.bit_length)),
+            };
+            (raw_value, raw_value as f64 * signal.factor + signal.offset)
+        }
     };
-    let physical_value = raw_value as f64 * signal.factor + signal.offset;
-    if !physical_value.is_finite() {
+    if !physical_value.is_finite() && !matches!(signal.value_type, Some(1 | 2)) {
         return Err(CanDecodeError::InvalidMetadata {
             signal: signal.name.clone(),
             reason: "decoded physical value is not finite",
@@ -123,6 +148,22 @@ pub fn decode_signal(signal: &CanSignal, data: &[u8]) -> Result<DecodedCanSignal
         physical_value,
         value_text: signal.choices.get(raw_value).map(str::to_owned),
     })
+}
+
+fn validate_float_length(
+    signal: &CanSignal,
+    value_type: u8,
+    expected: u16,
+) -> Result<(), CanDecodeError> {
+    if signal.bit_length != expected {
+        return Err(CanDecodeError::InvalidFloatBitLength {
+            signal: signal.name.clone(),
+            value_type,
+            bit_length: signal.bit_length,
+            expected,
+        });
+    }
+    Ok(())
 }
 
 pub fn decode_message(
