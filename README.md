@@ -81,6 +81,20 @@ cargo run -p blf-tui -- trace.blf \
 cargo run -p blf-tui -- --dbc 1=vehicle.dbc --ldf 3=body.ldf
 ```
 
+The binary is built, not installed:
+
+```bash
+cargo build -p blf-tui             # target/debug/vector-log-tui
+cargo build --release -p blf-tui   # target/release/vector-log-tui
+```
+
+Run it from the repository root, for example
+`./target/debug/vector-log-tui --dbc 1=vehicle.dbc`, or let cargo locate it with
+`cargo run -p blf-tui -- --dbc 1=vehicle.dbc`. It is not on `PATH` unless you link
+or alias it yourself, and it has no connection to the sources, so rebuild after
+pulling changes. Add `--offline` to either command when the machine cannot reach
+the crate registry.
+
 The trace path, when given, must be the first argument. Without one, at least
 one `--dbc`/`--ldf` is required and the viewer boots into the database browser
 with `(no trace)` in the header; the message, detail and curve modes are
