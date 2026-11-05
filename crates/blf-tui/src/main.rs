@@ -294,6 +294,13 @@ struct App {
     database_object_selected: usize,
     database_object_offset: usize,
     database_filter: String,
+    help: Option<HelpState>,
+}
+
+/// State of the `?` help overlay; closing restores the previous status.
+struct HelpState {
+    offset: usize,
+    previous_status: String,
 }
 
 impl App {
@@ -350,6 +357,7 @@ impl App {
             database_object_selected: 0,
             database_object_offset: 0,
             database_filter: String::new(),
+            help: None,
         };
         for (bus, channel, database_path) in specs {
             app.bind_database(bus, channel, database_path)?;
@@ -400,6 +408,10 @@ impl App {
         if self.input.is_some() {
             return self.handle_input_event(event);
         }
+        if self.help.is_some() {
+            self.handle_help_event(event);
+            return Ok(false);
+        }
         match self.mode {
             Mode::Messages => match event {
                 InputEvent::Char('q') => return Ok(true),
@@ -419,6 +431,7 @@ impl App {
                 InputEvent::Char('G') => self.jump_to_end(),
                 InputEvent::Char(']') => self.step_frame(1),
                 InputEvent::Char('[') => self.step_frame(-1),
+                InputEvent::Char('?') => self.open_help(),
                 InputEvent::Esc => self.clear_filter(),
                 InputEvent::Mouse(mouse) => self.handle_message_mouse(mouse),
                 _ => {}
@@ -435,6 +448,7 @@ impl App {
                 InputEvent::Char('b') => self.start_input(InputKind::Binding),
                 InputEvent::Char('e') => self.export_csv(),
                 InputEvent::Esc | InputEvent::Left => self.mode = Mode::Messages,
+                InputEvent::Char('?') => self.open_help(),
                 InputEvent::Mouse(mouse) => self.handle_detail_mouse(mouse),
                 _ => {}
             },
@@ -453,6 +467,7 @@ impl App {
                 InputEvent::Char('/') => self.start_input(InputKind::DatabaseFilter),
                 InputEvent::Enter => self.select_database_object(),
                 InputEvent::Char('b') => self.start_input(InputKind::Binding),
+                InputEvent::Char('?') => self.open_help(),
                 InputEvent::Esc => self.mode = Mode::Messages,
                 InputEvent::Mouse(mouse) => self.handle_database_mouse(mouse),
                 _ => {}
@@ -468,6 +483,7 @@ impl App {
                 InputEvent::PageDown | InputEvent::Char('-') => self.curve_zoom(2.0),
                 InputEvent::Home => self.curve_home(),
                 InputEvent::End => self.curve_end(),
+                InputEvent::Char('?') => self.open_help(),
                 InputEvent::Mouse(mouse) => self.handle_curve_mouse(mouse),
                 _ => {}
             },
@@ -602,52 +618,42 @@ impl App {
         self.selected_signal = 0;
     }
 
-    /// `g`: jump to a time, or to a 1-based position with `#`.
+    /// `g`: jump to a trace-clock time, a `+` offset or a `#` position.
     fn goto_input(&mut self, value: &str) -> Result<(), String> {
         match parse_goto(value)? {
-            Goto::Offset(seconds) => self.jump_to_time(seconds, false),
-            Goto::Absolute(seconds) => self.jump_to_time(seconds, true),
             Goto::Position(position) => self.jump_to_position(position),
+            time => self.jump_to_time(time),
         }
         Ok(())
     }
 
-    /// Jump to the first message at or after `seconds`; relative times count
-    /// from the first message, because bench logs rarely start at zero.
-    fn jump_to_time(&mut self, seconds: f64, absolute: bool) {
+    /// Jump to the first visible message at or after the requested time. A
+    /// bare value is an instant on the trace clock the list shows; `+` counts
+    /// from the first visible message because bench logs rarely start at zero.
+    fn jump_to_time(&mut self, goto: Goto) {
         let Some(base) = self.first_timestamp() else {
             self.status = "This trace has no timestamps to jump by".to_string();
             return;
         };
-        let Some(offset) = seconds_to_ns(seconds) else {
+        let Some(target) = goto_target(goto, base) else {
             self.status = "Time must be a finite, positive number of seconds".to_string();
             return;
-        };
-        let target = if absolute {
-            offset
-        } else {
-            base.saturating_add(offset)
         };
         let timestamps = self
             .filtered
             .iter()
             .map(|index| self.summaries[*index].timestamp_ns);
         let Some(position) = first_index_at_or_after(timestamps, target) else {
-            self.status = format!(
-                "No message at or after {}",
-                format_goto_time(target, base, absolute)
-            );
+            self.status = format!("No message at or after {}", format_timestamp(Some(target)));
             return;
         };
         self.selected = position;
         self.selected_signal = 0;
         self.keep_selection_visible();
-        let reached = self.summaries[self.filtered[position]].timestamp_ns;
-        self.status = format!(
-            "At {} ({})",
-            format_goto_time(reached.unwrap_or(target), base, absolute),
-            self.position_label()
-        );
+        let reached = self.summaries[self.filtered[position]]
+            .timestamp_ns
+            .unwrap_or(target);
+        self.status = landed_status(reached, base, position, self.filtered.len());
     }
 
     fn first_timestamp(&self) -> Option<u64> {
@@ -665,7 +671,13 @@ impl App {
         self.selected = index;
         self.selected_signal = 0;
         self.keep_selection_visible();
-        self.status = format!("Message #{} of {}", index + 1, self.filtered.len());
+        let total = self.filtered.len();
+        let reached = self.summaries[self.filtered[index]].timestamp_ns;
+        self.status = match (self.first_timestamp(), reached) {
+            (Some(base), Some(reached)) => landed_status(reached, base, index, total),
+            // A trace without timestamps can still be navigated by position.
+            _ => format!("Message #{} of {total}", index + 1),
+        };
     }
 
     fn jump_to_end(&mut self) {
@@ -1273,6 +1285,51 @@ impl App {
         (self.viewport_width * 25 / 100).max(24)
     }
 
+    /// `?`: open the help overlay; `?`, `q` or `Esc` closes it again.
+    fn open_help(&mut self) {
+        if self.help.is_some() {
+            return;
+        }
+        self.help = Some(HelpState {
+            offset: 0,
+            previous_status: std::mem::take(&mut self.status),
+        });
+        self.status = "Help: j/k or arrows scroll, ? / q / Esc closes".to_string();
+    }
+
+    fn close_help(&mut self) {
+        if let Some(help) = self.help.take() {
+            self.status = help.previous_status;
+        }
+    }
+
+    fn scroll_help(&mut self, delta: isize) {
+        let page = help_page_size(self.viewport_height);
+        let max_offset = HELP_ENTRIES.len().saturating_sub(page) as isize;
+        if let Some(help) = &mut self.help {
+            help.offset = (help.offset as isize)
+                .saturating_add(delta)
+                .clamp(0, max_offset) as usize;
+        }
+    }
+
+    fn handle_help_event(&mut self, event: InputEvent) {
+        let page = help_page_size(self.viewport_height) as isize;
+        match event {
+            InputEvent::Char('?') | InputEvent::Char('q') | InputEvent::Esc => self.close_help(),
+            InputEvent::Char('j') | InputEvent::Down => self.scroll_help(1),
+            InputEvent::Char('k') | InputEvent::Up => self.scroll_help(-1),
+            InputEvent::PageDown => self.scroll_help(page),
+            InputEvent::PageUp => self.scroll_help(-page),
+            InputEvent::Home => self.scroll_help(-(HELP_ENTRIES.len() as isize)),
+            InputEvent::End => self.scroll_help(HELP_ENTRIES.len() as isize),
+            InputEvent::Mouse(mouse) if mouse.wheel != 0 => {
+                self.scroll_help(-isize::from(mouse.wheel))
+            }
+            _ => {}
+        }
+    }
+
     fn render(&mut self, terminal: &mut RawTerminal) -> Result<(), String> {
         let width = self.viewport_width;
         let height = self.viewport_height;
@@ -1307,42 +1364,21 @@ impl App {
         };
         lines.push(paint(format!(" databases: {databases}"), ANSI_CYAN));
         lines.push(paint("─".repeat(width), ANSI_BRIGHT_CYAN));
-        match self.mode {
-            Mode::Messages => self.render_messages(&mut lines, width, height),
-            Mode::Detail => self.render_detail(&mut lines, width, height),
-            Mode::Curve => self.render_curve(&mut lines, width, height),
-            Mode::Databases => self.render_databases(&mut lines, width, height),
-        }
-        lines.push(paint("─".repeat(width), ANSI_BRIGHT_CYAN));
-        let footer = if let Some(kind) = self.input {
-            let prompt = match kind {
-                InputKind::Filter => "/",
-                InputKind::Binding => "bind (can|lin CHANNEL PATH): ",
-                InputKind::DatabaseFilter => "db /",
-                InputKind::Goto => "goto (12.5 | @1672542341.5 | #1234): ",
-            };
-            format!("{prompt}{}  [Enter] apply  [Esc] cancel", self.input_buffer)
+        if self.help.is_some() {
+            self.render_help(&mut lines, width, height);
         } else {
             match self.mode {
-                Mode::Messages => {
-                    "[j/k] move [g] goto [[]/[]] frame [Enter] detail [/] filter [e] export [d] databases [p] curve [q] quit"
-                }
-                Mode::Detail => "[j/k] signal [p] curve [e] export [b] bind [Esc] back [q] quit",
-                Mode::Curve => "[Esc] back [q] quit",
-                Mode::Databases => {
-                    "[j/k] object [Left/Right] category [/] search [[]/[]] database [b] bind [Esc] back [q] quit"
-                }
+                Mode::Messages => self.render_messages(&mut lines, width, height),
+                Mode::Detail => self.render_detail(&mut lines, width, height),
+                Mode::Curve => self.render_curve(&mut lines, width, height),
+                Mode::Databases => self.render_databases(&mut lines, width, height),
             }
-            .to_string()
-        };
-        // The status reports where a jump landed, so it outranks the key
-        // cheat-sheet when the terminal is too narrow for both.
-        let footer_text = if width >= display_width(&footer) + display_width(&self.status) + 2 {
-            format!("{footer}  {}", self.status)
-        } else {
-            self.status.clone()
-        };
-        lines.push(paint_bold(footer_text, ANSI_BRIGHT_YELLOW));
+        }
+        lines.push(paint("─".repeat(width), ANSI_BRIGHT_CYAN));
+        lines.push(paint_bold(
+            footer_line(self.input, &self.input_buffer, &self.status),
+            ANSI_BRIGHT_YELLOW,
+        ));
         let mut output = String::from("\x1b[H");
         for line in lines.into_iter().take(height) {
             output.push_str(&truncate_ansi(&line, width));
@@ -1351,6 +1387,33 @@ impl App {
         }
         output.push_str("\x1b[J");
         terminal.write(&output).map_err(|error| error.to_string())
+    }
+
+    fn render_help(&self, lines: &mut Vec<String>, width: usize, height: usize) {
+        let page = help_page_size(height);
+        let entries = help_lines(width);
+        let offset = clamp_help_offset(
+            self.help.as_ref().map_or(0, |help| help.offset),
+            entries.len(),
+            page,
+        );
+        let end = (offset + page).min(entries.len());
+        lines.push(paint_bold(
+            format!(
+                "Help  keys {}-{} of {}  (? / q / Esc closes)",
+                offset + 1,
+                end,
+                entries.len()
+            ),
+            ANSI_BRIGHT_CYAN,
+        ));
+        for (is_heading, line) in &entries[offset..end] {
+            lines.push(if *is_heading {
+                paint_bold(line, ANSI_BRIGHT_YELLOW)
+            } else {
+                paint(line, ANSI_WHITE)
+            });
+        }
     }
 
     fn render_messages(&self, lines: &mut Vec<String>, width: usize, height: usize) {
@@ -2402,24 +2465,22 @@ fn lin_status(state: blf_core::LinResponseState) -> &'static str {
     }
 }
 
-/// A `g` prompt value: either a timestamp or a 1-based position in the list.
+/// A `g` prompt value: a time on the trace clock, a time relative to the
+/// first message of the visible list, or a 1-based position in that list.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Goto {
-    /// Seconds after the first message of the visible list.
-    Offset(f64),
-    /// Seconds on the trace's own clock, written with a leading `@`.
-    Absolute(f64),
-    /// 1-based position in the visible list, written with a leading `#`.
+    /// Seconds on the trace's own clock, the timestamps the list displays.
+    Clock(f64),
+    /// Seconds after the first message of the visible list, written `+10`.
+    Relative(f64),
+    /// 1-based position in the visible list, written `#1234`.
     Position(usize),
 }
 
 fn parse_goto(value: &str) -> Result<Goto, String> {
     let text = value.trim();
     if text.is_empty() {
-        return Err("Enter a time (12.5s) or a position (#1234)".to_string());
-    }
-    if let Some(rest) = text.strip_prefix('@') {
-        return parse_seconds(rest, "Absolute time").map(Goto::Absolute);
+        return Err("Enter a time (10.5), an offset (+10) or a position (#1234)".to_string());
     }
     if let Some(rest) = text.strip_prefix('#') {
         let position = rest
@@ -2431,20 +2492,37 @@ fn parse_goto(value: &str) -> Result<Goto, String> {
         }
         return Ok(Goto::Position(position));
     }
-    parse_seconds(text, "Time").map(Goto::Offset)
+    if let Some(rest) = text.strip_prefix('+') {
+        return parse_seconds(rest, "Offset").map(Goto::Relative);
+    }
+    // `@` is the explicit spelling of the bare, trace-clock form.
+    let rest = text.strip_prefix('@').unwrap_or(text);
+    parse_seconds(rest, "Time").map(Goto::Clock)
 }
 
 fn parse_seconds(value: &str, label: &str) -> Result<f64, String> {
     let text = value.strip_suffix('s').unwrap_or(value).trim();
     let seconds = text
         .parse::<f64>()
-        .map_err(|_| format!("{label} must be a number of seconds, for example 12.5"))?;
+        .map_err(|_| format!("{label} must be a number of seconds, for example 10.5"))?;
     if !seconds.is_finite() || seconds < 0.0 {
         return Err(format!(
             "{label} must be a finite, positive number of seconds"
         ));
     }
     Ok(seconds)
+}
+
+/// Absolute nanosecond target of a time jump. `base_ns` is the timestamp of
+/// the first visible message, which the `+` form counts from.
+fn goto_target(goto: Goto, base_ns: u64) -> Option<u64> {
+    match goto {
+        Goto::Clock(seconds) => seconds_to_ns(seconds),
+        Goto::Relative(seconds) => {
+            seconds_to_ns(seconds).map(|offset| base_ns.saturating_add(offset))
+        }
+        Goto::Position(_) => None,
+    }
 }
 
 fn seconds_to_ns(seconds: f64) -> Option<u64> {
@@ -2464,13 +2542,30 @@ where
         .position(|timestamp| timestamp.is_some_and(|timestamp| timestamp >= target))
 }
 
-fn format_goto_time(timestamp_ns: u64, base_ns: u64, absolute: bool) -> String {
-    let absolute_text = format_timestamp(Some(timestamp_ns));
-    if absolute {
-        return absolute_text;
-    }
-    let offset = timestamp_ns.saturating_sub(base_ns) as f64 / 1_000_000_000.0;
-    format!("+{offset:.6}s ({absolute_text})")
+/// Status after a time jump: the landed trace clock, its offset from the
+/// first visible message, and the landed position in the visible list.
+fn landed_status(reached_ns: u64, base_ns: u64, position: usize, total: usize) -> String {
+    format!(
+        "At {} (+{:.6}s from start) ({} / {})",
+        format_timestamp(Some(reached_ns)),
+        reached_ns.saturating_sub(base_ns) as f64 / 1_000_000_000.0,
+        position + 1,
+        total
+    )
+}
+
+/// Bottom line: the active prompt while typing, otherwise the status message.
+fn footer_line(input: Option<InputKind>, buffer: &str, status: &str) -> String {
+    let Some(kind) = input else {
+        return status.to_string();
+    };
+    let prompt = match kind {
+        InputKind::Filter => "/",
+        InputKind::Binding => "bind (can|lin CHANNEL PATH): ",
+        InputKind::DatabaseFilter => "db /",
+        InputKind::Goto => "goto (10.5 | +10 | #1234): ",
+    };
+    format!("{prompt}{buffer}  [Enter] apply  [Esc] cancel")
 }
 
 fn frame_label(summary: &MessageSummary) -> String {
@@ -2486,6 +2581,112 @@ fn frame_label(summary: &MessageSummary) -> String {
 
 fn list_page_size(viewport_height: usize, reserved_rows: usize) -> usize {
     viewport_height.saturating_sub(reserved_rows).max(1)
+}
+
+/// Width of the key column of the `?` help table.
+const HELP_KEY_WIDTH: usize = 18;
+
+/// One row of the `?` help screen: a mode heading or a key binding.
+struct HelpEntry {
+    heading: bool,
+    key: &'static str,
+    description: &'static str,
+}
+
+const fn heading(label: &'static str) -> HelpEntry {
+    HelpEntry {
+        heading: true,
+        key: label,
+        description: "",
+    }
+}
+
+const fn binding(key: &'static str, description: &'static str) -> HelpEntry {
+    HelpEntry {
+        heading: false,
+        key,
+        description,
+    }
+}
+
+/// Every binding, grouped by mode, with the global keys last.
+const HELP_ENTRIES: &[HelpEntry] = &[
+    heading("Messages"),
+    binding("j / Down", "next message"),
+    binding("k / Up", "previous message"),
+    binding("PageUp/PageDown", "move one screen"),
+    binding("Home / End", "first / last message"),
+    binding("Enter", "open the selected message"),
+    binding("/", "filter messages"),
+    binding("b", "bind a DBC or LDF database"),
+    binding("p", "curve for the selected numeric signal"),
+    binding("d", "open the database browser"),
+    binding("e", "export filtered messages to CSV"),
+    binding("g", "jump by trace time, +offset or #position"),
+    binding("G", "jump to the last message"),
+    binding("] / [", "next / previous occurrence of the frame id"),
+    binding("Esc", "clear the message filter"),
+    binding("q", "quit"),
+    heading("Detail"),
+    binding("j / Down", "next signal"),
+    binding("k / Up", "previous signal"),
+    binding("PageUp/PageDown", "move one screen"),
+    binding("Home / End", "first / last signal"),
+    binding("p", "curve for the selected numeric signal"),
+    binding("b", "bind a DBC or LDF database"),
+    binding("e", "export filtered messages to CSV"),
+    binding("Esc / Left", "back to the message list"),
+    binding("q", "quit"),
+    heading("Curve"),
+    binding("Left / Right", "pan the sample window"),
+    binding("+ / = / -", "zoom in / out"),
+    binding("PageUp/PageDown", "zoom in / out"),
+    binding("Home / End", "first / last sample"),
+    binding("Esc", "back to the message detail"),
+    binding("q", "quit"),
+    heading("Databases"),
+    binding("j / Down", "next object"),
+    binding("k / Up", "previous object"),
+    binding("PageUp/PageDown", "move one screen"),
+    binding("Home / End", "first / last object"),
+    binding("Left / Right", "previous / next category"),
+    binding("] / [", "next / previous database"),
+    binding("/", "search objects"),
+    binding("Enter", "select the current object"),
+    binding("b", "bind a DBC or LDF database"),
+    binding("Esc", "back to the message list"),
+    binding("q", "quit"),
+    heading("Global"),
+    binding("Ctrl-C", "quit the viewer"),
+    binding("?", "open or close this help"),
+    binding("Mouse", "click to select, wheel to scroll"),
+];
+
+/// Render the help table for `width` cells as `(is_heading, line)` rows.
+fn help_lines(width: usize) -> Vec<(bool, String)> {
+    let split = HELP_KEY_WIDTH.min(width.saturating_sub(3));
+    HELP_ENTRIES
+        .iter()
+        .map(|entry| {
+            if entry.heading {
+                (true, entry.key.to_string())
+            } else {
+                (
+                    false,
+                    two_column(entry.key, entry.description, split, width),
+                )
+            }
+        })
+        .collect()
+}
+
+/// Rows of the help table that fit below the header and above the footer.
+fn help_page_size(height: usize) -> usize {
+    height.saturating_sub(6).max(1)
+}
+
+fn clamp_help_offset(offset: usize, len: usize, page: usize) -> usize {
+    offset.min(len.saturating_sub(page.max(1)))
 }
 
 fn move_index(index: usize, count: usize, delta: isize) -> usize {
@@ -3085,34 +3286,129 @@ mod tests {
     }
 
     #[test]
-    fn goto_accepts_offsets_absolute_times_and_positions() {
-        assert_eq!(parse_goto("12.5"), Ok(Goto::Offset(12.5)));
-        assert_eq!(parse_goto(" 12.5s "), Ok(Goto::Offset(12.5)));
-        assert_eq!(parse_goto("0"), Ok(Goto::Offset(0.0)));
-        assert_eq!(
-            parse_goto("@1672542341.5"),
-            Ok(Goto::Absolute(1672542341.5))
-        );
+    fn goto_accepts_trace_clock_relative_and_position_forms() {
+        assert_eq!(parse_goto("10.000770"), Ok(Goto::Clock(10.000770)));
+        assert_eq!(parse_goto(" 12.5s "), Ok(Goto::Clock(12.5)));
+        assert_eq!(parse_goto("0"), Ok(Goto::Clock(0.0)));
+        assert_eq!(parse_goto("+10"), Ok(Goto::Relative(10.0)));
+        assert_eq!(parse_goto(" + 10s "), Ok(Goto::Relative(10.0)));
+        // `@` stays accepted as the explicit trace-clock spelling.
+        assert_eq!(parse_goto("@1672542341.5"), Ok(Goto::Clock(1672542341.5)));
         assert_eq!(parse_goto("#1"), Ok(Goto::Position(1)));
         assert_eq!(parse_goto("# 42 "), Ok(Goto::Position(42)));
         assert!(parse_goto("").is_err());
         assert!(parse_goto("#0").is_err());
         assert!(parse_goto("#x").is_err());
         assert!(parse_goto("@nope").is_err());
+        assert!(parse_goto("+").is_err());
+        assert!(parse_goto("+-1").is_err());
         assert!(parse_goto("-1").is_err());
         assert!(parse_goto("later").is_err());
     }
 
     #[test]
-    fn goto_time_text_shows_offset_and_clock() {
-        let base = 1_672_542_331_984_470_000;
-        let target = base + 10_500_000_000;
-        let text = format_goto_time(target, base, false);
-        assert!(text.starts_with("+10.500000s ("), "got {text}");
-        assert!(text.contains("1672542342.484470s"));
-        // Absolute form prints only the trace clock.
-        let text = format_goto_time(target, base, true);
-        assert_eq!(text, "1672542342.484470s");
+    fn goto_targets_use_the_trace_clock_on_a_trace_that_starts_late() {
+        // Repro trace: the first message is at 0.001820s, one is at 10.000770s.
+        let base = 1_820_000;
+        let timestamps = [Some(base), Some(10_000_770_000), Some(10_101_820_000)];
+
+        let clock = goto_target(Goto::Clock(10.000770), base).expect("clock target");
+        assert_eq!(clock, 10_000_770_000);
+        assert_eq!(first_index_at_or_after(timestamps, clock), Some(1));
+
+        let relative = goto_target(Goto::Relative(10.0), base).expect("relative target");
+        assert_eq!(relative, 10_001_820_000);
+        assert_eq!(first_index_at_or_after(timestamps, relative), Some(2));
+
+        assert_eq!(goto_target(Goto::Position(2), base), None);
+    }
+
+    #[test]
+    fn jump_status_names_both_clocks_and_the_position() {
+        // Landing at 10.000770s when the first message is 0.001820s.
+        assert_eq!(
+            landed_status(10_000_770_000, 1_820_000, 511, 1374),
+            "At 10.000770s (+9.998950s from start) (512 / 1374)"
+        );
+        assert_eq!(
+            landed_status(5_025_000_000, 0, 0, 219),
+            "At 5.025000s (+5.025000s from start) (1 / 219)"
+        );
+    }
+
+    #[test]
+    fn bottom_line_shows_only_the_prompt_or_the_status() {
+        assert_eq!(
+            footer_line(None, "", "At 5.025000s (+3.510000s from start) (118 / 219)"),
+            "At 5.025000s (+3.510000s from start) (118 / 219)"
+        );
+        let prompt = footer_line(Some(InputKind::Goto), "+5", "Ready");
+        assert!(prompt.starts_with("goto ("), "got {prompt}");
+        assert!(prompt.contains("+5"));
+        // The old key cheat-sheet and the status no longer share the line.
+        assert!(!prompt.contains("Ready"));
+        assert!(!prompt.contains("[j/k]"));
+        assert_eq!(
+            footer_line(Some(InputKind::Filter), "fd", ""),
+            "/fd  [Enter] apply  [Esc] cancel"
+        );
+    }
+
+    #[test]
+    fn help_lists_bindings_by_mode_and_global_keys() {
+        let lines = help_lines(80);
+        for heading in ["Messages", "Detail", "Curve", "Databases", "Global"] {
+            assert!(
+                lines
+                    .iter()
+                    .any(|(is_heading, line)| *is_heading && line.as_str() == heading),
+                "missing help section {heading}"
+            );
+        }
+        let text = lines
+            .iter()
+            .map(|(_, line)| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in [
+            "Ctrl-C",
+            "open or close this help",
+            "jump by trace time",
+            "next / previous database",
+            "open the selected message",
+            "wheel to scroll",
+        ] {
+            assert!(text.contains(expected), "missing {expected} in help");
+        }
+    }
+
+    #[test]
+    fn help_is_legible_in_eighty_by_twenty_four() {
+        for (_, line) in help_lines(80) {
+            assert!(display_width(&line) <= 80, "help line too wide: {line}");
+            assert!(
+                !line.contains("..."),
+                "help line truncated in 80 columns: {line}"
+            );
+        }
+        assert_eq!(help_page_size(24), 18);
+    }
+
+    #[test]
+    fn help_scrolls_instead_of_truncating() {
+        let total = HELP_ENTRIES.len();
+        let page = help_page_size(24);
+        assert!(total > page, "help should overflow an 80x24 terminal");
+        assert_eq!(clamp_help_offset(0, total, page), 0);
+        assert_eq!(clamp_help_offset(usize::MAX, total, page), total - page);
+        assert_eq!(clamp_help_offset(total, total, page), total - page);
+
+        // Scrolling to the end keeps the global keys reachable.
+        let entries = help_lines(80);
+        let offset = clamp_help_offset(usize::MAX, total, page);
+        let visible = &entries[offset..(offset + page).min(total)];
+        assert_eq!(visible.len(), page);
+        assert!(visible.iter().any(|(_, line)| line.contains("Ctrl-C")));
     }
 
     #[test]

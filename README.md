@@ -95,7 +95,7 @@ Key controls are:
 j/k or Up/Down    move through messages or signals
 PageUp/PageDown   move one screen at a time
 Home/End          jump to the first or last item
-g                 jump by time or position
+g                 jump by trace time, +offset or #position
 G                 jump to the last message
 ] / [             next / previous occurrence of the same frame id
 Enter             open the selected message
@@ -106,6 +106,7 @@ Left/Right        change database category
 [/]               switch loaded database
 e                 export the filtered messages with decoded signals to CSV
 p                 open a curve for the selected numeric signal
+?                 open the key help screen
 Esc/Left          go back
 q                 quit
 ```
@@ -113,16 +114,27 @@ q                 quit
 `g` opens a prompt that takes three forms, and reports where it landed:
 
 ```text
-12.5         12.5 s after the first visible message
-@1672542341  that instant on the trace's own clock
-#1234        position 1234 in the visible list
+10.000770     the trace clock: the first message at or after 10.000770s
++10           10 s after the first message of the visible list
+#1234         position 1234 in the visible list
 ```
 
-Times are relative by default because bench traces rarely start at zero, while
-`@` reaches a timestamp copied from the list. Jumps respect the active filter,
-so `/0x344` followed by `g 10` lands on the first `0x344` frame at or after ten
-seconds into the filtered view. `]` and `[` step between the occurrences of the
-selected frame id and report which one of how many is shown.
+The bare form uses the timestamps the message list displays, so a time copied
+from a row lands where it says; `@10.000770` is accepted as an explicit alias.
+`+` counts from the first message of the visible list because bench traces
+rarely start at zero. Jumps respect the active filter, so `/0x1` followed by
+`g 5` lands on the first visible `0x1` frame at or after 5 s on the trace clock.
+After a jump the status line names the landed message with both clocks, for
+example `At 5.025000s (+3.510000s from start) (118 / 219)`. `]` and `[` step
+between the occurrences of the selected frame id and report which one of how
+many is shown.
+
+`?` opens a help screen in every mode, grouping the bindings by mode
+(Messages, Detail, Curve and Databases) and finishing with the global keys. It
+closes with `?`, `q` or `Esc`. When the list does not fit, `j`/`k`, the arrow
+keys, PageUp/PageDown and Home/End scroll it, and the title shows which rows are
+visible. The bottom line shows the active prompt while typing a filter,
+binding, database filter or goto value, and the status message otherwise.
 
 Opening a message shows its decoded signals on the right. The left column also
 reports the cycle timing of that frame id on the same bus and channel: average,
