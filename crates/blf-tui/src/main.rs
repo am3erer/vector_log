@@ -1017,7 +1017,7 @@ impl App {
                         || object
                             .details
                             .iter()
-                            .any(|detail| detail.to_ascii_lowercase().contains(&filter))
+                            .any(|detail| detail.text().to_ascii_lowercase().contains(&filter))
                 })
                 .collect()
         };
@@ -1863,13 +1863,13 @@ impl App {
             } else {
                 CellStyle::Normal
             };
-            let detail_text = selected_object
+            let (detail_text, detail_style) = selected_object
                 .and_then(|object| object.details.get(row))
-                .map_or("", String::as_str);
+                .map_or_else(|| (String::new(), CellStyle::Normal), DetailLine::render);
             lines.push(styled_three_column(
                 (&tree_text, tree_style),
                 (&object_text, object_style),
-                (detail_text, CellStyle::Normal),
+                (detail_text.as_str(), detail_style),
                 left,
                 middle,
                 width,
@@ -1886,6 +1886,54 @@ enum CellStyle {
     PaneHeader,
     PaneHeaderIdle,
     DatabaseHeader,
+    DetailHeading,
+    DetailItem,
+}
+
+/// One line of the database detail column.
+///
+/// A section heading, the items below it and a dim note have different visual
+/// weight, so they stay apart until the column is painted instead of being
+/// flattened into plain strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DetailLine {
+    Heading(String),
+    Item(String),
+    Note(String),
+    Blank,
+}
+
+impl DetailLine {
+    fn heading(text: impl Into<String>) -> Self {
+        Self::Heading(text.into())
+    }
+
+    fn item(text: impl Into<String>) -> Self {
+        Self::Item(text.into())
+    }
+
+    fn note(text: impl Into<String>) -> Self {
+        Self::Note(text.into())
+    }
+
+    /// The semantic text without presentation, used by filters and tests.
+    fn text(&self) -> &str {
+        match self {
+            Self::Heading(text) | Self::Item(text) | Self::Note(text) => text,
+            Self::Blank => "",
+        }
+    }
+
+    /// The cell text and the style it is painted with. Items are indented under
+    /// their heading; notes stay at the heading's level.
+    fn render(&self) -> (String, CellStyle) {
+        match self {
+            Self::Heading(text) => (text.clone(), CellStyle::DetailHeading),
+            Self::Item(text) => (format!("  {text}"), CellStyle::DetailItem),
+            Self::Note(text) => (text.clone(), CellStyle::Dim),
+            Self::Blank => (String::new(), CellStyle::Normal),
+        }
+    }
 }
 
 fn selection_style(focused: bool) -> CellStyle {
@@ -1912,6 +1960,8 @@ fn paint_cell(value: impl AsRef<str>, style: CellStyle) -> String {
         CellStyle::PaneHeader => paint_bold(value, ANSI_BRIGHT_CYAN),
         CellStyle::PaneHeaderIdle => paint(value, ANSI_BRIGHT_CYAN),
         CellStyle::DatabaseHeader => paint_bold(value, ANSI_BRIGHT_YELLOW),
+        CellStyle::DetailHeading => paint_bold(value, ANSI_BRIGHT_CYAN),
+        CellStyle::DetailItem => paint(value, ANSI_WHITE),
     }
 }
 
@@ -1943,7 +1993,7 @@ fn styled_three_column(
 struct DbObject {
     title: String,
     subtitle: String,
-    details: Vec<String>,
+    details: Vec<DetailLine>,
 }
 
 fn database_objects(entry: &BindingEntry, category: DbCategory) -> Vec<DbObject> {
@@ -1955,14 +2005,17 @@ fn database_objects(entry: &BindingEntry, category: DbCategory) -> Vec<DbObject>
                 database.len(),
                 database.signal_names().count()
             ),
-            details: vec![
-                format!("source: {}", database.source_path().unwrap_or("-")),
-                format!("version: {}", database.version().unwrap_or("-")),
-                format!("messages: {}", database.len()),
-                format!("signals: {}", database.signal_names().count()),
-                format!("nodes: {}", database.nodes().count()),
-                format!("attributes: {}", database.attributes().count()),
-            ],
+            details: detail_section(
+                "database",
+                [
+                    format!("source: {}", database.source_path().unwrap_or("-")),
+                    format!("version: {}", database.version().unwrap_or("-")),
+                    format!("messages: {}", database.len()),
+                    format!("signals: {}", database.signal_names().count()),
+                    format!("nodes: {}", database.nodes().count()),
+                    format!("attributes: {}", database.attributes().count()),
+                ],
+            ),
         }],
         (Database::Can(database), DbCategory::Messages) => database
             .messages()
@@ -2003,20 +2056,20 @@ fn database_objects(entry: &BindingEntry, category: DbCategory) -> Vec<DbObject>
             let mut objects: Vec<DbObject> = database
                 .attribute_definitions()
                 .map(|definition| {
-                    let mut details = vec![
+                    let mut items = vec![
                         format!("name: {}", definition.name),
                         format!("scope: {}", definition.scope),
                     ];
                     if let Some(relationship) = &definition.relationship {
-                        details.push(format!("relationship: {relationship}"));
+                        items.push(format!("relationship: {relationship}"));
                     }
-                    details.push(format!("definition: {}", attribute_spec(definition)));
-                    details.push(format!(
+                    items.push(format!("definition: {}", attribute_spec(definition)));
+                    items.push(format!(
                         "default: {}",
                         attribute_default(database, &definition.name)
                             .unwrap_or_else(|| "-".to_string())
                     ));
-                    details.push(format!(
+                    items.push(format!(
                         "assignments: {}",
                         database
                             .attribute_assignments()
@@ -2027,12 +2080,12 @@ fn database_objects(entry: &BindingEntry, category: DbCategory) -> Vec<DbObject>
                         .attributes()
                         .find(|(name, _)| *name == definition.name)
                     {
-                        details.push(format!("value: {value}"));
+                        items.push(format!("value: {value}"));
                     }
                     DbObject {
                         title: definition.name.clone(),
                         subtitle: attribute_spec(definition),
-                        details,
+                        details: detail_section("attribute", items),
                     }
                 })
                 .collect();
@@ -2047,18 +2100,22 @@ fn database_objects(entry: &BindingEntry, category: DbCategory) -> Vec<DbObject>
                     .map(|(name, value)| DbObject {
                         title: name.to_string(),
                         subtitle: value.to_string(),
-                        details: vec![
-                            format!("name: {name}"),
-                            format!("value: {value}"),
-                            "definition: -".to_string(),
-                            format!(
-                                "assignments: {}",
-                                database
-                                    .attribute_assignments()
-                                    .filter(|assignment| assignment.name == name)
-                                    .count()
-                            ),
-                        ],
+                        details: detail_section(
+                            "attribute",
+                            [
+                                format!("name: {name}"),
+                                format!("value: {value}"),
+                                "definition: -".to_string(),
+                                "default: -".to_string(),
+                                format!(
+                                    "assignments: {}",
+                                    database
+                                        .attribute_assignments()
+                                        .filter(|assignment| assignment.name == name)
+                                        .count()
+                                ),
+                            ],
+                        ),
                     }),
             );
             objects
@@ -2068,7 +2125,10 @@ fn database_objects(entry: &BindingEntry, category: DbCategory) -> Vec<DbObject>
             .map(|(name, table)| DbObject {
                 title: name.to_string(),
                 subtitle: format!("{} values", table.iter().count()),
-                details: vec![format!("values: {}", value_table_text(table))],
+                details: detail_section(
+                    "value table",
+                    [format!("values: {}", value_table_text(table))],
+                ),
             })
             .collect(),
         (Database::Lin(database), DbCategory::Overview) => vec![DbObject {
@@ -2078,18 +2138,21 @@ fn database_objects(entry: &BindingEntry, category: DbCategory) -> Vec<DbObject>
                 database.len(),
                 database.signal_count()
             ),
-            details: vec![
-                format!("source: {}", database.source_path().unwrap_or("-")),
-                format!("protocol: {}", database.protocol_version().unwrap_or("-")),
-                format!("language: {}", database.language_version().unwrap_or("-")),
-                format!("speed: {:?} kbps", database.speed_kbps()),
-                format!("frames: {}", database.len()),
-                format!(
-                    "diagnostic frames: {}",
-                    database.diagnostic_frames().count()
-                ),
-                format!("nodes: {}", database.nodes().count()),
-            ],
+            details: detail_section(
+                "database",
+                [
+                    format!("source: {}", database.source_path().unwrap_or("-")),
+                    format!("protocol: {}", database.protocol_version().unwrap_or("-")),
+                    format!("language: {}", database.language_version().unwrap_or("-")),
+                    format!("speed: {:?} kbps", database.speed_kbps()),
+                    format!("frames: {}", database.len()),
+                    format!(
+                        "diagnostic frames: {}",
+                        database.diagnostic_frames().count()
+                    ),
+                    format!("nodes: {}", database.nodes().count()),
+                ],
+            ),
         }],
         (Database::Lin(database), DbCategory::Frames) => database
             .frames()
@@ -2150,11 +2213,14 @@ fn database_objects(entry: &BindingEntry, category: DbCategory) -> Vec<DbObject>
                     "len={} initial={:?}",
                     signal.bit_length, signal.initial_value
                 ),
-                details: vec![
-                    format!("name: {}", signal.name),
-                    format!("bit length: {}", signal.bit_length),
-                    format!("initial value: {:?}", signal.initial_value),
-                ],
+                details: detail_section(
+                    "signal",
+                    [
+                        format!("name: {}", signal.name),
+                        format!("bit length: {}", signal.bit_length),
+                        format!("initial value: {:?}", signal.initial_value),
+                    ],
+                ),
             })
             .collect(),
         (Database::Lin(database), DbCategory::Schedules) => database
@@ -2162,10 +2228,13 @@ fn database_objects(entry: &BindingEntry, category: DbCategory) -> Vec<DbObject>
             .map(|(name, entries)| DbObject {
                 title: name.to_string(),
                 subtitle: format!("{} entries", entries.len()),
-                details: entries
-                    .iter()
-                    .map(|entry| format!("{} delay_ms={}", entry.frame_name, entry.delay_ms))
-                    .collect(),
+                details: detail_list(
+                    "entries",
+                    entries
+                        .iter()
+                        .map(|entry| format!("{} delay_ms={}", entry.frame_name, entry.delay_ms))
+                        .collect(),
+                ),
             })
             .collect(),
         (Database::Lin(database), DbCategory::DynamicFrames) => database
@@ -2173,11 +2242,14 @@ fn database_objects(entry: &BindingEntry, category: DbCategory) -> Vec<DbObject>
             .map(|frame| DbObject {
                 title: frame.name.clone(),
                 subtitle: format!("{:?} trigger={:?}", frame.kind, frame.trigger_frame_id),
-                details: vec![
-                    format!("kind: {:?}", frame.kind),
-                    format!("trigger frame id: {:?}", frame.trigger_frame_id),
-                    format!("members: {}", frame.frame_names.join(", ")),
-                ],
+                details: detail_section(
+                    "dynamic frame",
+                    [
+                        format!("kind: {:?}", frame.kind),
+                        format!("trigger frame id: {:?}", frame.trigger_frame_id),
+                        format!("members: {}", frame.frame_names.join(", ")),
+                    ],
+                ),
             })
             .collect(),
         (Database::Lin(database), DbCategory::OptionalSections) => database
@@ -2185,7 +2257,7 @@ fn database_objects(entry: &BindingEntry, category: DbCategory) -> Vec<DbObject>
             .map(|section| DbObject {
                 title: section.name.clone(),
                 subtitle: source_suffix(section.source),
-                details: vec![format!("name: {}", section.name)],
+                details: detail_section("section", [format!("name: {}", section.name)]),
             })
             .collect(),
         _ => Vec::new(),
@@ -2219,16 +2291,46 @@ fn union_names<'a>(groups: impl IntoIterator<Item = &'a [String]>) -> Vec<String
     })
 }
 
+/// Start a section: a blank line separates it from the previous content and
+/// its heading is painted with the strong heading style.
+fn push_heading(details: &mut Vec<DetailLine>, text: impl Into<String>) {
+    if details
+        .last()
+        .is_some_and(|line| !matches!(line, DetailLine::Blank))
+    {
+        details.push(DetailLine::Blank);
+    }
+    details.push(DetailLine::heading(text));
+}
+
+/// A heading and its items, for the small single-section detail objects.
+fn detail_section(label: &str, items: impl IntoIterator<Item = String>) -> Vec<DetailLine> {
+    let mut details = Vec::new();
+    push_heading(&mut details, label);
+    details.extend(items.into_iter().map(DetailLine::item));
+    details
+}
+
+/// A counted list block as a standalone detail list.
+fn detail_list(label: &str, entries: Vec<String>) -> Vec<DetailLine> {
+    let mut details = Vec::new();
+    push_detail_list(&mut details, label, entries);
+    details
+}
+
 /// Add a counted list block, keeping its total visible even when the entries
 /// are capped because the detail column does not scroll.
-fn push_detail_list(details: &mut Vec<String>, label: &str, entries: Vec<String>) {
+fn push_detail_list(details: &mut Vec<DetailLine>, label: &str, entries: Vec<String>) {
     let total = entries.len();
-    details.push(format!("{label}: {total}"));
-    for entry in entries.iter().take(MAX_DETAIL_ENTRIES) {
-        details.push(entry.clone());
+    push_heading(details, format!("{label}: {total}"));
+    for entry in entries.into_iter().take(MAX_DETAIL_ENTRIES) {
+        details.push(DetailLine::item(entry));
     }
     if total > MAX_DETAIL_ENTRIES {
-        details.push(format!("… {} more", total - MAX_DETAIL_ENTRIES));
+        details.push(DetailLine::note(format!(
+            "… {} more",
+            total - MAX_DETAIL_ENTRIES
+        )));
     }
 }
 
@@ -2280,16 +2382,68 @@ fn attribute_line(database: &DbcDatabase, assignment: &blf_core::DbcAttributeAss
     }
 }
 
-fn push_attributes<'a>(
-    details: &mut Vec<String>,
+/// The compact line that completes an attributes block with the definitions
+/// this object does not assign: their `BA_DEF_DEF_` default is still the
+/// effective value of the attribute.
+fn push_attribute_defaults(
+    details: &mut Vec<DetailLine>,
     database: &DbcDatabase,
+    scope: &str,
+    assigned: &[&str],
+) {
+    let defaults: Vec<String> = database
+        .attribute_definitions()
+        .filter(|definition| definition.scope == scope)
+        .filter(|definition| !assigned.contains(&definition.name.as_str()))
+        .filter_map(|definition| {
+            attribute_default(database, &definition.name)
+                .map(|default| format!("{}={default}", definition.name))
+        })
+        .collect();
+    if defaults.is_empty() {
+        return;
+    }
+    let mut line = format!(
+        "defaults: {}",
+        defaults
+            .iter()
+            .take(MAX_DETAIL_ENTRIES)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if defaults.len() > MAX_DETAIL_ENTRIES {
+        let _ = write!(line, ", … {} more", defaults.len() - MAX_DETAIL_ENTRIES);
+    }
+    details.push(DetailLine::note(line));
+}
+
+/// One attributes block: the object's `BA_` assignments, each with its
+/// definition, followed by the defaults of the remaining definitions of the
+/// same scope. A `BA_` assignment overrides a default; it does not create the
+/// attribute, so the defaults are part of the object's effective attributes.
+fn push_attributes<'a>(
+    details: &mut Vec<DetailLine>,
+    database: &DbcDatabase,
+    scope: &str,
     assignments: impl IntoIterator<Item = &'a blf_core::DbcAttributeAssignment>,
 ) {
-    let lines = assignments
-        .into_iter()
-        .map(|assignment| attribute_line(database, assignment))
+    let assignments: Vec<&blf_core::DbcAttributeAssignment> = assignments.into_iter().collect();
+    let assigned: Vec<&str> = assignments
+        .iter()
+        .map(|assignment| assignment.name.as_str())
         .collect();
-    push_detail_list(details, "attributes", lines);
+    push_heading(details, format!("attributes: {}", assignments.len()));
+    for assignment in assignments.iter().take(MAX_DETAIL_ENTRIES) {
+        details.push(DetailLine::item(attribute_line(database, assignment)));
+    }
+    if assignments.len() > MAX_DETAIL_ENTRIES {
+        details.push(DetailLine::note(format!(
+            "… {} more",
+            assignments.len() - MAX_DETAIL_ENTRIES
+        )));
+    }
+    push_attribute_defaults(details, database, scope, &assigned);
 }
 
 fn message_receivers(message: &blf_core::DbcMessage) -> Vec<String> {
@@ -2323,11 +2477,12 @@ fn message_signal_names(messages: &[&blf_core::DbcMessage]) -> Vec<String> {
 /// A CAN node owns two relations: the messages it transmits, and the messages
 /// whose deduplicated signal receivers include it. The signal lists derive
 /// from those two message sets.
-fn dbc_node_details(database: &DbcDatabase, node: &blf_core::DbcNode) -> Vec<String> {
-    let mut details = vec![format!("name: {}", node.name)];
+fn dbc_node_details(database: &DbcDatabase, node: &blf_core::DbcNode) -> Vec<DetailLine> {
+    let mut details = detail_section("node", [format!("name: {}", node.name)]);
     push_attributes(
         &mut details,
         database,
+        "node",
         database.attribute_assignments().filter(|assignment| {
             assignment.scope == "node"
                 && assignment.object_name.as_deref() == Some(node.name.as_str())
@@ -2371,13 +2526,16 @@ fn dbc_node_details(database: &DbcDatabase, node: &blf_core::DbcNode) -> Vec<Str
     details
 }
 
-fn lin_node_details(database: &LdfDatabase, node: &blf_core::LinNode) -> Vec<String> {
-    let mut details = vec![
-        format!("name: {}", node.name),
-        format!("configured NAD: {:?}", node.configured_nad),
-        format!("timebase ms: {:?}", node.timebase_ms),
-        format!("jitter ms: {:?}", node.jitter_ms),
-    ];
+fn lin_node_details(database: &LdfDatabase, node: &blf_core::LinNode) -> Vec<DetailLine> {
+    let mut details = detail_section(
+        "node",
+        [
+            format!("name: {}", node.name),
+            format!("configured NAD: {:?}", node.configured_nad),
+            format!("timebase ms: {:?}", node.timebase_ms),
+            format!("jitter ms: {:?}", node.jitter_ms),
+        ],
+    );
     let published: Vec<&blf_core::LinFrame> = database
         .frames()
         .filter(|frame| frame.publisher == node.name)
@@ -2413,30 +2571,33 @@ fn lin_node_details(database: &LdfDatabase, node: &blf_core::LinNode) -> Vec<Str
     details
 }
 
-fn dbc_message_details(database: &DbcDatabase, message: &blf_core::DbcMessage) -> Vec<String> {
-    let mut details = vec![
-        format!("name: {}", message.name),
-        format!(
-            "frame id: 0x{:X} ({})",
-            message.id.id,
-            if message.id.extended {
-                "extended"
-            } else {
-                "standard"
-            }
-        ),
-        format!("DLC: {}  FD: {}", message.dlc, message.is_fd),
-        format!("transmitter: {}", message.transmitter),
-        format!("receivers: {}", message_receivers(message).join(", ")),
-        format!("payload: {:?}", message.payload_kind),
-        format!("signals: {}", message.signals.len()),
-    ];
+fn dbc_message_details(database: &DbcDatabase, message: &blf_core::DbcMessage) -> Vec<DetailLine> {
+    let mut details = detail_section(
+        "message",
+        [
+            format!("name: {}", message.name),
+            format!(
+                "frame id: 0x{:X} ({})",
+                message.id.id,
+                if message.id.extended {
+                    "extended"
+                } else {
+                    "standard"
+                }
+            ),
+            format!("DLC: {}  FD: {}", message.dlc, message.is_fd),
+            format!("transmitter: {}", message.transmitter),
+            format!("receivers: {}", message_receivers(message).join(", ")),
+            format!("payload: {:?}", message.payload_kind),
+        ],
+    );
     if let Some(comment) = &message.comment {
-        details.push(format!("comment: {comment}"));
+        details.push(DetailLine::note(format!("comment: {comment}")));
     }
     push_attributes(
         &mut details,
         database,
+        "message",
         database.attribute_assignments().filter(|assignment| {
             assignment.scope == "message" && assignment.message_id == Some(message.id)
         }),
@@ -2452,8 +2613,8 @@ fn dbc_signal_details(
     database: &DbcDatabase,
     message: &blf_core::DbcMessage,
     signal: &blf_core::CanSignal,
-) -> Vec<String> {
-    let mut details = vec![
+) -> Vec<DetailLine> {
+    let mut items = vec![
         format!("message: {}  frame=0x{:X}", message.name, message.id.id),
         format!(
             "layout: start={} length={}",
@@ -2473,51 +2634,60 @@ fn dbc_signal_details(
         ),
         format!("multiplex: {:?}", signal.multiplex),
     ];
+    if !signal.choices.is_empty() {
+        items.push(format!("choices: {}", value_table_text(&signal.choices)));
+    }
+    let mut details = detail_section("signal", items);
     push_attributes(
         &mut details,
         database,
+        "signal",
         database.attribute_assignments().filter(|assignment| {
             assignment.scope == "signal"
                 && assignment.message_id == Some(message.id)
                 && assignment.signal_name.as_deref() == Some(signal.name.as_str())
         }),
     );
-    if !signal.choices.is_empty() {
-        details.push(format!("choices: {}", value_table_text(&signal.choices)));
-    }
     if let Some(comment) = &signal.comment {
-        details.push(format!("comment: {comment}"));
+        details.push(DetailLine::note(format!("comment: {comment}")));
     }
     details
 }
 
-fn push_signal_lines<'a>(details: &mut Vec<String>, names: impl IntoIterator<Item = &'a str>) {
+fn push_signal_lines<'a>(details: &mut Vec<DetailLine>, names: impl IntoIterator<Item = &'a str>) {
     let names: Vec<&str> = names.into_iter().collect();
+    let total = names.len();
+    push_heading(details, format!("signals: {total}"));
     for name in names.iter().take(MAX_DETAIL_ENTRIES) {
-        details.push(format!("signal: {name}"));
+        details.push(DetailLine::item(format!("signal: {name}")));
     }
-    if names.len() > MAX_DETAIL_ENTRIES {
-        details.push(format!("… {} more", names.len() - MAX_DETAIL_ENTRIES));
+    if total > MAX_DETAIL_ENTRIES {
+        details.push(DetailLine::note(format!(
+            "… {} more",
+            total - MAX_DETAIL_ENTRIES
+        )));
     }
 }
 
-fn lin_frame_details(frame: &blf_core::LinFrame) -> Vec<String> {
-    let mut details = vec![
-        format!("frame id: 0x{:02X}", frame.id),
-        format!("DLC: {}  publisher: {}", frame.dlc, frame.publisher),
-        format!(
-            "subscribers: {}",
-            union_names(
-                frame
-                    .signals
-                    .iter()
-                    .map(|signal| signal.subscribers.as_slice())
-            )
-            .join(", ")
-        ),
-        format!("checksum: {:?}", frame.checksum),
-        format!("signals: {}", frame.signals.len()),
-    ];
+fn lin_frame_details(frame: &blf_core::LinFrame) -> Vec<DetailLine> {
+    let mut details = detail_section(
+        "frame",
+        [
+            format!("frame id: 0x{:02X}", frame.id),
+            format!("DLC: {}  publisher: {}", frame.dlc, frame.publisher),
+            format!(
+                "subscribers: {}",
+                union_names(
+                    frame
+                        .signals
+                        .iter()
+                        .map(|signal| signal.subscribers.as_slice())
+                )
+                .join(", ")
+            ),
+            format!("checksum: {:?}", frame.checksum),
+        ],
+    );
     push_signal_lines(
         &mut details,
         frame.signals.iter().map(|signal| signal.name.as_str()),
@@ -2525,13 +2695,15 @@ fn lin_frame_details(frame: &blf_core::LinFrame) -> Vec<String> {
     details
 }
 
-fn lin_diagnostic_frame_details(frame: &blf_core::LinDiagnosticFrame) -> Vec<String> {
-    let mut details = vec![
-        format!("frame id: 0x{:02X}", frame.id),
-        format!("DLC: {}", frame.dlc),
-        format!("checksum: {:?}", frame.checksum),
-        format!("signals: {}", frame.signals.len()),
-    ];
+fn lin_diagnostic_frame_details(frame: &blf_core::LinDiagnosticFrame) -> Vec<DetailLine> {
+    let mut details = detail_section(
+        "diagnostic frame",
+        [
+            format!("frame id: 0x{:02X}", frame.id),
+            format!("DLC: {}", frame.dlc),
+            format!("checksum: {:?}", frame.checksum),
+        ],
+    );
     push_signal_lines(
         &mut details,
         frame.signals.iter().map(|signal| signal.name.as_str()),
@@ -2539,8 +2711,8 @@ fn lin_diagnostic_frame_details(frame: &blf_core::LinDiagnosticFrame) -> Vec<Str
     details
 }
 
-fn lin_signal_details(signal: &blf_core::LinSignal) -> Vec<String> {
-    let mut details = vec![
+fn lin_signal_details(signal: &blf_core::LinSignal) -> Vec<DetailLine> {
+    let mut items = vec![
         format!(
             "layout: start={} length={}",
             signal.start_bit, signal.bit_length
@@ -2555,9 +2727,9 @@ fn lin_signal_details(signal: &blf_core::LinSignal) -> Vec<String> {
         format!("encoding: {}", signal.encoding.as_deref().unwrap_or("-")),
     ];
     if !signal.choices.is_empty() {
-        details.push(format!("choices: {}", value_table_text(&signal.choices)));
+        items.push(format!("choices: {}", value_table_text(&signal.choices)));
     }
-    details
+    detail_section("signal", items)
 }
 
 fn value_table_text(table: &blf_core::ValueTable) -> String {
@@ -3799,6 +3971,17 @@ fn main() {
 mod tests {
     use super::*;
 
+    fn detail_texts(details: &[DetailLine]) -> Vec<&str> {
+        details.iter().map(DetailLine::text).collect()
+    }
+
+    fn find_detail(details: &[DetailLine], expected: &str) -> usize {
+        details
+            .iter()
+            .position(|line| line.text() == expected)
+            .unwrap_or_else(|| panic!("missing detail line {expected:?}"))
+    }
+
     fn strip_ansi(value: &str) -> String {
         let mut output = String::new();
         let mut chars = value.chars().peekable();
@@ -3870,6 +4053,28 @@ BA_ "GenMsgCycleTime" BO_ 256 100;
 BA_ "GenMsgSendType" BO_ 256 1;
 BA_ "GenSigStartValue" SG_ 256 VehicleSpeed 5.5;
 BA_ "GenNodeAddr" BU_ BCM 1;
+"#;
+
+    // One assigned message attribute and several unassigned definitions, plus
+    // a signal definition that must not leak into the message scope.
+    const DEFAULT_DBC: &str = r#"
+VERSION "1.0"
+BU_: BCM TCM
+
+BO_ 256 VehicleStatus: 8 BCM
+ SG_ VehicleSpeed : 0|16@1+ (0.01,0) [0|655.35] "km/h" TCM
+
+BA_DEF_ BO_ "GenMsgCycleTime" INT 2 50000;
+BA_DEF_DEF_ "GenMsgCycleTime" 2;
+BA_DEF_ BO_ "GenMsgDelayTime" INT 1 1000;
+BA_DEF_DEF_ "GenMsgDelayTime" 1;
+BA_DEF_ BO_ "GenMsgFastOnStart" INT 0 0;
+BA_DEF_DEF_ "GenMsgFastOnStart" 0;
+BA_DEF_ BO_ "GenMsgILSupport" ENUM "No","Yes";
+BA_DEF_DEF_ "GenMsgILSupport" "Yes";
+BA_DEF_ SG_ "GenSigStartValue" FLOAT 0 100;
+BA_DEF_DEF_ "GenSigStartValue" 0;
+BA_ "GenMsgCycleTime" BO_ 256 100;
 "#;
 
     const RELATION_LDF: &str = r#"
@@ -4231,13 +4436,10 @@ Schedule_tables {
 
         let database = DbcDatabase::from_str(TEST_DBC).expect("parse test DBC");
         let details = dbc_message_details(&database, &message);
-        let transmitter = details
-            .iter()
-            .position(|line| line == "transmitter: BCM")
-            .expect("transmitter line");
-        assert_eq!(details[transmitter + 1], "receivers: TCM, Gateway");
+        let transmitter = find_detail(&details, "transmitter: BCM");
+        assert_eq!(details[transmitter + 1].text(), "receivers: TCM, Gateway");
         assert_eq!(
-            details
+            detail_texts(&details)
                 .iter()
                 .filter(|line| line.starts_with("receivers:"))
                 .count(),
@@ -4278,19 +4480,18 @@ Schedule_tables {
 
         let database = DbcDatabase::from_str(TEST_DBC).expect("parse test DBC");
         let details = dbc_signal_details(&database, &message, &message.signals[0]);
-        let transmitter = details
-            .iter()
-            .position(|line| line == "transmitter: BCM")
-            .expect("transmitter line");
-        assert_eq!(details[transmitter + 1], "receivers: TCM, Gateway");
+        let transmitter = find_detail(&details, "transmitter: BCM");
+        assert_eq!(details[transmitter + 1].text(), "receivers: TCM, Gateway");
         assert_eq!(
-            details
+            detail_texts(&details)
                 .iter()
                 .filter(|line| line.starts_with("transmitter:"))
                 .count(),
             1
         );
-        assert!(details.iter().all(|line| !line.contains("Vector__XXX")));
+        assert!(detail_texts(&details)
+            .iter()
+            .all(|line| !line.contains("Vector__XXX")));
     }
 
     #[test]
@@ -4328,11 +4529,8 @@ Schedule_tables {
         };
 
         let details = lin_frame_details(&frame);
-        let publisher = details
-            .iter()
-            .position(|line| line == "DLC: 8  publisher: BCM")
-            .expect("publisher line");
-        assert_eq!(details[publisher + 1], "subscribers: TCM, Gateway");
+        let publisher = find_detail(&details, "DLC: 8  publisher: BCM");
+        assert_eq!(details[publisher + 1].text(), "subscribers: TCM, Gateway");
     }
 
     #[test]
@@ -4363,12 +4561,11 @@ Schedule_tables {
         };
 
         let details = lin_signal_details(&signal);
-        let publisher = details
+        let publisher = find_detail(&details, "publisher: BCM");
+        assert_eq!(details[publisher + 1].text(), "subscribers: TCM, Gateway");
+        assert!(detail_texts(&details)
             .iter()
-            .position(|line| line == "publisher: BCM")
-            .expect("publisher line");
-        assert_eq!(details[publisher + 1], "subscribers: TCM, Gateway");
-        assert!(details.iter().all(|line| !line.contains("Vector__XXX")));
+            .all(|line| !line.contains("Vector__XXX")));
     }
 
     #[test]
@@ -4379,39 +4576,30 @@ Schedule_tables {
             .find(|node| node.name == "BCM")
             .expect("BCM node");
         let details = dbc_node_details(&database, node);
-        let position = |line: &str| {
-            details
-                .iter()
-                .position(|detail| detail == line)
-                .unwrap_or_else(|| panic!("missing detail line {line:?}"))
-        };
+        let position = |line: &str| find_detail(&details, line);
 
-        assert_eq!(details[0], "name: BCM");
+        assert_eq!(details[0], DetailLine::heading("node"));
+        assert_eq!(details[1].text(), "name: BCM");
         let sent = position("messages sent: 2");
-        assert_eq!(details[sent + 1], "VehicleStatus 0x100 2 signals");
-        assert_eq!(details[sent + 2], "DoorStatus 0x101 1 signals");
+        assert_eq!(details[sent + 1].text(), "VehicleStatus 0x100 2 signals");
+        assert_eq!(details[sent + 2].text(), "DoorStatus 0x101 1 signals");
         let received = position("messages received: 1");
-        assert_eq!(details[received + 1], "EngineStatus 0x102 1 signals");
+        assert_eq!(details[received + 1].text(), "EngineStatus 0x102 1 signals");
         let sent_signals = position("signals sent: 3");
         let names: Vec<&str> = details[sent_signals + 1..sent_signals + 4]
             .iter()
-            .map(String::as_str)
+            .map(DetailLine::text)
             .collect();
         assert_eq!(names, ["VehicleSpeed", "EngineSpeed", "FrontLeft"]);
         let received_signals = position("signals received: 1");
-        assert_eq!(details[received_signals + 1], "EngineTemp");
+        assert_eq!(details[received_signals + 1].text(), "EngineTemp");
 
         let tcm = database
             .nodes()
             .find(|node| node.name == "TCM")
             .expect("TCM node");
         let details = dbc_node_details(&database, tcm);
-        let position = |line: &str| {
-            details
-                .iter()
-                .position(|detail| detail == line)
-                .unwrap_or_else(|| panic!("missing detail line {line:?}"))
-        };
+        let position = |line: &str| find_detail(&details, line);
         assert_eq!(
             position("messages sent: 1") + 1,
             position("EngineStatus 0x102 1 signals")
@@ -4434,23 +4622,23 @@ Schedule_tables {
         let database = DbcDatabase::from_str(ATTRIBUTE_DBC).expect("parse attribute DBC");
         let message = database.messages().next().expect("message");
         let details = dbc_message_details(&database, message);
-        assert!(details.contains(&"attributes: 2".to_string()));
-        assert!(details.contains(&"GenMsgCycleTime = 100 (INT 0..65535, default 0)".to_string()));
-        assert!(details
-            .contains(&"GenMsgSendType = 1 (ENUM Cyclic, Spontan, default Cyclic)".to_string()));
+        assert!(detail_texts(&details).contains(&"attributes: 2"));
+        assert!(detail_texts(&details).contains(&"GenMsgCycleTime = 100 (INT 0..65535, default 0)"));
+        assert!(detail_texts(&details)
+            .contains(&"GenMsgSendType = 1 (ENUM Cyclic, Spontan, default Cyclic)"));
 
         let signal_details = dbc_signal_details(&database, message, &message.signals[0]);
-        assert!(signal_details.contains(&"attributes: 1".to_string()));
-        assert!(signal_details
-            .contains(&"GenSigStartValue = 5.5 (FLOAT 0..100, default 0)".to_string()));
+        assert!(detail_texts(&signal_details).contains(&"attributes: 1"));
+        assert!(detail_texts(&signal_details)
+            .contains(&"GenSigStartValue = 5.5 (FLOAT 0..100, default 0)"));
 
         let node = database
             .nodes()
             .find(|node| node.name == "BCM")
             .expect("BCM node");
         let node_details = dbc_node_details(&database, node);
-        assert!(node_details.contains(&"attributes: 1".to_string()));
-        assert!(node_details.contains(&"GenNodeAddr = 1 (HEX 0..255, default 0)".to_string()));
+        assert!(detail_texts(&node_details).contains(&"attributes: 1"));
+        assert!(detail_texts(&node_details).contains(&"GenNodeAddr = 1 (HEX 0..255, default 0)"));
 
         let undefined = blf_core::DbcAttributeAssignment {
             name: "CustomAttr".to_string(),
@@ -4473,44 +4661,135 @@ Schedule_tables {
             .iter()
             .find(|object| object.title == "GenMsgCycleTime")
             .expect("message cycle attribute");
-        assert!(cycle.details.contains(&"scope: message".to_string()));
-        assert!(cycle
-            .details
-            .contains(&"definition: INT 0..65535".to_string()));
-        assert!(cycle.details.contains(&"default: 0".to_string()));
-        assert!(cycle.details.contains(&"assignments: 1".to_string()));
+        assert!(detail_texts(&cycle.details).contains(&"scope: message"));
+        assert!(detail_texts(&cycle.details).contains(&"definition: INT 0..65535"));
+        assert!(detail_texts(&cycle.details).contains(&"default: 0"));
+        assert!(detail_texts(&cycle.details).contains(&"assignments: 1"));
 
         let send_type = objects
             .iter()
             .find(|object| object.title == "GenMsgSendType")
             .expect("message send type attribute");
         assert_eq!(send_type.subtitle, "ENUM Cyclic, Spontan");
-        assert!(send_type
-            .details
-            .contains(&"definition: ENUM Cyclic, Spontan".to_string()));
+        assert!(detail_texts(&send_type.details).contains(&"definition: ENUM Cyclic, Spontan"));
 
         assert!(objects.iter().any(|object| object.title == "GenNodeAddr"));
     }
 
     #[test]
+    fn dbc_message_details_show_assigned_attributes_and_scope_defaults() {
+        let database = DbcDatabase::from_str(DEFAULT_DBC).expect("parse defaults DBC");
+        let message = database.messages().next().expect("message");
+        let details = dbc_message_details(&database, message);
+        let texts = detail_texts(&details);
+
+        assert!(texts.contains(&"attributes: 1"));
+        assert!(texts.contains(&"GenMsgCycleTime = 100 (INT 2..50000, default 2)"));
+        let defaults = details
+            .iter()
+            .find(|line| line.text().starts_with("defaults: "))
+            .expect("defaults note");
+        assert!(matches!(defaults, DetailLine::Note(_)));
+        assert_eq!(
+            defaults.text(),
+            "defaults: GenMsgDelayTime=1, GenMsgFastOnStart=0, GenMsgILSupport=Yes"
+        );
+        // The assigned attribute is not repeated, and other scopes stay out.
+        assert!(!defaults.text().contains("GenMsgCycleTime="));
+        assert!(!defaults.text().contains("GenSigStartValue"));
+
+        // The signal scope has its own default, which is not assigned here.
+        let signal_details = dbc_signal_details(&database, message, &message.signals[0]);
+        assert!(detail_texts(&signal_details).contains(&"defaults: GenSigStartValue=0"));
+    }
+
+    #[test]
+    fn detail_scope_without_definitions_has_no_defaults_line() {
+        let database = DbcDatabase::from_str(TEST_DBC).expect("parse test DBC");
+        let message = database.messages().next().expect("message");
+        let details = dbc_message_details(&database, message);
+        assert!(detail_texts(&details)
+            .iter()
+            .all(|line| !line.starts_with("defaults:")));
+
+        let node = database.nodes().next().expect("node");
+        let node_details = dbc_node_details(&database, node);
+        assert!(detail_texts(&node_details)
+            .iter()
+            .all(|line| !line.starts_with("defaults:")));
+    }
+
+    #[test]
+    fn attribute_defaults_line_caps_scope_definitions() {
+        let mut source = String::from("VERSION \"1.0\"\nBU_: BCM\n\nBO_ 256 M: 8 BCM\n\n");
+        for index in 0..MAX_DETAIL_ENTRIES + 2 {
+            let _ = writeln!(source, "BA_DEF_ BO_ \"Attr{index:02}\" INT 0 1;");
+            let _ = writeln!(source, "BA_DEF_DEF_ \"Attr{index:02}\" 0;");
+        }
+        let database = DbcDatabase::from_str(&source).expect("parse generated defaults");
+        let message = database.messages().next().expect("message");
+        let details = dbc_message_details(&database, message);
+        let defaults = details
+            .iter()
+            .find(|line| line.text().starts_with("defaults: "))
+            .expect("defaults note");
+
+        assert!(defaults.text().starts_with("defaults: Attr00=0, Attr01=0"));
+        assert!(defaults.text().ends_with(", … 2 more"));
+        assert_eq!(defaults.text().matches("Attr").count(), MAX_DETAIL_ENTRIES);
+    }
+
+    #[test]
+    fn detail_lines_separate_headings_items_notes_and_blank_rows() {
+        let mut details = Vec::new();
+        push_heading(&mut details, "message");
+        details.push(DetailLine::item("name: VehicleStatus"));
+        details.push(DetailLine::note("comment: demo"));
+        push_heading(&mut details, "attributes: 1");
+        details.push(DetailLine::item("GenMsgCycleTime = 100"));
+
+        assert_eq!(details[0], DetailLine::heading("message"));
+        assert_eq!(details[1], DetailLine::item("name: VehicleStatus"));
+        assert_eq!(details[2], DetailLine::note("comment: demo"));
+        assert_eq!(details[3], DetailLine::Blank);
+        assert_eq!(details[4], DetailLine::heading("attributes: 1"));
+
+        assert_eq!(
+            details[0].render(),
+            ("message".to_string(), CellStyle::DetailHeading)
+        );
+        assert_eq!(
+            details[1].render(),
+            ("  name: VehicleStatus".to_string(), CellStyle::DetailItem)
+        );
+        assert_eq!(
+            details[2].render(),
+            ("comment: demo".to_string(), CellStyle::Dim)
+        );
+        assert_eq!(details[3].render(), (String::new(), CellStyle::Normal));
+
+        let heading = paint_cell("message", CellStyle::DetailHeading);
+        assert!(heading.starts_with(ANSI_BOLD));
+        assert!(heading.contains(ANSI_BRIGHT_CYAN));
+        let item = paint_cell("  name: VehicleStatus", CellStyle::DetailItem);
+        assert!(item.contains(ANSI_WHITE));
+        assert!(!item.contains(ANSI_BOLD));
+    }
+
+    #[test]
     fn lin_node_details_list_published_frames_and_subscribed_signals() {
         let database = LdfDatabase::from_str(RELATION_LDF).expect("parse relation LDF");
-        let position = |details: &[String], line: &str| {
-            details
-                .iter()
-                .position(|detail| detail == line)
-                .unwrap_or_else(|| panic!("missing detail line {line:?}"))
-        };
+        let position = |details: &[DetailLine], line: &str| find_detail(details, line);
 
         let master = database
             .nodes()
             .find(|node| node.name == "MasterNode")
             .expect("master node");
         let details = lin_node_details(&database, master);
-        assert_eq!(details[0], "name: MasterNode");
-        assert!(details.contains(&"frames published: 0".to_string()));
+        assert_eq!(details[1].text(), "name: MasterNode");
+        assert!(detail_texts(&details).contains(&"frames published: 0"));
         let subscribed = position(&details, "signals subscribed: 1");
-        assert_eq!(details[subscribed + 1], "Speed");
+        assert_eq!(details[subscribed + 1].text(), "Speed");
 
         let slave = database
             .nodes()
@@ -4518,9 +4797,9 @@ Schedule_tables {
             .expect("slave node");
         let details = lin_node_details(&database, slave);
         let published = position(&details, "frames published: 1");
-        assert_eq!(details[published + 1], "Status 0x01 2 signals");
+        assert_eq!(details[published + 1].text(), "Status 0x01 2 signals");
         let subscribed = position(&details, "signals subscribed: 1");
-        assert_eq!(details[subscribed + 1], "Mode");
+        assert_eq!(details[subscribed + 1].text(), "Mode");
     }
 
     #[test]
@@ -4531,9 +4810,12 @@ Schedule_tables {
         let mut details = Vec::new();
         push_detail_list(&mut details, "items", entries);
 
-        assert_eq!(details[0], format!("items: {}", MAX_DETAIL_ENTRIES + 3));
+        assert_eq!(
+            details[0].text(),
+            format!("items: {}", MAX_DETAIL_ENTRIES + 3)
+        );
         assert_eq!(details.len(), MAX_DETAIL_ENTRIES + 2);
-        assert_eq!(details.last().unwrap(), "… 3 more");
+        assert_eq!(details.last().unwrap().text(), "… 3 more");
     }
 
     #[test]
