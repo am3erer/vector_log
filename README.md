@@ -77,7 +77,15 @@ cargo run -p blf-tui -- trace.blf
 cargo run -p blf-tui -- trace.blf \
   --dbc 1=vehicle.dbc \
   --ldf 3=body.ldf
+# Browse databases alone: no trace, starts in the database browser.
+cargo run -p blf-tui -- --dbc 1=vehicle.dbc --ldf 3=body.ldf
 ```
+
+The trace path, when given, must be the first argument. Without one, at least
+one `--dbc`/`--ldf` is required and the viewer boots into the database browser
+with `(no trace)` in the header; the message, detail and curve modes are
+unreachable, `Esc` does not leave the browser, and trace-only keys report
+`No trace loaded`. `vector-log-tui --help` documents both invocations.
 
 The application scans the BLF at startup, then allows message filtering and
 selection, per-message detail inspection, channel-specific DBC/LDF binding,
@@ -93,8 +101,10 @@ pane. The focused pane draws the strong selection marker and background; the
 other pane keeps its row visible with a dimmed `·` marker. The database name is
 a non-selectable header line in the tree pane, because `[`/`]` switch loaded
 databases. The detail column includes each DBC message's transmitter and the
-deduplicated receivers of its signals; LIN frames show the union of their
-signals' subscribers.
+deduplicated receivers of its signals. A DBC signal shows its message's
+transmitter next to its deduplicated receivers; a LIN signal shows its
+publisher next to its deduplicated subscribers, and a LIN frame shows the union
+of its signals' subscribers.
 
 Key controls are:
 
@@ -119,6 +129,11 @@ p                 open a curve for the selected numeric signal
 Esc/Left          go back
 q                 quit
 ```
+
+The message list, detail and curve modes need a trace. A database-only session
+stays in the browser, where `Esc` cannot go back to a message list; the keys
+that act on the trace (`e`, `g`, `G`, `p` and `Esc` from the browser) report
+`No trace loaded`, and the rest of the browser works as usual.
 
 `g` opens a prompt that takes three forms, and reports where it landed:
 
