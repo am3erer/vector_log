@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::fmt::Write as _;
 use std::fs::{File as StdFile, OpenOptions};
@@ -79,6 +80,21 @@ struct SignalRow {
     physical: Option<f64>,
     choice: Option<String>,
     error: Option<String>,
+}
+
+/// Identifies one frame id on one bus and channel.
+type FrameKey = (BusKind, u16, u32);
+
+/// Outcome of a `]`/`[` step, resolved before mutating any state.
+enum FrameStep {
+    Missing,
+    AtStart(usize),
+    AtEnd(usize),
+    Move {
+        target: usize,
+        ordinal: usize,
+        total: usize,
+    },
 }
 
 /// Cycle timing of one frame id on one bus/channel.
@@ -278,6 +294,8 @@ struct App {
     filter: String,
     filtered: Vec<usize>,
     db_objects: Vec<DbObject>,
+    frame_index: Option<HashMap<FrameKey, Vec<usize>>>,
+    timing: Option<TimingStats>,
     dirty: bool,
     selected: usize,
     list_offset: usize,
@@ -341,6 +359,8 @@ impl App {
             filter: String::new(),
             filtered,
             db_objects: Vec::new(),
+            frame_index: None,
+            timing: None,
             dirty: true,
             selected: 0,
             list_offset: 0,
@@ -694,52 +714,84 @@ impl App {
     /// `]`/`[`: move to the next or previous message with the same frame id
     /// on the same bus and channel, and say which occurrence it is.
     fn step_frame(&mut self, direction: isize) {
-        let Some((positions, current)) = self.frame_positions() else {
+        let Some(key) = self.selected_frame_key() else {
             self.status = "This message has no frame id to step through".to_string();
             return;
         };
-        let next = current as isize + direction;
-        if next < 0 {
-            self.status = format!("First of {} occurrences", positions.len());
-            return;
-        }
-        let Some(&position) = positions.get(next as usize) else {
-            self.status = format!("Last of {} occurrences", positions.len());
-            return;
+        self.ensure_frame_index();
+        let outcome = match self.frame_index.as_ref().and_then(|index| index.get(&key)) {
+            None => FrameStep::Missing,
+            Some(positions) => match positions
+                .iter()
+                .position(|position| *position == self.selected)
+            {
+                None => FrameStep::Missing,
+                Some(current) => {
+                    let next = current as isize + direction;
+                    if next < 0 {
+                        FrameStep::AtStart(positions.len())
+                    } else if let Some(&target) = positions.get(next as usize) {
+                        FrameStep::Move {
+                            target,
+                            ordinal: next as usize + 1,
+                            total: positions.len(),
+                        }
+                    } else {
+                        FrameStep::AtEnd(positions.len())
+                    }
+                }
+            },
         };
-        self.selected = position;
-        self.selected_signal = 0;
-        self.keep_selection_visible();
-        let label = self
-            .selected_summary()
-            .map(frame_label)
-            .unwrap_or_else(|| "frame".to_string());
-        self.status = format!("{label}: occurrence {}/{}", next + 1, positions.len());
+        match outcome {
+            FrameStep::Missing => {
+                self.status = "This message has no frame id to step through".to_string();
+            }
+            FrameStep::AtStart(total) => self.status = format!("First of {total} occurrences"),
+            FrameStep::AtEnd(total) => self.status = format!("Last of {total} occurrences"),
+            FrameStep::Move {
+                target,
+                ordinal,
+                total,
+            } => {
+                self.selected = target;
+                self.selected_signal = 0;
+                self.keep_selection_visible();
+                let label = self
+                    .selected_summary()
+                    .map(frame_label)
+                    .unwrap_or_else(|| "frame".to_string());
+                self.status = format!("{label}: occurrence {ordinal}/{total}");
+            }
+        }
     }
 
-    /// Positions (inside the filtered list) of the selected frame id.
-    fn frame_positions(&self) -> Option<(Vec<usize>, usize)> {
-        let current = *self.filtered.get(self.selected)?;
-        let summary = self.summaries.get(current)?;
-        let bus = summary.bus?;
-        let channel = summary.channel?;
-        let frame_id = summary.frame_id?;
-        let positions = self
-            .filtered
-            .iter()
-            .enumerate()
-            .filter(|(_, index)| {
-                let candidate = &self.summaries[**index];
-                candidate.bus == Some(bus)
-                    && candidate.channel == Some(channel)
-                    && candidate.frame_id == Some(frame_id)
-            })
-            .map(|(position, _)| position)
-            .collect::<Vec<_>>();
-        let current = positions
-            .iter()
-            .position(|position| *position == self.selected)?;
-        Some((positions, current))
+    fn selected_frame_key(&self) -> Option<FrameKey> {
+        let summary = self.selected_summary()?;
+        Some((summary.bus?, summary.channel?, summary.frame_id?))
+    }
+
+    /// Map each frame id of the visible list to its positions in that list,
+    /// built once instead of rescanning on every `]`/`[` and detail open.
+    fn ensure_frame_index(&mut self) {
+        if self.frame_index.is_some() {
+            return;
+        }
+        let mut index: HashMap<FrameKey, Vec<usize>> = HashMap::new();
+        for (position, list_index) in self.filtered.iter().enumerate() {
+            let Some(summary) = self.summaries.get(*list_index) else {
+                continue;
+            };
+            let (Some(bus), Some(channel), Some(frame_id)) =
+                (summary.bus, summary.channel, summary.frame_id)
+            else {
+                continue;
+            };
+            index
+                .entry((bus, channel, frame_id))
+                .or_default()
+                .push(position);
+        }
+        self.frame_index = Some(index);
     }
 
     fn position_label(&self) -> String {
@@ -946,20 +998,18 @@ impl App {
             .and_then(|index| self.summaries.get(*index))
     }
 
-    /// Cycle timing for the frame id of `summary` on its own bus and channel.
-    fn frame_timing(&self, summary: &MessageSummary) -> Option<TimingStats> {
-        let bus = summary.bus?;
-        let channel = summary.channel?;
-        let frame_id = summary.frame_id?;
-        let timestamps = self
-            .summaries
+    /// Cycle timing for the frame id of `summary`, read from the frame index
+    /// so opening a detail page does not rescan the whole trace.
+    fn frame_timing(&mut self, summary: &MessageSummary) -> Option<TimingStats> {
+        let key = (summary.bus?, summary.channel?, summary.frame_id?);
+        self.ensure_frame_index();
+        let positions = self.frame_index.as_ref()?.get(&key)?;
+        let timestamps = positions
             .iter()
-            .filter(|candidate| {
-                candidate.bus == Some(bus)
-                    && candidate.channel == Some(channel)
-                    && candidate.frame_id == Some(frame_id)
+            .filter_map(|position| {
+                let index = *self.filtered.get(*position)?;
+                self.summaries.get(index)?.timestamp_ns
             })
-            .filter_map(|candidate| candidate.timestamp_ns)
             .collect::<Vec<_>>();
         timing_stats(&timestamps)
     }
@@ -972,13 +1022,21 @@ impl App {
     /// Recompute the filter once per filter change instead of once per frame.
     fn rebuild_filtered(&mut self) {
         let filter = self.filter.to_ascii_lowercase();
-        self.filtered = self
-            .summaries
-            .iter()
-            .enumerate()
-            .filter(|(_, summary)| filter.is_empty() || summary_matches(summary, &filter))
-            .map(|(index, _)| index)
-            .collect();
+        let filtered = if filter.is_empty() {
+            (0..self.summaries.len()).collect()
+        } else {
+            let mut buffer = String::with_capacity(128);
+            let mut indices = Vec::new();
+            for (index, summary) in self.summaries.iter().enumerate() {
+                if summary_matches_in(summary, &filter, &mut buffer) {
+                    indices.push(index);
+                }
+            }
+            indices
+        };
+        self.filtered = filtered;
+        self.frame_index = None;
+        self.timing = None;
         self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
     }
 
@@ -994,9 +1052,12 @@ impl App {
 
     fn refresh_detail(&mut self) {
         self.detail_rows.clear();
+        self.timing = None;
         let Some(summary) = self.selected_summary().cloned() else {
             return;
         };
+        // Timing only needs timestamps, so it stays available without a database.
+        self.timing = self.frame_timing(&summary);
         let Some(object) = self.objects.get(summary.object_index) else {
             return;
         };
@@ -1475,7 +1536,7 @@ impl App {
         };
         let split = (width * 43 / 100).max(24);
         let mut left = summary_detail_lines(summary, self.selected_object());
-        left.extend(timing_lines(self.frame_timing(summary)));
+        left.extend(timing_lines(self.timing.clone()));
         let mut right = vec!["Signals".to_string()];
         if self.detail_rows.is_empty() {
             right.push("  no decoded signals (bind a matching database with b)".to_string());
@@ -2431,25 +2492,88 @@ fn display_filter(filter: &str) -> &str {
     }
 }
 
+/// Match one message against an already-lowercased filter.
+///
+/// The haystack is rebuilt in a reusable buffer: formatting a fresh `String`
+/// per message costs about 0.5 us per item, which is a visible pause when a
+/// million-message trace is filtered.
+fn summary_matches_in(summary: &MessageSummary, filter: &str, buffer: &mut String) -> bool {
+    buffer.clear();
+    buffer.push_str(summary.class_name);
+    buffer.push(' ');
+    buffer.push_str(summary.bus.map_or("-", BusKind::as_str));
+    buffer.push(' ');
+    if let Some(channel) = summary.channel {
+        push_decimal(buffer, u64::from(channel));
+    }
+    buffer.push(' ');
+    if let Some(frame_id) = summary.frame_id {
+        let frame_id = u64::from(frame_id);
+        buffer.push_str("0x");
+        push_hex(buffer, frame_id);
+        buffer.push(' ');
+        push_hex(buffer, frame_id);
+        buffer.push(' ');
+    }
+    buffer.push_str(summary.direction.unwrap_or("-"));
+    buffer.push(' ');
+    buffer.push_str(summary.status);
+    buffer.push(' ');
+    push_decimal(buffer, u64::from(summary.object_type_raw));
+    for byte in &summary.payload {
+        buffer.push(' ');
+        push_hex_byte(buffer, *byte);
+    }
+    buffer.make_ascii_lowercase();
+    buffer.contains(filter)
+}
+
+/// Append a decimal number without going through `core::fmt`, which costs
+/// noticeably more per message when a million messages are filtered.
+fn push_decimal(buffer: &mut String, mut value: u64) {
+    if value == 0 {
+        buffer.push('0');
+        return;
+    }
+    let mut digits = [0_u8; 20];
+    let mut length = 0;
+    while value > 0 {
+        digits[length] = b'0' + (value % 10) as u8;
+        value /= 10;
+        length += 1;
+    }
+    for index in (0..length).rev() {
+        buffer.push(char::from(digits[index]));
+    }
+}
+
+fn push_hex(buffer: &mut String, mut value: u64) {
+    const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+    if value == 0 {
+        buffer.push('0');
+        return;
+    }
+    let mut digits = [0_u8; 16];
+    let mut length = 0;
+    while value > 0 {
+        digits[length] = DIGITS[(value % 16) as usize];
+        value /= 16;
+        length += 1;
+    }
+    for index in (0..length).rev() {
+        buffer.push(char::from(digits[index]));
+    }
+}
+
+fn push_hex_byte(buffer: &mut String, byte: u8) {
+    const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+    buffer.push(char::from(DIGITS[(byte >> 4) as usize]));
+    buffer.push(char::from(DIGITS[(byte & 0x0F) as usize]));
+}
+
+#[cfg(test)]
 fn summary_matches(summary: &MessageSummary, filter: &str) -> bool {
-    let haystack = format!(
-        "{} {} {} {} {} {} {} {} {}",
-        summary.class_name,
-        summary.bus.map_or("", BusKind::as_str),
-        summary
-            .channel
-            .map_or_else(|| "".to_string(), |value| value.to_string()),
-        summary
-            .frame_id
-            .map_or_else(|| "".to_string(), |value| format!("{value:X}")),
-        summary.direction.unwrap_or(""),
-        hex_bytes(&summary.payload),
-        summary.status,
-        summary.object_type_raw,
-        summary.class_name,
-    )
-    .to_ascii_lowercase();
-    haystack.contains(filter)
+    summary_matches_in(summary, filter, &mut String::with_capacity(128))
 }
 
 fn lin_status(state: blf_core::LinResponseState) -> &'static str {
@@ -3283,6 +3407,49 @@ mod tests {
         let line = summary_line(&summary);
         assert!(display_width(&line) <= 120);
         assert!(line.ends_with("..."));
+    }
+
+    fn sample_summary(
+        frame_id: u32,
+        bus: BusKind,
+        channel: u16,
+        status: &'static str,
+    ) -> MessageSummary {
+        MessageSummary {
+            object_index: 0,
+            timestamp_ns: Some(0),
+            timestamp_source: None,
+            bus: Some(bus),
+            channel: Some(channel),
+            frame_id: Some(frame_id),
+            object_type_raw: 101,
+            class_name: "CAN_MESSAGE",
+            direction: Some("Rx"),
+            dlc: Some(2),
+            payload: vec![0xAB, 0xCD],
+            status,
+        }
+    }
+
+    #[test]
+    fn filter_matches_frame_ids_status_and_payload() {
+        let summary = sample_summary(0x344, BusKind::Can, 1, "ok");
+        assert!(summary_matches(&summary, "0x344"));
+        assert!(summary_matches(&summary, "344"));
+        // Payload bytes are space separated, matching what the list displays.
+        assert!(summary_matches(&summary, "ab cd"));
+        assert!(!summary_matches(&summary, "abcd"));
+        assert!(summary_matches(&summary, "can 1"));
+        assert!(summary_matches(&summary, "can_message"));
+        assert!(!summary_matches(&summary, "0x999"));
+    }
+
+    #[test]
+    fn filter_matches_lin_status_words() {
+        let summary = sample_summary(0x2f, BusKind::Lin, 3, "header_only");
+        assert!(summary_matches(&summary, "header_only"));
+        assert!(summary_matches(&summary, "lin 3"));
+        assert!(!summary_matches(&summary, "send_error"));
     }
 
     #[test]
