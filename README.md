@@ -114,18 +114,24 @@ selected object. One pane has focus at a time: `Left`/`Right`, `h`/`l` or
 pane. The focused pane draws the strong selection marker and background; the
 other pane keeps its row visible with a dimmed `·` marker. The database name is
 a non-selectable header line in the tree pane, because `[`/`]` switch loaded
-databases. The detail column includes each DBC message's transmitter and the
+databases. The detail column groups each object into bold headings with
+indented items and dim notes, separated by a blank line, so message metadata,
+attribute blocks, signal lists and node relations stay readable instead of
+running together. It includes each DBC message's transmitter and the
 deduplicated receivers of its signals. A DBC signal shows its message's
 transmitter next to its deduplicated receivers; a LIN signal shows its
 publisher next to its deduplicated subscribers, and a LIN frame shows the union
-of its signals' subscribers. A DBC node lists the messages it transmits and the
-messages whose signal receivers include it, plus the signals derived from those
-messages; a LIN node lists the frames it publishes and the signals it
-subscribes to. Message, signal and node details carry an `attributes:` block
-that pairs every assigned attribute with its definition and default, and the
-Attributes category shows each definition's type, range or enum members,
-default and assignment count. Long detail lists stop after 24 entries and
-report the remaining count, because the detail column does not scroll.
+of its signals' subscribers. A DBC node groups its relations under the
+`messages sent`, `messages received`, `signals sent` and `signals received`
+headings; a LIN node groups the frames it publishes and the signals it
+subscribes to. Message, signal and node details carry an `attributes:` block:
+every assigned attribute is shown with its definition and default, followed by
+one compact `defaults:` line with the `BA_DEF_DEF_` defaults of that scope's
+definitions which the object does not assign. An attribute therefore keeps its
+definition's default until a `BA_` assignment overrides it. The Attributes
+category shows each definition's type, range or enum members, default and
+assignment count. Long detail lists stop after 24 entries and report the
+remaining count, because the detail column does not scroll.
 
 Key controls are:
 
