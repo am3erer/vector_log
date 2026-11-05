@@ -20,9 +20,10 @@ const HEADER_ROWS: u16 = 3;
 const MAX_CSV_SIGNALS: usize = 64;
 /// Upper bound on curve samples kept in memory; older ones are dropped.
 const MAX_CURVE_SAMPLES: usize = 200_000;
-/// Upper bound on entries in one detail list; the column does not scroll, so a
-/// longer list is cut and the remaining count is reported.
-const MAX_DETAIL_ENTRIES: usize = 24;
+/// Guard against a pathological detail list. The details column scrolls, so
+/// this is far above any real database and only reports the remainder of an
+/// absurdly long list instead of building thousands of lines.
+const MAX_DETAIL_ENTRIES: usize = 500;
 /// First list row below the header block, section title and column rule.
 const LIST_FIRST_ROW: u16 = HEADER_ROWS + 2;
 /// First detail row: the header block plus the detail section title.
@@ -143,6 +144,41 @@ enum Mode {
 enum DatabasePane {
     Tree,
     Objects,
+    Details,
+}
+
+impl DatabasePane {
+    /// The pane `step` stops after this one, clamped at both ends.
+    fn shifted(self, step: isize) -> Self {
+        match step {
+            ..=-1 => match self {
+                Self::Details => Self::Objects,
+                Self::Objects | Self::Tree => Self::Tree,
+            },
+            _ => match self {
+                Self::Tree => Self::Objects,
+                Self::Objects | Self::Details => Self::Details,
+            },
+        }
+    }
+
+    /// The pane after this one, wrapping from the last back to the first.
+    fn cycled(self) -> Self {
+        match self {
+            Self::Tree => Self::Objects,
+            Self::Objects => Self::Details,
+            Self::Details => Self::Tree,
+        }
+    }
+
+    /// The pane before this one, wrapping from the first back to the last.
+    fn cycled_back(self) -> Self {
+        match self {
+            Self::Tree => Self::Details,
+            Self::Objects => Self::Tree,
+            Self::Details => Self::Objects,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,6 +368,7 @@ struct App {
     database_category: usize,
     database_object_selected: usize,
     database_object_offset: usize,
+    database_detail_offset: usize,
     database_filter: String,
     help: Option<HelpState>,
 }
@@ -416,6 +453,7 @@ impl App {
             database_category: 0,
             database_object_selected: 0,
             database_object_offset: 0,
+            database_detail_offset: 0,
             database_filter: String::new(),
             help: None,
         };
@@ -546,13 +584,10 @@ impl App {
                 InputEvent::PageDown => self.move_database_row(self.page_step()),
                 InputEvent::Home => self.select_first_database_row(),
                 InputEvent::End => self.select_last_database_row(),
-                InputEvent::Left | InputEvent::Char('h') => {
-                    self.focus_database_pane(DatabasePane::Tree);
-                }
-                InputEvent::Right | InputEvent::Char('l') => {
-                    self.focus_database_pane(DatabasePane::Objects);
-                }
-                InputEvent::Tab | InputEvent::BackTab => self.toggle_database_pane(),
+                InputEvent::Left | InputEvent::Char('h') => self.shift_database_pane(-1),
+                InputEvent::Right | InputEvent::Char('l') => self.shift_database_pane(1),
+                InputEvent::Tab => self.toggle_database_pane(true),
+                InputEvent::BackTab => self.toggle_database_pane(false),
                 InputEvent::Char('[') => self.switch_database(-1),
                 InputEvent::Char(']') => self.switch_database(1),
                 InputEvent::Char('/') => self.start_input(InputKind::DatabaseFilter),
@@ -936,7 +971,11 @@ impl App {
         let rows = match self.mode {
             Mode::Messages => self.message_page_size(),
             Mode::Detail => self.detail_page_size(),
-            Mode::Databases => self.database_page_size(),
+            // The details pane scrolls wrapped lines, so a page is its height.
+            Mode::Databases => match self.database_pane {
+                DatabasePane::Details => self.database_body_rows(self.viewport_height),
+                DatabasePane::Tree | DatabasePane::Objects => self.database_page_size(),
+            },
             Mode::Curve => 1,
         };
         rows as isize
@@ -1024,6 +1063,7 @@ impl App {
         self.database_object_selected = self
             .database_object_selected
             .min(self.db_objects.len().saturating_sub(1));
+        self.database_detail_offset = 0;
     }
 
     fn move_database_category(&mut self, delta: isize) {
@@ -1053,16 +1093,19 @@ impl App {
     fn move_database_object(&mut self, delta: isize) {
         let count = self.db_objects.len();
         self.database_object_selected = move_index(self.database_object_selected, count, delta);
+        self.database_detail_offset = 0;
         self.keep_database_object_visible();
     }
 
     fn select_first_database_object(&mut self) {
         self.database_object_selected = 0;
         self.database_object_offset = 0;
+        self.database_detail_offset = 0;
     }
 
     fn select_last_database_object(&mut self) {
         self.database_object_selected = self.db_objects.len().saturating_sub(1);
+        self.database_detail_offset = 0;
         self.keep_database_object_visible();
     }
 
@@ -1075,6 +1118,43 @@ impl App {
         }
     }
 
+    /// Body rows of the database browser below its header block and rule.
+    fn database_body_rows(&self, height: usize) -> usize {
+        height.saturating_sub(7).max(1)
+    }
+
+    /// The selected object's detail lines wrapped to `width` cells. Each
+    /// wrapped part keeps the style of the detail line it came from.
+    fn database_detail_lines(&self, width: usize) -> Vec<(String, CellStyle)> {
+        let Some(object) = self.db_objects.get(self.database_object_selected) else {
+            return Vec::new();
+        };
+        let mut lines = Vec::new();
+        for detail in &object.details {
+            let (text, style) = detail.render();
+            lines.extend(wrap(&text, width).into_iter().map(|part| (part, style)));
+        }
+        lines
+    }
+
+    /// Keep the details offset inside the wrapped content, so a resize or a
+    /// shorter object cannot leave the column scrolled past its end.
+    fn clamp_database_detail_offset(&mut self) {
+        let (_, _, width) = self.database_layout(self.viewport_width);
+        let total = self.database_detail_lines(width).len();
+        let rows = self.database_body_rows(self.viewport_height);
+        self.database_detail_offset = clamp_detail_offset(self.database_detail_offset, total, rows);
+    }
+
+    /// Scroll the details column by `delta` wrapped lines.
+    fn scroll_database_details(&mut self, delta: isize) {
+        let (_, _, width) = self.database_layout(self.viewport_width);
+        let total = self.database_detail_lines(width).len();
+        let rows = self.database_body_rows(self.viewport_height);
+        self.database_detail_offset =
+            move_detail_offset(self.database_detail_offset, total, rows, delta);
+    }
+
     fn select_first_database_category(&mut self) {
         self.set_database_category(0);
     }
@@ -1084,14 +1164,17 @@ impl App {
         self.set_database_category(count.saturating_sub(1));
     }
 
-    fn focus_database_pane(&mut self, pane: DatabasePane) {
-        self.database_pane = pane;
+    /// Left/Right and h/l step through the panes and stop at either end.
+    fn shift_database_pane(&mut self, step: isize) {
+        self.database_pane = self.database_pane.shifted(step);
     }
 
-    fn toggle_database_pane(&mut self) {
-        self.database_pane = match self.database_pane {
-            DatabasePane::Tree => DatabasePane::Objects,
-            DatabasePane::Objects => DatabasePane::Tree,
+    /// Tab and Shift-Tab cycle through the panes.
+    fn toggle_database_pane(&mut self, forward: bool) {
+        self.database_pane = if forward {
+            self.database_pane.cycled()
+        } else {
+            self.database_pane.cycled_back()
         };
     }
 
@@ -1100,6 +1183,7 @@ impl App {
         match self.database_pane {
             DatabasePane::Tree => self.move_database_category(delta),
             DatabasePane::Objects => self.move_database_object(delta),
+            DatabasePane::Details => self.scroll_database_details(delta),
         }
     }
 
@@ -1107,6 +1191,7 @@ impl App {
         match self.database_pane {
             DatabasePane::Tree => self.select_first_database_category(),
             DatabasePane::Objects => self.select_first_database_object(),
+            DatabasePane::Details => self.database_detail_offset = 0,
         }
     }
 
@@ -1114,15 +1199,18 @@ impl App {
         match self.database_pane {
             DatabasePane::Tree => self.select_last_database_category(),
             DatabasePane::Objects => self.select_last_database_object(),
+            DatabasePane::Details => self.scroll_database_details(isize::MAX),
         }
     }
 
     /// Enter opens the object list from the tree and reports the object
-    /// selection from the object list, without moving focus.
+    /// selection from the object list, without moving focus. The details are
+    /// read-only, so Enter does not change anything there.
     fn activate_database_row(&mut self) {
         match self.database_pane {
             DatabasePane::Tree => self.database_pane = DatabasePane::Objects,
             DatabasePane::Objects => self.select_database_object(),
+            DatabasePane::Details => {}
         }
     }
 
@@ -1476,10 +1564,14 @@ impl App {
         let objects_start = left + 3;
         let details_start = objects_start + middle;
         if mouse.wheel != 0 {
-            if usize::from(mouse.column) < left {
+            let column = usize::from(mouse.column);
+            if column < left {
                 self.move_database_category(-isize::from(mouse.wheel));
-            } else {
+            } else if column < details_start {
                 self.move_database_object(-isize::from(mouse.wheel));
+            } else {
+                self.database_pane = DatabasePane::Details;
+                self.scroll_database_details(-isize::from(mouse.wheel));
             }
             return;
         }
@@ -1498,7 +1590,10 @@ impl App {
             let index = self.database_object_offset + row;
             if index < self.db_objects.len() {
                 self.database_object_selected = index;
+                self.database_detail_offset = 0;
             }
+        } else {
+            self.database_pane = DatabasePane::Details;
         }
     }
 
@@ -1534,8 +1629,9 @@ impl App {
     }
 
     fn scroll_help(&mut self, delta: isize) {
+        let rows = help_lines(self.viewport_width).len();
         let page = help_page_size(self.viewport_height);
-        let max_offset = HELP_ENTRIES.len().saturating_sub(page) as isize;
+        let max_offset = rows.saturating_sub(page) as isize;
         if let Some(help) = &mut self.help {
             help.offset = (help.offset as isize)
                 .saturating_add(delta)
@@ -1545,14 +1641,15 @@ impl App {
 
     fn handle_help_event(&mut self, event: InputEvent) {
         let page = help_page_size(self.viewport_height) as isize;
+        let rows = help_lines(self.viewport_width).len() as isize;
         match event {
             InputEvent::Char('?') | InputEvent::Char('q') | InputEvent::Esc => self.close_help(),
             InputEvent::Char('j') | InputEvent::Down => self.scroll_help(1),
             InputEvent::Char('k') | InputEvent::Up => self.scroll_help(-1),
             InputEvent::PageDown => self.scroll_help(page),
             InputEvent::PageUp => self.scroll_help(-page),
-            InputEvent::Home => self.scroll_help(-(HELP_ENTRIES.len() as isize)),
-            InputEvent::End => self.scroll_help(HELP_ENTRIES.len() as isize),
+            InputEvent::Home => self.scroll_help(-rows),
+            InputEvent::End => self.scroll_help(rows),
             InputEvent::Mouse(mouse) if mouse.wheel != 0 => {
                 self.scroll_help(-isize::from(mouse.wheel))
             }
@@ -1590,7 +1687,10 @@ impl App {
                 Mode::Messages => self.render_messages(&mut lines, width, height),
                 Mode::Detail => self.render_detail(&mut lines, width, height),
                 Mode::Curve => self.render_curve(&mut lines, width, height),
-                Mode::Databases => self.render_databases(&mut lines, width, height),
+                Mode::Databases => {
+                    self.clamp_database_detail_offset();
+                    self.render_databases(&mut lines, width, height);
+                }
             }
         }
         lines.push(paint("─".repeat(width), ANSI_BRIGHT_CYAN));
@@ -1637,7 +1737,8 @@ impl App {
 
     fn render_messages(&self, lines: &mut Vec<String>, width: usize, height: usize) {
         let indices = &self.filtered;
-        let split = (width * 43 / 100).max(24);
+        let split = (width * 43 / 100).max(24).min(width.saturating_sub(3));
+        let preview_width = width.saturating_sub(split + 3);
         lines.push(paint_bold(
             two_column(
                 &format!("Messages ({}/{})", indices.len(), self.summaries.len()),
@@ -1660,6 +1761,10 @@ impl App {
             .selected_summary()
             .map(|summary| summary_detail_lines(summary, self.selected_object()))
             .unwrap_or_else(|| vec!["No matching messages".to_string()]);
+        let preview = preview
+            .iter()
+            .flat_map(|line| wrap(line, preview_width))
+            .collect::<Vec<_>>();
         for row in 0..available {
             let message_index = self.list_offset + row;
             let selected = message_index == self.selected;
@@ -1692,15 +1797,27 @@ impl App {
             lines.push("No message selected".to_string());
             return;
         };
-        let split = (width * 43 / 100).max(24);
+        let split = (width * 43 / 100).max(24).min(width.saturating_sub(3));
+        let right_width = width.saturating_sub(split + 3);
         let mut left = summary_detail_lines(summary, self.selected_object());
         left.extend(timing_lines(self.timing.clone()));
-        let mut right = vec!["Signals".to_string()];
+        let left = left
+            .iter()
+            .flat_map(|line| wrap(line, split))
+            .collect::<Vec<_>>();
+        let mut right = vec![(None, "Signals".to_string())];
         if self.detail_rows.is_empty() {
-            right.push("  no decoded signals (bind a matching database with b)".to_string());
+            right.extend(
+                wrap(
+                    "  no decoded signals (bind a matching database with b)",
+                    right_width,
+                )
+                .into_iter()
+                .map(|line| (None, line)),
+            );
         }
         for (index, row) in self.detail_rows.iter().enumerate().skip(self.detail_offset) {
-            right.push(format!(
+            let text = format!(
                 "{}{} = {}",
                 if index == self.selected_signal {
                     "▶ "
@@ -1709,18 +1826,24 @@ impl App {
                 },
                 row.name,
                 row_display(row)
-            ));
+            );
+            right.extend(
+                wrap(&text, right_width)
+                    .into_iter()
+                    .map(|part| (Some(index), part)),
+            );
         }
         for row in 0..height.saturating_sub(5) {
+            let (signal, right_text) = right
+                .get(row)
+                .map_or((None, ""), |(index, text)| (*index, text.as_str()));
             let line = two_column(
                 left.get(row).map_or("", String::as_str),
-                right.get(row).map_or("", String::as_str),
+                right_text,
                 split,
                 width,
             );
-            let signal_selected = row > 0
-                && self.detail_offset + row - 1 == self.selected_signal
-                && self.detail_offset + row - 1 < self.detail_rows.len();
+            let signal_selected = signal == Some(self.selected_signal);
             lines.push(if signal_selected {
                 paint_selected(line)
             } else if row == 0 {
@@ -1772,10 +1895,14 @@ impl App {
     }
 
     fn render_databases(&self, lines: &mut Vec<String>, width: usize, height: usize) {
-        let (left, middle, _) = self.database_layout(width);
+        let (left, middle, right) = self.database_layout(width);
         let objects = &self.db_objects;
         let categories = self.database_categories();
         let selected_object = objects.get(self.database_object_selected);
+        let rows = self.database_body_rows(height);
+        let details = self.database_detail_lines(right);
+        let detail_total = details.len();
+        let detail_offset = clamp_detail_offset(self.database_detail_offset, detail_total, rows);
         let database_label = self
             .bindings
             .get(self.database_selected)
@@ -1797,11 +1924,18 @@ impl App {
                 .map_or("Objects", DbCategory::label),
             objects.len()
         );
-        let detail_header = selected_object.map_or("Details", |object| object.title.as_str());
+        // The selected object's title already sits in the object pane, so the
+        // details header reports where the scrollable column is instead.
+        let detail_header = if selected_object.is_some() && detail_total > 0 {
+            details_header_text(detail_offset, rows, detail_total, right)
+        } else {
+            "Details".to_string()
+        };
+        let details_focused = self.database_pane == DatabasePane::Details;
         lines.push(styled_three_column(
             (tree_header, pane_header_style(tree_focused)),
             (object_header.as_str(), pane_header_style(objects_focused)),
-            (detail_header, CellStyle::PaneHeaderIdle),
+            (detail_header.as_str(), pane_header_style(details_focused)),
             left,
             middle,
             width,
@@ -1815,7 +1949,6 @@ impl App {
             ),
             ANSI_CYAN,
         ));
-        let rows = height.saturating_sub(7).max(1);
         for row in 0..rows {
             let (tree_text, tree_style) = if row == 0 {
                 (format!(" {database_label}"), CellStyle::DatabaseHeader)
@@ -1863,9 +1996,11 @@ impl App {
             } else {
                 CellStyle::Normal
             };
-            let (detail_text, detail_style) = selected_object
-                .and_then(|object| object.details.get(row))
-                .map_or_else(|| (String::new(), CellStyle::Normal), DetailLine::render);
+            let (detail_text, detail_style) = details
+                .get(detail_offset + row)
+                .map_or((String::new(), CellStyle::Normal), |(text, style)| {
+                    (text.clone(), *style)
+                });
             lines.push(styled_three_column(
                 (&tree_text, tree_style),
                 (&object_text, object_style),
@@ -2403,19 +2538,7 @@ fn push_attribute_defaults(
     if defaults.is_empty() {
         return;
     }
-    let mut line = format!(
-        "defaults: {}",
-        defaults
-            .iter()
-            .take(MAX_DETAIL_ENTRIES)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    if defaults.len() > MAX_DETAIL_ENTRIES {
-        let _ = write!(line, ", … {} more", defaults.len() - MAX_DETAIL_ENTRIES);
-    }
-    details.push(DetailLine::note(line));
+    push_detail_list(details, "defaults", defaults);
 }
 
 /// One attributes block: the object's `BA_` assignments, each with its
@@ -2587,10 +2710,10 @@ fn dbc_message_details(database: &DbcDatabase, message: &blf_core::DbcMessage) -
             ),
             format!("DLC: {}  FD: {}", message.dlc, message.is_fd),
             format!("transmitter: {}", message.transmitter),
-            format!("receivers: {}", message_receivers(message).join(", ")),
             format!("payload: {:?}", message.payload_kind),
         ],
     );
+    push_detail_list(&mut details, "receivers", message_receivers(message));
     if let Some(comment) = &message.comment {
         details.push(DetailLine::note(format!("comment: {comment}")));
     }
@@ -2628,16 +2751,17 @@ fn dbc_signal_details(
         format!("range: {:?}..{:?}", signal.minimum, signal.maximum),
         format!("unit: {}", signal.unit.as_deref().unwrap_or("-")),
         format!("transmitter: {}", message.transmitter),
-        format!(
-            "receivers: {}",
-            union_names([signal.receivers.as_slice()]).join(", ")
-        ),
         format!("multiplex: {:?}", signal.multiplex),
     ];
     if !signal.choices.is_empty() {
         items.push(format!("choices: {}", value_table_text(&signal.choices)));
     }
     let mut details = detail_section("signal", items);
+    push_detail_list(
+        &mut details,
+        "receivers",
+        union_names([signal.receivers.as_slice()]),
+    );
     push_attributes(
         &mut details,
         database,
@@ -2675,18 +2799,18 @@ fn lin_frame_details(frame: &blf_core::LinFrame) -> Vec<DetailLine> {
         [
             format!("frame id: 0x{:02X}", frame.id),
             format!("DLC: {}  publisher: {}", frame.dlc, frame.publisher),
-            format!(
-                "subscribers: {}",
-                union_names(
-                    frame
-                        .signals
-                        .iter()
-                        .map(|signal| signal.subscribers.as_slice())
-                )
-                .join(", ")
-            ),
             format!("checksum: {:?}", frame.checksum),
         ],
+    );
+    push_detail_list(
+        &mut details,
+        "subscribers",
+        union_names(
+            frame
+                .signals
+                .iter()
+                .map(|signal| signal.subscribers.as_slice()),
+        ),
     );
     push_signal_lines(
         &mut details,
@@ -2718,10 +2842,6 @@ fn lin_signal_details(signal: &blf_core::LinSignal) -> Vec<DetailLine> {
             signal.start_bit, signal.bit_length
         ),
         format!("publisher: {}", signal.publisher.as_deref().unwrap_or("-")),
-        format!(
-            "subscribers: {}",
-            union_names([signal.subscribers.as_slice()]).join(", ")
-        ),
         format!("scale/offset: {} / {}", signal.factor, signal.offset),
         format!("range: {:?}..{:?}", signal.minimum, signal.maximum),
         format!("encoding: {}", signal.encoding.as_deref().unwrap_or("-")),
@@ -2729,7 +2849,13 @@ fn lin_signal_details(signal: &blf_core::LinSignal) -> Vec<DetailLine> {
     if !signal.choices.is_empty() {
         items.push(format!("choices: {}", value_table_text(&signal.choices)));
     }
-    detail_section("signal", items)
+    let mut details = detail_section("signal", items);
+    push_detail_list(
+        &mut details,
+        "subscribers",
+        union_names([signal.subscribers.as_slice()]),
+    );
+    details
 }
 
 fn value_table_text(table: &blf_core::ValueTable) -> String {
@@ -3487,12 +3613,15 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     binding("Esc", "back to the message detail"),
     binding("q", "quit"),
     heading("Databases"),
-    binding("j / Down", "next category or object"),
-    binding("k / Up", "previous category or object"),
+    binding("j / Down", "next category, object or detail line"),
+    binding("k / Up", "previous category, object or detail line"),
     binding("PageUp/PageDown", "move one screen in the focused pane"),
-    binding("Home / End", "first / last row in the focused pane"),
-    binding("Left/Right or h/l", "focus the tree or object pane"),
-    binding("Tab / Shift-Tab", "switch pane focus"),
+    binding("Home / End", "first / last row or detail line"),
+    binding(
+        "Left/Right or h/l",
+        "focus the tree, object or details pane",
+    ),
+    binding("Tab / Shift-Tab", "cycle the tree, objects and details"),
     binding("] / [", "next / previous database"),
     binding("/", "search objects"),
     binding("Enter", "focus objects or report the selection"),
@@ -3505,22 +3634,26 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     binding("Mouse", "click to select, wheel to scroll"),
 ];
 
-/// Render the help table for `width` cells as `(is_heading, line)` rows.
+/// Render the help table for `width` cells as `(is_heading, line)` rows. A
+/// description that does not fit wraps under its key instead of being cut.
 fn help_lines(width: usize) -> Vec<(bool, String)> {
     let split = HELP_KEY_WIDTH.min(width.saturating_sub(3));
-    HELP_ENTRIES
-        .iter()
-        .map(|entry| {
-            if entry.heading {
-                (true, entry.key.to_string())
-            } else {
-                (
-                    false,
-                    two_column(entry.key, entry.description, split, width),
-                )
-            }
-        })
-        .collect()
+    let description_width = width.saturating_sub(split + 3);
+    let mut lines = Vec::new();
+    for entry in HELP_ENTRIES {
+        if entry.heading {
+            lines.push((true, entry.key.to_string()));
+            continue;
+        }
+        for (index, part) in wrap(entry.description, description_width)
+            .into_iter()
+            .enumerate()
+        {
+            let key = if index == 0 { entry.key } else { "" };
+            lines.push((false, two_column(key, &part, split, width)));
+        }
+    }
+    lines
 }
 
 /// Rows of the help table that fit below the header and above the footer.
@@ -3872,6 +4005,97 @@ fn pad_to_width(value: &str, width: usize) -> String {
     padded
 }
 
+/// Wrap `text` into lines of at most `width` display cells.
+///
+/// Wide glyphs count as two cells, the break lands on a space when the current
+/// line has one, and a word longer than the width is split instead of dropped.
+/// Continuation lines repeat the leading indentation of `text`, so a wrapped
+/// detail item stays indented under its heading.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let indent = text
+        .chars()
+        .take_while(|character| *character == ' ')
+        .count();
+    // A continuation has to keep at least one cell for text, so a terminal
+    // narrower than the indentation drops it instead of losing the line.
+    let indent = if indent + 1 > width { 0 } else { indent };
+    let indent_text = " ".repeat(indent);
+    let limit = width - indent;
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut line_width = 0;
+    let mut last_space = None;
+    for character in text[indent..].chars() {
+        let cells = char_width(character);
+        if !line.is_empty() && line_width + cells > limit {
+            match last_space.take() {
+                // Break at the last space and keep the rest of the line.
+                Some((index, before)) => {
+                    lines.push(format!("{indent_text}{}", &line[..index]));
+                    line = line[index + 1..].to_string();
+                    line_width -= before + 1;
+                }
+                // A word longer than the line is split at the boundary.
+                None => {
+                    lines.push(format!("{indent_text}{line}"));
+                    line.clear();
+                    line_width = 0;
+                }
+            }
+        }
+        line.push(character);
+        line_width += cells;
+        if character == ' ' {
+            last_space = Some((line.len() - 1, line_width - 1));
+        }
+    }
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(format!("{indent_text}{line}"));
+    }
+    lines
+}
+
+/// Clamp a detail-column line offset so the last page stays full instead of
+/// scrolling past the end of the wrapped content.
+fn clamp_detail_offset(offset: usize, total: usize, rows: usize) -> usize {
+    offset.min(total.saturating_sub(rows.max(1)))
+}
+
+/// Move a detail-column line offset by `delta` and keep it inside the content.
+fn move_detail_offset(offset: usize, total: usize, rows: usize, delta: isize) -> usize {
+    let moved = (offset as isize).saturating_add(delta).max(0) as usize;
+    clamp_detail_offset(moved, total, rows)
+}
+
+/// The visible line range written into the details header.
+fn detail_range_label(offset: usize, rows: usize, total: usize) -> String {
+    let first = if total == 0 { 0 } else { offset.min(total) + 1 };
+    let last = (offset + rows).min(total);
+    format!("lines {first}-{last} of {total}")
+}
+
+/// The details header for a `width`-cell column. The full label is used when
+/// it fits and a shorter range when the column is narrow, so the header never
+/// ends in a cut-off range.
+fn details_header_text(offset: usize, rows: usize, total: usize, width: usize) -> String {
+    let first = if total == 0 { 0 } else { offset.min(total) + 1 };
+    let last = (offset + rows).min(total);
+    let full = format!("Details  lines {first}-{last} of {total}");
+    if display_width(&full) <= width {
+        return full;
+    }
+    let range = detail_range_label(offset, rows, total);
+    if display_width(&range) <= width {
+        return range;
+    }
+    let compact = format!("{first}-{last}/{total}");
+    if display_width(&compact) <= width {
+        return compact;
+    }
+    take_width(&full, width)
+}
+
 fn two_column(left: &str, right: &str, split: usize, width: usize) -> String {
     let split = split.min(width.saturating_sub(3));
     format!(
@@ -3973,6 +4197,14 @@ mod tests {
 
     fn detail_texts(details: &[DetailLine]) -> Vec<&str> {
         details.iter().map(DetailLine::text).collect()
+    }
+
+    /// The details header cell of a rendered database-browser line.
+    fn details_header_cell(line: &str) -> String {
+        strip_ansi(line)
+            .rsplit_once(" │ ")
+            .map(|(_, right)| right.trim_end().to_string())
+            .unwrap_or_default()
     }
 
     fn find_detail(details: &[DetailLine], expected: &str) -> usize {
@@ -4121,6 +4353,11 @@ Schedule_tables {
 
     /// A real `App` over an empty but valid trace, with one CAN database bound.
     fn test_database_app() -> App {
+        test_database_app_for(TEST_DBC)
+    }
+
+    /// The same app with a caller-supplied DBC source.
+    fn test_database_app_for(source: &str) -> App {
         let path = unique_temp_path("blf");
         let mut statistics = vec![0_u8; 144];
         statistics[0..4].copy_from_slice(&blf_core::FILE_SIGNATURE.to_le_bytes());
@@ -4132,7 +4369,7 @@ Schedule_tables {
         let mut app = App::open(path.clone(), Vec::new()).expect("open empty test trace");
         std::fs::remove_file(&path).ok();
 
-        app.bindings.push(database_entry(TEST_DBC));
+        app.bindings.push(database_entry(source));
         app.enter_databases();
         app
     }
@@ -4437,7 +4674,11 @@ Schedule_tables {
         let database = DbcDatabase::from_str(TEST_DBC).expect("parse test DBC");
         let details = dbc_message_details(&database, &message);
         let transmitter = find_detail(&details, "transmitter: BCM");
-        assert_eq!(details[transmitter + 1].text(), "receivers: TCM, Gateway");
+        // The receivers follow the transmitter as one name per line.
+        let receivers = find_detail(&details, "receivers: 2");
+        assert!(receivers > transmitter);
+        assert_eq!(details[receivers + 1].text(), "TCM");
+        assert_eq!(details[receivers + 2].text(), "Gateway");
         assert_eq!(
             detail_texts(&details)
                 .iter()
@@ -4481,7 +4722,10 @@ Schedule_tables {
         let database = DbcDatabase::from_str(TEST_DBC).expect("parse test DBC");
         let details = dbc_signal_details(&database, &message, &message.signals[0]);
         let transmitter = find_detail(&details, "transmitter: BCM");
-        assert_eq!(details[transmitter + 1].text(), "receivers: TCM, Gateway");
+        let receivers = find_detail(&details, "receivers: 2");
+        assert!(receivers > transmitter);
+        assert_eq!(details[receivers + 1].text(), "TCM");
+        assert_eq!(details[receivers + 2].text(), "Gateway");
         assert_eq!(
             detail_texts(&details)
                 .iter()
@@ -4530,7 +4774,10 @@ Schedule_tables {
 
         let details = lin_frame_details(&frame);
         let publisher = find_detail(&details, "DLC: 8  publisher: BCM");
-        assert_eq!(details[publisher + 1].text(), "subscribers: TCM, Gateway");
+        let subscribers = find_detail(&details, "subscribers: 2");
+        assert!(subscribers > publisher);
+        assert_eq!(details[subscribers + 1].text(), "TCM");
+        assert_eq!(details[subscribers + 2].text(), "Gateway");
     }
 
     #[test]
@@ -4562,7 +4809,10 @@ Schedule_tables {
 
         let details = lin_signal_details(&signal);
         let publisher = find_detail(&details, "publisher: BCM");
-        assert_eq!(details[publisher + 1].text(), "subscribers: TCM, Gateway");
+        let subscribers = find_detail(&details, "subscribers: 2");
+        assert!(subscribers > publisher);
+        assert_eq!(details[subscribers + 1].text(), "TCM");
+        assert_eq!(details[subscribers + 2].text(), "Gateway");
         assert!(detail_texts(&details)
             .iter()
             .all(|line| !line.contains("Vector__XXX")));
@@ -4685,22 +4935,26 @@ Schedule_tables {
 
         assert!(texts.contains(&"attributes: 1"));
         assert!(texts.contains(&"GenMsgCycleTime = 100 (INT 2..50000, default 2)"));
-        let defaults = details
-            .iter()
-            .find(|line| line.text().starts_with("defaults: "))
-            .expect("defaults note");
-        assert!(matches!(defaults, DetailLine::Note(_)));
-        assert_eq!(
-            defaults.text(),
-            "defaults: GenMsgDelayTime=1, GenMsgFastOnStart=0, GenMsgILSupport=Yes"
-        );
+        let defaults = find_detail(&details, "defaults: 3");
+        assert_eq!(details[defaults + 1].text(), "GenMsgDelayTime=1");
+        assert_eq!(details[defaults + 2].text(), "GenMsgFastOnStart=0");
+        assert_eq!(details[defaults + 3].text(), "GenMsgILSupport=Yes");
         // The assigned attribute is not repeated, and other scopes stay out.
-        assert!(!defaults.text().contains("GenMsgCycleTime="));
-        assert!(!defaults.text().contains("GenSigStartValue"));
+        let defaults_text = details[defaults..]
+            .iter()
+            .map(DetailLine::text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!defaults_text.contains("GenMsgCycleTime="));
+        assert!(!defaults_text.contains("GenSigStartValue"));
 
         // The signal scope has its own default, which is not assigned here.
         let signal_details = dbc_signal_details(&database, message, &message.signals[0]);
-        assert!(detail_texts(&signal_details).contains(&"defaults: GenSigStartValue=0"));
+        let signal_defaults = find_detail(&signal_details, "defaults: 1");
+        assert_eq!(
+            signal_details[signal_defaults + 1].text(),
+            "GenSigStartValue=0"
+        );
     }
 
     #[test]
@@ -4729,14 +4983,19 @@ Schedule_tables {
         let database = DbcDatabase::from_str(&source).expect("parse generated defaults");
         let message = database.messages().next().expect("message");
         let details = dbc_message_details(&database, message);
-        let defaults = details
-            .iter()
-            .find(|line| line.text().starts_with("defaults: "))
-            .expect("defaults note");
+        let defaults = find_detail(&details, &format!("defaults: {}", MAX_DETAIL_ENTRIES + 2));
 
-        assert!(defaults.text().starts_with("defaults: Attr00=0, Attr01=0"));
-        assert!(defaults.text().ends_with(", … 2 more"));
-        assert_eq!(defaults.text().matches("Attr").count(), MAX_DETAIL_ENTRIES);
+        // Definitions are ordered by name, so only the guard boundary matters.
+        assert_eq!(details[defaults + 1].text(), "Attr00=0");
+        let listed = details[defaults + 1..=defaults + MAX_DETAIL_ENTRIES]
+            .iter()
+            .filter(|line| matches!(line, DetailLine::Item(_)))
+            .count();
+        assert_eq!(listed, MAX_DETAIL_ENTRIES);
+        assert_eq!(
+            details[defaults + MAX_DETAIL_ENTRIES + 1].text(),
+            "… 2 more"
+        );
     }
 
     #[test]
@@ -4839,6 +5098,313 @@ Schedule_tables {
             .iter()
             .map(|line| strip_ansi(line))
             .any(|line| line.contains("messages sent: 2")));
+    }
+
+    /// A DBC whose message details are longer than one 80x24 details column and
+    /// whose attribute value and comment are wider than that column.
+    const LONG_DETAIL_DBC: &str = r#"
+VERSION "1.0"
+BU_: BCM TCM
+
+BO_ 256 VehicleStatus: 8 BCM
+ SG_ VehicleSpeed : 0|16@1+ (0.01,0) [0|655.35] "km/h" TCM
+ SG_ EngineSpeed : 16|16@1+ (0.25,0) [0|16383.75] "rpm" TCM
+ SG_ GearPosition : 32|8@1+ (1,0) [0|15] "" TCM
+ SG_ BrakePressure : 40|8@1+ (1,0) [0|255] "bar" TCM
+ SG_ SteeringAngle : 48|8@1+ (1,0) [-128|127] "deg" TCM
+
+BA_DEF_ BO_ "GenMsgSendType" STRING ;
+BA_DEF_DEF_ "GenMsgSendType" "";
+BA_ "GenMsgSendType" BO_ 256 "Cyclic, Spontaneous, IfActive, OnChange, OnWrite, OnRead, IfActiveAndOnChange, IfActiveAndOnRead";
+CM_ BO_ 256 "A long comment that names every receiver and explains when the frame is sent on the bus.";
+"#;
+
+    #[test]
+    fn details_offset_keeps_up_with_a_resized_column() {
+        let mut app = test_database_app();
+        app.viewport_width = 80;
+        app.viewport_height = 24;
+        app.set_database_category(1);
+        app.database_object_selected = 0;
+        app.database_pane = DatabasePane::Details;
+        app.handle_event(InputEvent::End).unwrap();
+        let narrow = app.database_detail_offset;
+        assert!(narrow > 0);
+
+        // A wider terminal wraps the same details into fewer lines.
+        app.viewport_width = 200;
+        let (_, _, width) = app.database_layout(200);
+        let total = app.database_detail_lines(width).len();
+        let rows = app.database_body_rows(24);
+        assert!(total.saturating_sub(rows) < narrow);
+        app.clamp_database_detail_offset();
+        assert_eq!(app.database_detail_offset, total.saturating_sub(rows));
+    }
+
+    #[test]
+    fn wrap_breaks_plain_text_on_spaces_and_splits_long_words() {
+        assert_eq!(wrap("alpha beta gamma", 11), ["alpha beta", "gamma"]);
+        assert_eq!(wrap("abcdefghij", 4), ["abcd", "efgh", "ij"]);
+        assert_eq!(wrap("", 10), [""]);
+        // A word longer than the line is split instead of being cut.
+        assert_eq!(wrap("abcdefgh", 3), ["abc", "def", "gh"]);
+        for line in wrap("alpha beta gamma delta", 7) {
+            assert!(display_width(&line) <= 7, "line too wide: {line}");
+        }
+    }
+
+    #[test]
+    fn wrap_counts_wide_glyphs_and_keeps_continuation_indentation() {
+        // Two CJK glyphs are four cells, so only one fits a four-cell column.
+        assert_eq!(wrap("信号曲线", 4), ["信号", "曲线"]);
+        // Continuation lines repeat the indentation of the wrapped line.
+        assert_eq!(wrap("  信号 曲线 字", 7), ["  信号", "  曲线", "  字"]);
+        assert_eq!(wrap("  abcdefgh", 6), ["  abcd", "  efgh"]);
+        for line in wrap("  信号 曲线 字", 7) {
+            assert!(display_width(&line) <= 7, "line too wide: {line}");
+        }
+    }
+
+    #[test]
+    fn detail_offsets_clamp_to_the_wrapped_content() {
+        assert_eq!(clamp_detail_offset(0, 41, 18), 0);
+        assert_eq!(clamp_detail_offset(5, 41, 18), 5);
+        assert_eq!(clamp_detail_offset(100, 41, 18), 23);
+        assert_eq!(clamp_detail_offset(usize::MAX, 41, 18), 23);
+        // Content shorter than one page cannot scroll.
+        assert_eq!(clamp_detail_offset(5, 10, 18), 0);
+        assert_eq!(clamp_detail_offset(5, 0, 18), 0);
+        assert_eq!(move_detail_offset(20, 41, 18, 5), 23);
+        assert_eq!(move_detail_offset(0, 41, 18, -5), 0);
+    }
+
+    #[test]
+    fn detail_range_label_names_the_visible_lines() {
+        assert_eq!(detail_range_label(0, 18, 41), "lines 1-18 of 41");
+        assert_eq!(detail_range_label(23, 18, 41), "lines 24-41 of 41");
+        assert_eq!(detail_range_label(0, 18, 0), "lines 0-0 of 0");
+    }
+
+    #[test]
+    fn details_pane_cycles_and_scrolls_wrapped_lines() {
+        let mut app = test_database_app();
+        app.viewport_width = 80;
+        app.viewport_height = 24;
+        app.set_database_category(1);
+        app.database_object_selected = 0;
+        let (_, _, width) = app.database_layout(80);
+        let total = app.database_detail_lines(width).len();
+        let rows = app.database_body_rows(24);
+        assert!(total > rows, "fixture details should overflow the pane");
+
+        // Tab cycles Tree -> Objects -> Details -> Tree, Shift-Tab reverses it.
+        assert_eq!(app.database_pane, DatabasePane::Tree);
+        app.handle_event(InputEvent::Tab).unwrap();
+        assert_eq!(app.database_pane, DatabasePane::Objects);
+        app.handle_event(InputEvent::Tab).unwrap();
+        assert_eq!(app.database_pane, DatabasePane::Details);
+        app.handle_event(InputEvent::Tab).unwrap();
+        assert_eq!(app.database_pane, DatabasePane::Tree);
+        app.handle_event(InputEvent::BackTab).unwrap();
+        assert_eq!(app.database_pane, DatabasePane::Details);
+
+        // Up/Down scroll by one wrapped line and clamp at both ends.
+        app.handle_event(InputEvent::Down).unwrap();
+        assert_eq!(app.database_detail_offset, 1);
+        app.handle_event(InputEvent::End).unwrap();
+        assert_eq!(app.database_detail_offset, total - rows);
+        app.handle_event(InputEvent::Down).unwrap();
+        assert_eq!(app.database_detail_offset, total - rows);
+        app.handle_event(InputEvent::Home).unwrap();
+        assert_eq!(app.database_detail_offset, 0);
+        app.handle_event(InputEvent::PageDown).unwrap();
+        assert_eq!(
+            app.database_detail_offset,
+            clamp_detail_offset(app.page_step() as usize, total, rows)
+        );
+        assert_eq!(app.page_step() as usize, rows);
+        app.handle_event(InputEvent::PageUp).unwrap();
+        assert_eq!(app.database_detail_offset, 0);
+
+        // Left/Right step through the three panes and stop at either end.
+        app.handle_event(InputEvent::Left).unwrap();
+        assert_eq!(app.database_pane, DatabasePane::Objects);
+        app.handle_event(InputEvent::Left).unwrap();
+        assert_eq!(app.database_pane, DatabasePane::Tree);
+        app.handle_event(InputEvent::Left).unwrap();
+        assert_eq!(app.database_pane, DatabasePane::Tree);
+        app.handle_event(InputEvent::Right).unwrap();
+        app.handle_event(InputEvent::Right).unwrap();
+        assert_eq!(app.database_pane, DatabasePane::Details);
+    }
+
+    #[test]
+    fn details_scroll_resets_when_the_selected_object_changes() {
+        let mut app = test_database_app();
+        app.viewport_width = 80;
+        app.viewport_height = 24;
+        app.set_database_category(1);
+        app.database_object_selected = 0;
+        app.database_pane = DatabasePane::Details;
+        app.handle_event(InputEvent::End).unwrap();
+        assert!(app.database_detail_offset > 0);
+
+        // The object list owns the selection, so moving it resets the scroll.
+        app.handle_event(InputEvent::Left).unwrap();
+        assert_eq!(app.database_pane, DatabasePane::Objects);
+        app.handle_event(InputEvent::Down).unwrap();
+        assert_eq!(app.database_object_selected, 1);
+        assert_eq!(app.database_detail_offset, 0);
+
+        // Scrolling again, then picking another object with the mouse resets it.
+        app.handle_event(InputEvent::Up).unwrap();
+        assert_eq!(app.database_object_selected, 0);
+        app.database_pane = DatabasePane::Details;
+        app.handle_event(InputEvent::End).unwrap();
+        assert!(app.database_detail_offset > 0);
+        let left = app.database_left_width() as u16;
+        app.handle_event(InputEvent::Mouse(MouseEvent {
+            button: 0,
+            column: left + 3,
+            row: LIST_FIRST_ROW + 1,
+            wheel: 0,
+            release: false,
+        }))
+        .unwrap();
+        assert_eq!(app.database_object_selected, 1);
+        assert_eq!(app.database_detail_offset, 0);
+    }
+
+    #[test]
+    fn details_header_reports_the_visible_line_range() {
+        let mut app = test_database_app();
+        app.viewport_width = 80;
+        app.viewport_height = 24;
+        app.set_database_category(1);
+        app.database_object_selected = 0;
+        let (_, _, width) = app.database_layout(80);
+        let total = app.database_detail_lines(width).len();
+        let rows = app.database_body_rows(24);
+
+        // 80 columns leave a narrow details column, so the range is shortened
+        // instead of being cut off.
+        let mut lines = Vec::new();
+        app.render_databases(&mut lines, 80, 24);
+        let header = details_header_cell(&lines[0]);
+        assert_eq!(header, details_header_text(0, rows, total, width));
+        assert_eq!(header, format!("lines 1-{} of {total}", rows.min(total)));
+
+        // A wide column has room for the full label.
+        let (_, _, wide_width) = app.database_layout(160);
+        let wide_total = app.database_detail_lines(wide_width).len();
+        let mut lines = Vec::new();
+        app.render_databases(&mut lines, 160, 24);
+        let header = details_header_cell(&lines[0]);
+        assert_eq!(
+            header,
+            format!("Details  lines 1-{} of {wide_total}", rows.min(wide_total))
+        );
+
+        // Scrolling to the end moves the reported range with it.
+        app.database_pane = DatabasePane::Details;
+        app.handle_event(InputEvent::End).unwrap();
+        let mut lines = Vec::new();
+        app.render_databases(&mut lines, 80, 24);
+        let header = details_header_cell(&lines[0]);
+        assert_eq!(
+            header,
+            details_header_text(total - rows, rows, total, width)
+        );
+        assert_eq!(
+            header,
+            format!("lines {}-{total} of {total}", total - rows + 1)
+        );
+    }
+
+    #[test]
+    fn long_detail_values_are_reachable_by_wrapping() {
+        let mut app = test_database_app_for(LONG_DETAIL_DBC);
+        app.viewport_width = 80;
+        app.viewport_height = 24;
+        app.set_database_category(1);
+        app.database_object_selected = 0;
+        let (_, _, width) = app.database_layout(80);
+        let details = app.database_detail_lines(width);
+        assert!(details.len() > app.database_body_rows(24));
+
+        for (text, _) in &details {
+            assert!(
+                display_width(text) <= width,
+                "detail line too wide for {width} cells: {text}"
+            );
+        }
+        // Spaces at a wrap and a long word split across lines both disappear
+        // once the whitespace is squeezed out, so the text stays intact.
+        let combined = details
+            .iter()
+            .map(|(text, _)| text.trim())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<String>();
+        assert!(
+            combined.contains(
+                "Cyclic,Spontaneous,IfActive,OnChange,OnWrite,OnRead,IfActiveAndOnChange,IfActiveAndOnRead"
+            ),
+            "attribute value lost: {combined}"
+        );
+        assert!(
+            combined.contains(
+                "Alongcommentthatnameseveryreceiverandexplainswhentheframeissentonthebus."
+            ),
+            "comment lost: {combined}"
+        );
+        assert!(!combined.contains("..."));
+    }
+
+    #[test]
+    fn long_data_line_wraps_in_the_message_preview() {
+        let mut app = App::new(None, Vec::new(), Vec::new()).expect("build app");
+        app.mode = Mode::Messages;
+        app.viewport_width = 80;
+        app.viewport_height = 24;
+        let payload: Vec<u8> = (0u8..32).collect();
+        app.summaries.push(MessageSummary {
+            object_index: 0,
+            timestamp_ns: Some(1_000_000_000),
+            timestamp_source: None,
+            bus: Some(BusKind::Can),
+            channel: Some(1),
+            frame_id: Some(0x123),
+            object_type_raw: 1,
+            class_name: "CAN_MESSAGE",
+            direction: Some("Rx"),
+            dlc: Some(8),
+            payload: payload.clone(),
+            status: "ok",
+        });
+        app.filtered = vec![0];
+        app.selected = 0;
+
+        let mut lines = Vec::new();
+        app.render_messages(&mut lines, 80, 24);
+        // Strip the message list column so only the preview text remains.
+        let preview = lines
+            .iter()
+            .filter_map(|line| {
+                strip_ansi(line)
+                    .rsplit_once(" │ ")
+                    .map(|(_, right)| right.trim_end().to_string())
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        let preview = preview.split_whitespace().collect::<Vec<_>>().join(" ");
+        let data = format!("data: {}", hex_bytes(&payload));
+        assert!(
+            preview.contains(&data),
+            "data line lost from the preview: {preview}"
+        );
+        assert!(!preview.contains("..."));
     }
 
     #[test]
@@ -5113,8 +5679,8 @@ Schedule_tables {
             "open or close this help",
             "jump by trace time",
             "next / previous database",
-            "focus the tree or object pane",
-            "switch pane focus",
+            "focus the tree, object or details pane",
+            "cycle the tree, objects and details",
             "focus objects or report the selection",
             "open the selected message",
             "wheel to scroll",
@@ -5139,7 +5705,10 @@ Schedule_tables {
 
     #[test]
     fn help_scrolls_instead_of_truncating() {
-        let total = HELP_ENTRIES.len();
+        // At 80 columns every description fits its row, so one row per entry.
+        let entries = help_lines(80);
+        let total = entries.len();
+        assert_eq!(total, HELP_ENTRIES.len());
         let page = help_page_size(24);
         assert!(total > page, "help should overflow an 80x24 terminal");
         assert_eq!(clamp_help_offset(0, total, page), 0);
@@ -5147,11 +5716,31 @@ Schedule_tables {
         assert_eq!(clamp_help_offset(total, total, page), total - page);
 
         // Scrolling to the end keeps the global keys reachable.
-        let entries = help_lines(80);
         let offset = clamp_help_offset(usize::MAX, total, page);
         let visible = &entries[offset..(offset + page).min(total)];
         assert_eq!(visible.len(), page);
         assert!(visible.iter().any(|(_, line)| line.contains("Ctrl-C")));
+    }
+
+    #[test]
+    fn help_wraps_descriptions_in_a_narrow_terminal() {
+        let lines = help_lines(40);
+        assert!(lines.len() > HELP_ENTRIES.len());
+        for (_, line) in &lines {
+            assert!(display_width(line) <= 40, "help line too wide: {line}");
+            assert!(!line.contains("..."), "help line cut: {line}");
+        }
+        let squeezed = lines
+            .iter()
+            .filter_map(|(_, line)| line.rsplit_once(" │ ").map(|(_, right)| right))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<String>();
+        assert!(
+            squeezed.contains("focusthetree,objectordetailspane"),
+            "wrapped description lost: {squeezed}"
+        );
     }
 
     #[test]
