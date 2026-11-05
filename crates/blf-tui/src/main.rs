@@ -24,6 +24,8 @@ const MAX_CURVE_SAMPLES: usize = 200_000;
 const LIST_FIRST_ROW: u16 = HEADER_ROWS + 2;
 /// First detail row: the header block plus the detail section title.
 const DETAIL_FIRST_ROW: u16 = HEADER_ROWS + 1;
+/// Status for a trace-only action in a database-only session.
+const NO_TRACE_STATUS: &str = "No trace loaded";
 
 // Match the vivid ANSI palette used by the other terminal tools in this workspace.
 const ANSI_RESET: &str = "\x1b[0m";
@@ -56,6 +58,14 @@ struct BindingEntry {
 }
 
 type BindingSpec = (BusKind, u16, PathBuf);
+
+/// The BLF trace backing the message-oriented modes. Database-only launches
+/// hold `None`, so no trace-derived state exists at all.
+struct Trace {
+    path: PathBuf,
+    reader: File,
+    skipped_objects: u64,
+}
 
 #[derive(Debug, Clone)]
 struct MessageSummary {
@@ -291,11 +301,9 @@ impl LoadProgress {
 }
 
 struct App {
-    path: PathBuf,
-    reader: File,
+    trace: Option<Trace>,
     objects: Vec<Object>,
     summaries: Vec<MessageSummary>,
-    skipped_objects: u64,
     bindings: Vec<BindingEntry>,
     mode: Mode,
     input: Option<InputKind>,
@@ -348,20 +356,38 @@ impl App {
             progress.report(objects.len());
         }
         progress.clear();
+        let trace = Trace {
+            path,
+            skipped_objects: reader.skipped_object_count,
+            reader,
+        };
+        Self::new(Some(trace), objects, specs)
+    }
 
+    /// `vector-log-tui --dbc … [--ldf …]`: browse databases with no trace.
+    /// The message, detail and curve modes stay empty and unreachable.
+    fn open_databases(specs: Vec<(BusKind, u16, PathBuf)>) -> Result<Self, String> {
+        if specs.is_empty() {
+            return Err(usage());
+        }
+        Self::new(None, Vec::new(), specs)
+    }
+
+    fn new(
+        trace: Option<Trace>,
+        objects: Vec<Object>,
+        specs: Vec<(BusKind, u16, PathBuf)>,
+    ) -> Result<Self, String> {
         let summaries = objects
             .iter()
             .enumerate()
             .map(|(object_index, object)| summary_for(object_index, object))
             .collect::<Vec<_>>();
         let filtered = (0..summaries.len()).collect::<Vec<_>>();
-        let skipped_objects = reader.skipped_object_count;
         let mut app = Self {
-            path,
-            reader,
+            trace,
             objects,
             summaries,
-            skipped_objects,
             bindings: Vec::new(),
             mode: Mode::Messages,
             input: None,
@@ -393,7 +419,33 @@ impl App {
         for (bus, channel, database_path) in specs {
             app.bind_database(bus, channel, database_path)?;
         }
+        if !app.has_trace() {
+            app.enter_databases();
+        }
         Ok(app)
+    }
+
+    fn has_trace(&self) -> bool {
+        self.trace.is_some()
+    }
+
+    /// First header line: the trace, or its absence, plus the active mode.
+    fn title_line(&self) -> String {
+        match &self.trace {
+            Some(trace) => format!(
+                " vector-log-tui  {}  objects={}/{}  skipped={}  mode={:?}",
+                trace.path.display(),
+                self.filtered.len(),
+                self.summaries.len(),
+                trace.skipped_objects,
+                self.mode
+            ),
+            None => format!(
+                " vector-log-tui  (no trace)  databases={}  mode={:?}",
+                self.bindings.len(),
+                self.mode
+            ),
+        }
     }
 
     fn run(&mut self) -> Result<(), String> {
@@ -504,7 +556,18 @@ impl App {
                 InputEvent::Enter => self.activate_database_row(),
                 InputEvent::Char('b') => self.start_input(InputKind::Binding),
                 InputEvent::Char('?') => self.open_help(),
-                InputEvent::Esc => self.mode = Mode::Messages,
+                // `p`, `e`, `g` and `G` all act on the trace; a database-only
+                // session explains why they do nothing instead of staying silent.
+                InputEvent::Char('p' | 'e' | 'g' | 'G') if self.trace.is_none() => {
+                    self.status = NO_TRACE_STATUS.to_string();
+                }
+                InputEvent::Esc => {
+                    if self.has_trace() {
+                        self.mode = Mode::Messages;
+                    } else {
+                        self.status = NO_TRACE_STATUS.to_string();
+                    }
+                }
                 InputEvent::Mouse(mouse) => self.handle_database_mouse(mouse),
                 _ => {}
             },
@@ -1115,6 +1178,10 @@ impl App {
     }
 
     fn enter_detail(&mut self) {
+        if self.trace.is_none() {
+            self.status = NO_TRACE_STATUS.to_string();
+            return;
+        }
         if self.selected_summary().is_none() {
             return;
         }
@@ -1160,7 +1227,11 @@ impl App {
     /// Write the filtered messages, with their decoded signals, to a CSV
     /// next to the trace so a bench report can quote real numbers.
     fn export_csv(&mut self) {
-        let path = export_path(&self.path);
+        let Some(trace) = &self.trace else {
+            self.status = NO_TRACE_STATUS.to_string();
+            return;
+        };
+        let path = export_path(&trace.path);
         match self.write_csv(&path) {
             Ok((rows, signals)) => {
                 self.status = format!(
@@ -1250,6 +1321,10 @@ impl App {
     }
 
     fn open_curve(&mut self) {
+        if self.trace.is_none() {
+            self.status = NO_TRACE_STATUS.to_string();
+            return;
+        }
         if self.mode == Mode::Messages {
             self.enter_detail();
         }
@@ -1274,7 +1349,10 @@ impl App {
             &row.name,
             &self.objects[summary.object_index],
         );
-        let query = match self
+        let Some(trace) = &self.trace else {
+            return;
+        };
+        let query = match trace
             .reader
             .signal_query(binding, signal_name.clone(), false)
         {
@@ -1483,18 +1561,7 @@ impl App {
         let width = self.viewport_width;
         let height = self.viewport_height;
         let mut lines = Vec::new();
-        let filtered_count = self.filtered.len();
-        lines.push(paint_bold(
-            format!(
-                " vector-log-tui  {}  objects={}/{}  skipped={}  mode={:?}",
-                self.path.display(),
-                filtered_count,
-                self.summaries.len(),
-                self.skipped_objects,
-                self.mode
-            ),
-            ANSI_BRIGHT_CYAN,
-        ));
+        lines.push(paint_bold(self.title_line(), ANSI_BRIGHT_CYAN));
         let databases = if self.bindings.is_empty() {
             "none".to_string()
         } else {
@@ -2142,7 +2209,11 @@ fn dbc_signal_details(message: &blf_core::DbcMessage, signal: &blf_core::CanSign
         format!("scale/offset: {} / {}", signal.factor, signal.offset),
         format!("range: {:?}..{:?}", signal.minimum, signal.maximum),
         format!("unit: {}", signal.unit.as_deref().unwrap_or("-")),
-        format!("receivers: {}", signal.receivers.join(", ")),
+        format!("transmitter: {}", message.transmitter),
+        format!(
+            "receivers: {}",
+            union_names([signal.receivers.as_slice()]).join(", ")
+        ),
         format!("multiplex: {:?}", signal.multiplex),
     ];
     if !signal.choices.is_empty() {
@@ -2203,7 +2274,10 @@ fn lin_signal_details(signal: &blf_core::LinSignal) -> Vec<String> {
             signal.start_bit, signal.bit_length
         ),
         format!("publisher: {}", signal.publisher.as_deref().unwrap_or("-")),
-        format!("subscribers: {}", signal.subscribers.join(", ")),
+        format!(
+            "subscribers: {}",
+            union_names([signal.subscribers.as_slice()]).join(", ")
+        ),
         format!("scale/offset: {} / {}", signal.factor, signal.offset),
         format!("range: {:?}..{:?}", signal.minimum, signal.maximum),
         format!("encoding: {}", signal.encoding.as_deref().unwrap_or("-")),
@@ -2935,7 +3009,7 @@ const fn binding(key: &'static str, description: &'static str) -> HelpEntry {
 
 /// Every binding, grouped by mode, with the global keys last.
 const HELP_ENTRIES: &[HelpEntry] = &[
-    heading("Messages"),
+    heading("Messages (needs a trace)"),
     binding("j / Down", "next message"),
     binding("k / Up", "previous message"),
     binding("PageUp/PageDown", "move one screen"),
@@ -2951,7 +3025,7 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     binding("] / [", "next / previous occurrence of the frame id"),
     binding("Esc", "clear the message filter"),
     binding("q", "quit"),
-    heading("Detail"),
+    heading("Detail (needs a trace)"),
     binding("j / Down", "next signal"),
     binding("k / Up", "previous signal"),
     binding("PageUp/PageDown", "move one screen"),
@@ -2961,7 +3035,7 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     binding("e", "export filtered messages to CSV"),
     binding("Esc / Left", "back to the message list"),
     binding("q", "quit"),
-    heading("Curve"),
+    heading("Curve (needs a trace)"),
     binding("Left / Right", "pan the sample window"),
     binding("+ / = / -", "zoom in / out"),
     binding("PageUp/PageDown", "zoom in / out"),
@@ -2979,7 +3053,7 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     binding("/", "search objects"),
     binding("Enter", "focus objects or report the selection"),
     binding("b", "bind a DBC or LDF database"),
-    binding("Esc", "back to the message list"),
+    binding("Esc", "back to the message list (trace only)"),
     binding("q", "quit"),
     heading("Global"),
     binding("Ctrl-C", "quit the viewer"),
@@ -3070,12 +3144,21 @@ fn field_u8(object: &blf_core::LinObject, name: &str) -> Option<u8> {
     })
 }
 
-fn parse_args(args: &[String]) -> Result<(PathBuf, Vec<BindingSpec>), String> {
-    let Some(path) = args.first() else {
-        return Err(usage());
+/// Parsed command line: an optional trace and every `--dbc`/`--ldf` binding.
+#[derive(Debug)]
+struct Args {
+    trace: Option<PathBuf>,
+    specs: Vec<BindingSpec>,
+}
+
+fn parse_args(args: &[String]) -> Result<Args, String> {
+    let (trace, mut index) = match args.first() {
+        None => return Err(usage()),
+        // Without a leading trace path the viewer still needs a database to browse.
+        Some(first) if first.starts_with("--") => (None, 0),
+        Some(trace) => (Some(PathBuf::from(trace)), 1),
     };
     let mut specs = Vec::new();
-    let mut index = 1;
     while index < args.len() {
         let option = args[index].as_str();
         let bus = match option {
@@ -3091,11 +3174,17 @@ fn parse_args(args: &[String]) -> Result<(PathBuf, Vec<BindingSpec>), String> {
         specs.push((bus, channel, PathBuf::from(database_path)));
         index += 2;
     }
-    Ok((PathBuf::from(path), specs))
+    if trace.is_none() && specs.is_empty() {
+        return Err(usage());
+    }
+    Ok(Args { trace, specs })
 }
 
 fn usage() -> String {
-    "usage: vector-log-tui TRACE.blf [--dbc CHANNEL=FILE] [--ldf CHANNEL=FILE]".to_string()
+    "usage: vector-log-tui TRACE.blf [--dbc CHANNEL=FILE] [--ldf CHANNEL=FILE]\n       \
+     vector-log-tui --dbc CHANNEL=FILE [--ldf CHANNEL=FILE] …\n       \
+     (without a trace, at least one --dbc/--ldf opens the database browser alone)"
+        .to_string()
 }
 
 fn split_first_word(value: &str) -> (&str, &str) {
@@ -3418,14 +3507,18 @@ fn main() {
         println!("{}", usage());
         return;
     }
-    let (path, specs) = match parse_args(&args) {
+    let args = match parse_args(&args) {
         Ok(value) => value,
         Err(error) => {
             eprintln!("{error}");
             return;
         }
     };
-    if let Err(error) = App::open(path, specs).and_then(|mut app| app.run()) {
+    let app = match args.trace {
+        Some(path) => App::open(path, args.specs),
+        None => App::open_databases(args.specs),
+    };
+    if let Err(error) = app.and_then(|mut app| app.run()) {
         eprintln!("vector-log-tui: {error}");
     }
 }
@@ -3471,16 +3564,21 @@ BO_ 294 AdasStatus: 8 ADAS
  SG_ TargetSpeed : 0|16@1+ (0.01,0) [0|655.35] "km/h" Gateway
 "#;
 
-    /// A real `App` over an empty but valid trace, with one CAN database bound.
-    fn test_database_app() -> App {
+    /// A process-wide unique path in the temp directory for a test fixture.
+    fn unique_temp_path(extension: &str) -> PathBuf {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "vector-log-tui-test-{}-{}.blf",
+        std::env::temp_dir().join(format!(
+            "vector-log-tui-test-{}-{}.{extension}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        ))
+    }
+
+    /// A real `App` over an empty but valid trace, with one CAN database bound.
+    fn test_database_app() -> App {
+        let path = unique_temp_path("blf");
         let mut statistics = vec![0_u8; 144];
         statistics[0..4].copy_from_slice(&blf_core::FILE_SIGNATURE.to_le_bytes());
         statistics[4..8].copy_from_slice(&144_u32.to_le_bytes());
@@ -3658,19 +3756,88 @@ BO_ 294 AdasStatus: 8 ADAS
     }
 
     #[test]
-    fn parses_database_bindings() {
-        let args = vec![
-            "trace.blf".to_string(),
-            "--dbc".to_string(),
-            "1=vehicle.dbc".to_string(),
-            "--ldf".to_string(),
-            "3=body.ldf".to_string(),
-        ];
-        let (path, specs) = parse_args(&args).unwrap();
-        assert_eq!(path, PathBuf::from("trace.blf"));
-        assert_eq!(specs.len(), 2);
-        assert_eq!(specs[0].0, BusKind::Can);
-        assert_eq!(specs[1].1, 3);
+    fn parses_no_arguments_as_a_usage_error() {
+        assert_eq!(parse_args(&[]).unwrap_err(), usage());
+    }
+
+    #[test]
+    fn parses_a_trace_followed_by_database_bindings() {
+        let args: Vec<String> = ["trace.blf", "--dbc", "1=vehicle.dbc", "--ldf", "3=body.ldf"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let parsed = parse_args(&args).unwrap();
+        assert_eq!(parsed.trace, Some(PathBuf::from("trace.blf")));
+        assert_eq!(parsed.specs.len(), 2);
+        assert_eq!(parsed.specs[0].0, BusKind::Can);
+        assert_eq!(parsed.specs[1].1, 3);
+    }
+
+    #[test]
+    fn parses_database_only_arguments_without_a_trace() {
+        let args: Vec<String> = ["--dbc", "1=vehicle.dbc", "--ldf", "3=body.ldf"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let parsed = parse_args(&args).unwrap();
+        assert_eq!(parsed.trace, None);
+        assert_eq!(parsed.specs.len(), 2);
+        assert_eq!(parsed.specs[0].0, BusKind::Can);
+        assert_eq!(parsed.specs[0].1, 1);
+        assert_eq!(parsed.specs[1].0, BusKind::Lin);
+        assert_eq!(parsed.specs[1].1, 3);
+    }
+
+    #[test]
+    fn requires_the_trace_to_be_the_first_argument() {
+        let args: Vec<String> = ["--dbc", "1=vehicle.dbc", "trace.blf"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(parse_args(&args).unwrap_err(), usage());
+    }
+
+    #[test]
+    fn database_only_app_starts_in_the_browser_without_a_trace() {
+        let path = unique_temp_path("dbc");
+        std::fs::write(&path, TEST_DBC).expect("write test DBC");
+        let mut app = App::open_databases(vec![(BusKind::Can, 1, path.clone())])
+            .expect("open database-only app");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(app.mode, Mode::Databases);
+        assert!(app.trace.is_none());
+        assert!(app.objects.is_empty());
+        assert!(app.summaries.is_empty());
+        assert!(app.filtered.is_empty());
+        assert_eq!(app.bindings.len(), 1);
+        assert!(!app.db_objects.is_empty(), "database objects should load");
+
+        let title = app.title_line();
+        assert!(title.contains("(no trace)"), "got {title}");
+        assert!(title.contains("databases=1"), "got {title}");
+        assert!(title.contains("mode=Databases"), "got {title}");
+
+        // Esc cannot leave the browser, and trace-only keys explain why.
+        app.handle_event(InputEvent::Esc).unwrap();
+        assert_eq!(app.mode, Mode::Databases);
+        assert_eq!(app.status, NO_TRACE_STATUS);
+        for key in ['p', 'e', 'g', 'G'] {
+            app.status.clear();
+            app.handle_event(InputEvent::Char(key)).unwrap();
+            assert_eq!(app.status, NO_TRACE_STATUS, "key {key}");
+            assert_eq!(app.mode, Mode::Databases, "key {key}");
+        }
+
+        // The browser itself keeps working without a trace.
+        app.handle_event(InputEvent::Char(']')).unwrap();
+        assert_eq!(app.database_selected, 0);
+        app.handle_event(InputEvent::Char('?')).unwrap();
+        assert!(app.help.is_some());
+        app.handle_event(InputEvent::Esc).unwrap();
+        assert!(app.help.is_none());
+        app.handle_event(InputEvent::Char('b')).unwrap();
+        assert_eq!(app.input, Some(InputKind::Binding));
     }
 
     #[test]
@@ -3736,6 +3903,53 @@ BO_ 294 AdasStatus: 8 ADAS
     }
 
     #[test]
+    fn dbc_signal_details_show_the_transmitter_and_deduplicated_receivers() {
+        use blf_core::{ByteOrder, CanMessageId, CanPayloadKind, SignalType};
+
+        let mut speed = blf_core::CanSignal::new(
+            "VehicleSpeed",
+            0,
+            16,
+            ByteOrder::LittleEndian,
+            SignalType::Unsigned,
+        );
+        speed.receivers = vec![
+            "TCM".to_string(),
+            "Vector__XXX".to_string(),
+            "TCM".to_string(),
+            "Gateway".to_string(),
+            String::new(),
+        ];
+        let message = blf_core::DbcMessage {
+            id: CanMessageId::new(0x123, false),
+            name: "VehicleStatus".to_string(),
+            dlc: 8,
+            is_fd: false,
+            payload_kind: CanPayloadKind::Physical,
+            transmitter: "BCM".to_string(),
+            signals: vec![speed],
+            comment: None,
+            attributes: Default::default(),
+            source: None,
+        };
+
+        let details = dbc_signal_details(&message, &message.signals[0]);
+        let transmitter = details
+            .iter()
+            .position(|line| line == "transmitter: BCM")
+            .expect("transmitter line");
+        assert_eq!(details[transmitter + 1], "receivers: TCM, Gateway");
+        assert_eq!(
+            details
+                .iter()
+                .filter(|line| line.starts_with("transmitter:"))
+                .count(),
+            1
+        );
+        assert!(details.iter().all(|line| !line.contains("Vector__XXX")));
+    }
+
+    #[test]
     fn lin_frame_details_name_subscribers_after_the_publisher() {
         use blf_core::{LinChecksum, LinFrame, LinSignal};
 
@@ -3775,6 +3989,42 @@ BO_ 294 AdasStatus: 8 ADAS
             .position(|line| line == "DLC: 8  publisher: BCM")
             .expect("publisher line");
         assert_eq!(details[publisher + 1], "subscribers: TCM, Gateway");
+    }
+
+    #[test]
+    fn lin_signal_details_deduplicate_subscribers() {
+        use blf_core::LinSignal;
+
+        let signal = LinSignal {
+            name: "FrontLeft".to_string(),
+            start_bit: 0,
+            bit_length: 1,
+            publisher: Some("BCM".to_string()),
+            subscribers: vec![
+                "TCM".to_string(),
+                "Vector__XXX".to_string(),
+                "TCM".to_string(),
+                "Gateway".to_string(),
+                String::new(),
+            ],
+            initial_value: None,
+            factor: 1.0,
+            offset: 0.0,
+            minimum: None,
+            maximum: None,
+            physical_ranges: Vec::new(),
+            encoding: None,
+            choices: Default::default(),
+            source: None,
+        };
+
+        let details = lin_signal_details(&signal);
+        let publisher = details
+            .iter()
+            .position(|line| line == "publisher: BCM")
+            .expect("publisher line");
+        assert_eq!(details[publisher + 1], "subscribers: TCM, Gateway");
+        assert!(details.iter().all(|line| !line.contains("Vector__XXX")));
     }
 
     #[test]
@@ -4025,7 +4275,13 @@ BO_ 294 AdasStatus: 8 ADAS
     #[test]
     fn help_lists_bindings_by_mode_and_global_keys() {
         let lines = help_lines(80);
-        for heading in ["Messages", "Detail", "Curve", "Databases", "Global"] {
+        for heading in [
+            "Messages (needs a trace)",
+            "Detail (needs a trace)",
+            "Curve (needs a trace)",
+            "Databases",
+            "Global",
+        ] {
             assert!(
                 lines
                     .iter()
@@ -4048,6 +4304,8 @@ BO_ 294 AdasStatus: 8 ADAS
             "focus objects or report the selection",
             "open the selected message",
             "wheel to scroll",
+            "needs a trace",
+            "back to the message list (trace only)",
         ] {
             assert!(text.contains(expected), "missing {expected} in help");
         }
