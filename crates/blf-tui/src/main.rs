@@ -149,6 +149,7 @@ enum InputKind {
     Filter,
     Binding,
     DatabaseFilter,
+    Goto,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -414,6 +415,10 @@ impl App {
                 InputEvent::Char('p') => self.open_curve(),
                 InputEvent::Char('d') => self.enter_databases(),
                 InputEvent::Char('e') => self.export_csv(),
+                InputEvent::Char('g') => self.start_input(InputKind::Goto),
+                InputEvent::Char('G') => self.jump_to_end(),
+                InputEvent::Char(']') => self.step_frame(1),
+                InputEvent::Char('[') => self.step_frame(-1),
                 InputEvent::Esc => self.clear_filter(),
                 InputEvent::Mouse(mouse) => self.handle_message_mouse(mouse),
                 _ => {}
@@ -492,6 +497,13 @@ impl App {
                             if let Err(error) = self.apply_binding_input(&value) {
                                 self.status = error;
                                 self.input = Some(InputKind::Binding);
+                                self.input_buffer = value;
+                            }
+                        }
+                        InputKind::Goto => {
+                            if let Err(error) = self.goto_input(&value) {
+                                self.status = error;
+                                self.input = Some(InputKind::Goto);
                                 self.input_buffer = value;
                             }
                         }
@@ -588,6 +600,138 @@ impl App {
         self.selected = 0;
         self.list_offset = 0;
         self.selected_signal = 0;
+    }
+
+    /// `g`: jump to a time, or to a 1-based position with `#`.
+    fn goto_input(&mut self, value: &str) -> Result<(), String> {
+        match parse_goto(value)? {
+            Goto::Offset(seconds) => self.jump_to_time(seconds, false),
+            Goto::Absolute(seconds) => self.jump_to_time(seconds, true),
+            Goto::Position(position) => self.jump_to_position(position),
+        }
+        Ok(())
+    }
+
+    /// Jump to the first message at or after `seconds`; relative times count
+    /// from the first message, because bench logs rarely start at zero.
+    fn jump_to_time(&mut self, seconds: f64, absolute: bool) {
+        let Some(base) = self.first_timestamp() else {
+            self.status = "This trace has no timestamps to jump by".to_string();
+            return;
+        };
+        let Some(offset) = seconds_to_ns(seconds) else {
+            self.status = "Time must be a finite, positive number of seconds".to_string();
+            return;
+        };
+        let target = if absolute {
+            offset
+        } else {
+            base.saturating_add(offset)
+        };
+        let timestamps = self
+            .filtered
+            .iter()
+            .map(|index| self.summaries[*index].timestamp_ns);
+        let Some(position) = first_index_at_or_after(timestamps, target) else {
+            self.status = format!(
+                "No message at or after {}",
+                format_goto_time(target, base, absolute)
+            );
+            return;
+        };
+        self.selected = position;
+        self.selected_signal = 0;
+        self.keep_selection_visible();
+        let reached = self.summaries[self.filtered[position]].timestamp_ns;
+        self.status = format!(
+            "At {} ({})",
+            format_goto_time(reached.unwrap_or(target), base, absolute),
+            self.position_label()
+        );
+    }
+
+    fn first_timestamp(&self) -> Option<u64> {
+        self.filtered
+            .iter()
+            .find_map(|index| self.summaries[*index].timestamp_ns)
+    }
+
+    fn jump_to_position(&mut self, position: usize) {
+        if self.filtered.is_empty() {
+            self.status = "Nothing to jump to".to_string();
+            return;
+        }
+        let index = position.saturating_sub(1).min(self.filtered.len() - 1);
+        self.selected = index;
+        self.selected_signal = 0;
+        self.keep_selection_visible();
+        self.status = format!("Message #{} of {}", index + 1, self.filtered.len());
+    }
+
+    fn jump_to_end(&mut self) {
+        if self.filtered.is_empty() {
+            self.status = "Nothing to jump to".to_string();
+            return;
+        }
+        self.selected = self.filtered.len() - 1;
+        self.selected_signal = 0;
+        self.keep_selection_visible();
+        self.status = format!("Last message ({})", self.position_label());
+    }
+
+    /// `]`/`[`: move to the next or previous message with the same frame id
+    /// on the same bus and channel, and say which occurrence it is.
+    fn step_frame(&mut self, direction: isize) {
+        let Some((positions, current)) = self.frame_positions() else {
+            self.status = "This message has no frame id to step through".to_string();
+            return;
+        };
+        let next = current as isize + direction;
+        if next < 0 {
+            self.status = format!("First of {} occurrences", positions.len());
+            return;
+        }
+        let Some(&position) = positions.get(next as usize) else {
+            self.status = format!("Last of {} occurrences", positions.len());
+            return;
+        };
+        self.selected = position;
+        self.selected_signal = 0;
+        self.keep_selection_visible();
+        let label = self
+            .selected_summary()
+            .map(frame_label)
+            .unwrap_or_else(|| "frame".to_string());
+        self.status = format!("{label}: occurrence {}/{}", next + 1, positions.len());
+    }
+
+    /// Positions (inside the filtered list) of the selected frame id.
+    fn frame_positions(&self) -> Option<(Vec<usize>, usize)> {
+        let current = *self.filtered.get(self.selected)?;
+        let summary = self.summaries.get(current)?;
+        let bus = summary.bus?;
+        let channel = summary.channel?;
+        let frame_id = summary.frame_id?;
+        let positions = self
+            .filtered
+            .iter()
+            .enumerate()
+            .filter(|(_, index)| {
+                let candidate = &self.summaries[**index];
+                candidate.bus == Some(bus)
+                    && candidate.channel == Some(channel)
+                    && candidate.frame_id == Some(frame_id)
+            })
+            .map(|(position, _)| position)
+            .collect::<Vec<_>>();
+        let current = positions
+            .iter()
+            .position(|position| *position == self.selected)?;
+        Some((positions, current))
+    }
+
+    fn position_label(&self) -> String {
+        format!("{} / {}", self.selected + 1, self.filtered.len())
     }
 
     fn select_last(&mut self) {
@@ -1175,12 +1319,13 @@ impl App {
                 InputKind::Filter => "/",
                 InputKind::Binding => "bind (can|lin CHANNEL PATH): ",
                 InputKind::DatabaseFilter => "db /",
+                InputKind::Goto => "goto (12.5 | @1672542341.5 | #1234): ",
             };
             format!("{prompt}{}  [Enter] apply  [Esc] cancel", self.input_buffer)
         } else {
             match self.mode {
                 Mode::Messages => {
-                    "[j/k] move [Enter] detail [/] filter [e] export [b] bind [d] databases [p] curve [q] quit"
+                    "[j/k] move [g] goto [[]/[]] frame [Enter] detail [/] filter [e] export [d] databases [p] curve [q] quit"
                 }
                 Mode::Detail => "[j/k] signal [p] curve [e] export [b] bind [Esc] back [q] quit",
                 Mode::Curve => "[Esc] back [q] quit",
@@ -1190,10 +1335,14 @@ impl App {
             }
             .to_string()
         };
-        lines.push(paint_bold(
-            format!("{footer}  {}", self.status),
-            ANSI_BRIGHT_YELLOW,
-        ));
+        // The status reports where a jump landed, so it outranks the key
+        // cheat-sheet when the terminal is too narrow for both.
+        let footer_text = if width >= display_width(&footer) + display_width(&self.status) + 2 {
+            format!("{footer}  {}", self.status)
+        } else {
+            self.status.clone()
+        };
+        lines.push(paint_bold(footer_text, ANSI_BRIGHT_YELLOW));
         let mut output = String::from("\x1b[H");
         for line in lines.into_iter().take(height) {
             output.push_str(&truncate_ansi(&line, width));
@@ -2253,6 +2402,88 @@ fn lin_status(state: blf_core::LinResponseState) -> &'static str {
     }
 }
 
+/// A `g` prompt value: either a timestamp or a 1-based position in the list.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Goto {
+    /// Seconds after the first message of the visible list.
+    Offset(f64),
+    /// Seconds on the trace's own clock, written with a leading `@`.
+    Absolute(f64),
+    /// 1-based position in the visible list, written with a leading `#`.
+    Position(usize),
+}
+
+fn parse_goto(value: &str) -> Result<Goto, String> {
+    let text = value.trim();
+    if text.is_empty() {
+        return Err("Enter a time (12.5s) or a position (#1234)".to_string());
+    }
+    if let Some(rest) = text.strip_prefix('@') {
+        return parse_seconds(rest, "Absolute time").map(Goto::Absolute);
+    }
+    if let Some(rest) = text.strip_prefix('#') {
+        let position = rest
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| "Position must be a positive number".to_string())?;
+        if position == 0 {
+            return Err("Positions start at 1".to_string());
+        }
+        return Ok(Goto::Position(position));
+    }
+    parse_seconds(text, "Time").map(Goto::Offset)
+}
+
+fn parse_seconds(value: &str, label: &str) -> Result<f64, String> {
+    let text = value.strip_suffix('s').unwrap_or(value).trim();
+    let seconds = text
+        .parse::<f64>()
+        .map_err(|_| format!("{label} must be a number of seconds, for example 12.5"))?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return Err(format!(
+            "{label} must be a finite, positive number of seconds"
+        ));
+    }
+    Ok(seconds)
+}
+
+fn seconds_to_ns(seconds: f64) -> Option<u64> {
+    let value = (seconds * 1_000_000_000.0).round();
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    Some(value as u64)
+}
+
+fn first_index_at_or_after<I>(timestamps: I, target: u64) -> Option<usize>
+where
+    I: IntoIterator<Item = Option<u64>>,
+{
+    timestamps
+        .into_iter()
+        .position(|timestamp| timestamp.is_some_and(|timestamp| timestamp >= target))
+}
+
+fn format_goto_time(timestamp_ns: u64, base_ns: u64, absolute: bool) -> String {
+    let absolute_text = format_timestamp(Some(timestamp_ns));
+    if absolute {
+        return absolute_text;
+    }
+    let offset = timestamp_ns.saturating_sub(base_ns) as f64 / 1_000_000_000.0;
+    format!("+{offset:.6}s ({absolute_text})")
+}
+
+fn frame_label(summary: &MessageSummary) -> String {
+    let bus = summary.bus.map_or("--", BusKind::as_str);
+    let channel = summary
+        .channel
+        .map_or_else(|| "-".to_string(), |value| value.to_string());
+    let id = summary
+        .frame_id
+        .map_or_else(|| "-".to_string(), |value| format!("0x{value:X}"));
+    format!("{bus} {channel} {id}")
+}
+
 fn list_page_size(viewport_height: usize, reserved_rows: usize) -> usize {
     viewport_height.saturating_sub(reserved_rows).max(1)
 }
@@ -2851,6 +3082,81 @@ mod tests {
         let line = summary_line(&summary);
         assert!(display_width(&line) <= 120);
         assert!(line.ends_with("..."));
+    }
+
+    #[test]
+    fn goto_accepts_offsets_absolute_times_and_positions() {
+        assert_eq!(parse_goto("12.5"), Ok(Goto::Offset(12.5)));
+        assert_eq!(parse_goto(" 12.5s "), Ok(Goto::Offset(12.5)));
+        assert_eq!(parse_goto("0"), Ok(Goto::Offset(0.0)));
+        assert_eq!(
+            parse_goto("@1672542341.5"),
+            Ok(Goto::Absolute(1672542341.5))
+        );
+        assert_eq!(parse_goto("#1"), Ok(Goto::Position(1)));
+        assert_eq!(parse_goto("# 42 "), Ok(Goto::Position(42)));
+        assert!(parse_goto("").is_err());
+        assert!(parse_goto("#0").is_err());
+        assert!(parse_goto("#x").is_err());
+        assert!(parse_goto("@nope").is_err());
+        assert!(parse_goto("-1").is_err());
+        assert!(parse_goto("later").is_err());
+    }
+
+    #[test]
+    fn goto_time_text_shows_offset_and_clock() {
+        let base = 1_672_542_331_984_470_000;
+        let target = base + 10_500_000_000;
+        let text = format_goto_time(target, base, false);
+        assert!(text.starts_with("+10.500000s ("), "got {text}");
+        assert!(text.contains("1672542342.484470s"));
+        // Absolute form prints only the trace clock.
+        let text = format_goto_time(target, base, true);
+        assert_eq!(text, "1672542342.484470s");
+    }
+
+    #[test]
+    fn seconds_convert_to_nanoseconds_only_when_sane() {
+        assert_eq!(seconds_to_ns(1.5), Some(1_500_000_000));
+        assert_eq!(seconds_to_ns(0.0), Some(0));
+        assert_eq!(seconds_to_ns(-1.0), None);
+        assert_eq!(seconds_to_ns(f64::NAN), None);
+        assert_eq!(seconds_to_ns(f64::INFINITY), None);
+    }
+
+    #[test]
+    fn jump_lands_on_the_first_message_at_or_after_the_target() {
+        let timestamps = [
+            None,
+            Some(1_000_000_000),
+            Some(2_000_000_000),
+            Some(3_000_000_000),
+        ];
+        assert_eq!(first_index_at_or_after(timestamps, 0), Some(1));
+        assert_eq!(first_index_at_or_after(timestamps, 1_000_000_000), Some(1));
+        assert_eq!(first_index_at_or_after(timestamps, 2_500_000_000), Some(3));
+        assert_eq!(first_index_at_or_after(timestamps, 9_000_000_000), None);
+        assert_eq!(first_index_at_or_after([None, None], 0), None);
+        assert_eq!(first_index_at_or_after([], 0), None);
+    }
+
+    #[test]
+    fn frame_labels_name_bus_channel_and_id() {
+        let summary = MessageSummary {
+            object_index: 0,
+            timestamp_ns: Some(0),
+            timestamp_source: None,
+            bus: Some(BusKind::Can),
+            channel: Some(1),
+            frame_id: Some(0x344),
+            object_type_raw: 1,
+            class_name: "CAN_MESSAGE",
+            direction: Some("Rx"),
+            dlc: Some(8),
+            payload: Vec::new(),
+            status: "ok",
+        };
+        assert_eq!(frame_label(&summary), "can 1 0x344");
     }
 
     #[test]

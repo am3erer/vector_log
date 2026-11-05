@@ -95,6 +95,9 @@ Key controls are:
 j/k or Up/Down    move through messages or signals
 PageUp/PageDown   move one screen at a time
 Home/End          jump to the first or last item
+g                 jump by time or position
+G                 jump to the last message
+] / [             next / previous occurrence of the same frame id
 Enter             open the selected message
 /                 filter messages, or search objects in the database browser
 b                 bind a DBC/LDF database
@@ -106,6 +109,20 @@ p                 open a curve for the selected numeric signal
 Esc/Left          go back
 q                 quit
 ```
+
+`g` opens a prompt that takes three forms, and reports where it landed:
+
+```text
+12.5         12.5 s after the first visible message
+@1672542341  that instant on the trace's own clock
+#1234        position 1234 in the visible list
+```
+
+Times are relative by default because bench traces rarely start at zero, while
+`@` reaches a timestamp copied from the list. Jumps respect the active filter,
+so `/0x344` followed by `g 10` lands on the first `0x344` frame at or after ten
+seconds into the filtered view. `]` and `[` step between the occurrences of the
+selected frame id and report which one of how many is shown.
 
 Opening a message shows its decoded signals on the right. The left column also
 reports the cycle timing of that frame id on the same bus and channel: average,
