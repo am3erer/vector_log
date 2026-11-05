@@ -83,19 +83,42 @@ The application scans the BLF at startup, then allows message filtering and
 selection, per-message detail inspection, channel-specific DBC/LDF binding,
 signal decoding, and an ASCII signal curve. Database paths can also be bound
 while the viewer is running with `b`, using `can CHANNEL PATH` or
-`lin CHANNEL PATH`.
+`lin CHANNEL PATH`. Press `d` to open the database browser. Its layout follows
+the CANdb++-style workflow used by the companion `candb_tui` project: the left
+column selects a loaded database and object category, the center column lists
+messages/signals/frames, and the right column shows details for the selected
+object.
 
 Key controls are:
 
 ```text
-j/k or Up/Down   move through messages or signals
-Enter            open the selected message
-/                filter messages
-b                bind a DBC/LDF database
-p                open a curve for the selected numeric signal
-Esc/Left         go back
-q                quit
+j/k or Up/Down    move through messages or signals
+PageUp/PageDown   move one screen at a time
+Home/End          jump to the first or last item
+Enter             open the selected message
+/                 filter messages, or search objects in the database browser
+b                 bind a DBC/LDF database
+d                 open the DBC/LDF browser
+Left/Right        change database category
+[/]               switch loaded database
+e                 export the filtered messages with decoded signals to CSV
+p                 open a curve for the selected numeric signal
+Esc/Left          go back
+q                 quit
 ```
+
+Opening a message shows its decoded signals on the right. The left column also
+reports the cycle timing of that frame id on the same bus and channel: average,
+minimum and maximum period, mean jitter, and how many frames the log holds.
+
+Pressing `e` writes `<trace>.signals.csv` next to the trace, with one row per
+filtered message and one column per decoded signal (up to 64 signal columns).
+Filtering to a single frame id first turns the export into a time series for a
+bench report.
+
+Curves stream the signal from the reader and keep at most 200,000 samples; the
+title says when a longer signal was cut. Run `vector-log-tui --help` for the
+command line usage.
 
 The current viewer keeps message summaries in memory for responsive navigation;
 very large logs may use more memory than the streaming reader. Mouse input is

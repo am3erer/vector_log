@@ -10,3 +10,4 @@ __pycache__/
 /yes
 /yes.pub
 /doc/*.pdf
+*.signals.csv

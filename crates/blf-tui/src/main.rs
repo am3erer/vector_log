@@ -1,8 +1,8 @@
 use std::env;
 use std::fmt::Write as _;
 use std::fs::{File as StdFile, OpenOptions};
-use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::io::{self, BufWriter, IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,6 +12,41 @@ use blf_core::{
     object_timestamp_ns, object_timestamp_source, BusKind, Database, DatabaseBinding, DbcDatabase,
     FieldValue, File, LdfDatabase, Object,
 };
+
+/// Header lines drawn above every list: title, databases line and one rule.
+const HEADER_ROWS: u16 = 3;
+/// Upper bound on signal columns written by the CSV export.
+const MAX_CSV_SIGNALS: usize = 64;
+/// Upper bound on curve samples kept in memory; older ones are dropped.
+const MAX_CURVE_SAMPLES: usize = 200_000;
+/// First list row below the header block, section title and column rule.
+const LIST_FIRST_ROW: u16 = HEADER_ROWS + 2;
+/// First detail row: the header block plus the detail section title.
+const DETAIL_FIRST_ROW: u16 = HEADER_ROWS + 1;
+
+// Match the vivid ANSI palette used by the other terminal tools in this workspace.
+const ANSI_RESET: &str = "\x1b[0m";
+const ANSI_BOLD: &str = "\x1b[1m";
+const ANSI_RED: &str = "\x1b[31m";
+const ANSI_MAGENTA: &str = "\x1b[35m";
+const ANSI_CYAN: &str = "\x1b[36m";
+const ANSI_WHITE: &str = "\x1b[37m";
+const ANSI_BRIGHT_GREEN: &str = "\x1b[92m";
+const ANSI_BRIGHT_CYAN: &str = "\x1b[96m";
+const ANSI_BRIGHT_YELLOW: &str = "\x1b[93m";
+const ANSI_SELECTED: &str = "\x1b[1;97;44m";
+
+fn paint(value: impl AsRef<str>, color: &str) -> String {
+    format!("{color}{}{ANSI_RESET}", value.as_ref())
+}
+
+fn paint_bold(value: impl AsRef<str>, color: &str) -> String {
+    format!("{ANSI_BOLD}{color}{}{ANSI_RESET}", value.as_ref())
+}
+
+fn paint_selected(value: impl AsRef<str>) -> String {
+    paint(value, ANSI_SELECTED)
+}
 
 #[derive(Debug, Clone)]
 struct BindingEntry {
@@ -30,11 +65,11 @@ struct MessageSummary {
     channel: Option<u16>,
     frame_id: Option<u32>,
     object_type_raw: u32,
-    class_name: String,
-    direction: Option<String>,
+    class_name: &'static str,
+    direction: Option<&'static str>,
     dlc: Option<u8>,
     payload: Vec<u8>,
-    status: String,
+    status: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -46,11 +81,22 @@ struct SignalRow {
     error: Option<String>,
 }
 
+/// Cycle timing of one frame id on one bus/channel.
+#[derive(Debug, Clone, PartialEq)]
+struct TimingStats {
+    frames: usize,
+    avg_ms: f64,
+    min_ms: f64,
+    max_ms: f64,
+    jitter_ms: f64,
+}
+
 #[derive(Debug, Clone)]
 struct CurveData {
     title: String,
     samples: Vec<(u64, f64)>,
     error: Option<String>,
+    truncated: bool,
     window_start: usize,
     window_len: usize,
 }
@@ -60,12 +106,49 @@ enum Mode {
     Messages,
     Detail,
     Curve,
+    Databases,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DbCategory {
+    Overview,
+    Messages,
+    Signals,
+    Nodes,
+    Attributes,
+    ValueTables,
+    Frames,
+    DiagnosticFrames,
+    DiagnosticSignals,
+    Schedules,
+    DynamicFrames,
+    OptionalSections,
+}
+
+impl DbCategory {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "Overview",
+            Self::Messages => "Messages",
+            Self::Signals => "Signals",
+            Self::Nodes => "Nodes",
+            Self::Attributes => "Attributes",
+            Self::ValueTables => "Value tables",
+            Self::Frames => "Frames",
+            Self::DiagnosticFrames => "Diagnostic frames",
+            Self::DiagnosticSignals => "Diagnostic signals",
+            Self::Schedules => "Schedules",
+            Self::DynamicFrames => "Dynamic frames",
+            Self::OptionalSections => "Optional sections",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputKind {
     Filter,
     Binding,
+    DatabaseFilter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +228,42 @@ impl Drop for RawTerminal {
     }
 }
 
+/// Show a cheap stderr progress line while large traces load, but only on a TTY.
+struct LoadProgress {
+    enabled: bool,
+    last_report: Instant,
+    shown: bool,
+}
+
+impl LoadProgress {
+    fn new() -> Self {
+        Self {
+            enabled: io::stderr().is_terminal(),
+            last_report: Instant::now(),
+            shown: false,
+        }
+    }
+
+    fn report(&mut self, objects: usize) {
+        if !self.enabled || self.last_report.elapsed() < Duration::from_millis(150) {
+            return;
+        }
+        eprint!("\rreading BLF: {objects} objects");
+        let _ = io::stderr().flush();
+        self.last_report = Instant::now();
+        self.shown = true;
+    }
+
+    fn clear(&mut self) {
+        if !self.enabled || !self.shown {
+            return;
+        }
+        eprint!("\r\x1b[K");
+        let _ = io::stderr().flush();
+        self.shown = false;
+    }
+}
+
 struct App {
     path: PathBuf,
     reader: File,
@@ -156,6 +275,9 @@ struct App {
     input: Option<InputKind>,
     input_buffer: String,
     filter: String,
+    filtered: Vec<usize>,
+    db_objects: Vec<DbObject>,
+    dirty: bool,
     selected: usize,
     list_offset: usize,
     selected_signal: usize,
@@ -166,6 +288,11 @@ struct App {
     viewport_width: usize,
     viewport_height: usize,
     last_size_check: Instant,
+    database_selected: usize,
+    database_category: usize,
+    database_object_selected: usize,
+    database_object_offset: usize,
+    database_filter: String,
 }
 
 impl App {
@@ -173,6 +300,7 @@ impl App {
         let path = path.into();
         let mut reader = File::open(&path).map_err(|error| format!("open BLF: {error}"))?;
         let mut objects = Vec::new();
+        let mut progress = LoadProgress::new();
         loop {
             let batch = reader
                 .read_batch(4096)
@@ -181,13 +309,16 @@ impl App {
                 break;
             }
             objects.extend(batch);
+            progress.report(objects.len());
         }
+        progress.clear();
 
         let summaries = objects
             .iter()
             .enumerate()
             .map(|(object_index, object)| summary_for(object_index, object))
-            .collect();
+            .collect::<Vec<_>>();
+        let filtered = (0..summaries.len()).collect::<Vec<_>>();
         let skipped_objects = reader.skipped_object_count;
         let mut app = Self {
             path,
@@ -200,6 +331,9 @@ impl App {
             input: None,
             input_buffer: String::new(),
             filter: String::new(),
+            filtered,
+            db_objects: Vec::new(),
+            dirty: true,
             selected: 0,
             list_offset: 0,
             selected_signal: 0,
@@ -210,6 +344,11 @@ impl App {
             viewport_width: 120,
             viewport_height: 40,
             last_size_check: Instant::now() - Duration::from_secs(1),
+            database_selected: 0,
+            database_category: 0,
+            database_object_selected: 0,
+            database_object_offset: 0,
+            database_filter: String::new(),
         };
         for (bus, channel, database_path) in specs {
             app.bind_database(bus, channel, database_path)?;
@@ -224,16 +363,33 @@ impl App {
 
     fn run_terminal(&mut self, terminal: &mut RawTerminal) -> Result<(), String> {
         loop {
-            self.render(terminal)?;
+            if self.dirty || self.poll_resize(terminal) {
+                self.render(terminal)?;
+                self.dirty = false;
+            }
             if let Some(event) = terminal.read_event()? {
                 if self.handle_event(event)? {
                     break;
                 }
-            } else {
-                std::thread::sleep(Duration::from_millis(20));
+                self.dirty = true;
             }
         }
         Ok(())
+    }
+
+    /// Redraw only when the terminal changed size; idle frames stay cheap.
+    fn poll_resize(&mut self, terminal: &RawTerminal) -> bool {
+        if self.last_size_check.elapsed() < Duration::from_millis(250) {
+            return false;
+        }
+        let (width, height) = terminal.size();
+        self.last_size_check = Instant::now();
+        if (width, height) == (self.viewport_width, self.viewport_height) {
+            return false;
+        }
+        self.viewport_width = width;
+        self.viewport_height = height;
+        true
     }
 
     fn handle_event(&mut self, event: InputEvent) -> Result<bool, String> {
@@ -248,14 +404,16 @@ impl App {
                 InputEvent::Char('q') => return Ok(true),
                 InputEvent::Up | InputEvent::Char('k') => self.move_selection(-1),
                 InputEvent::Down | InputEvent::Char('j') => self.move_selection(1),
-                InputEvent::PageUp => self.move_selection(-10),
-                InputEvent::PageDown => self.move_selection(10),
+                InputEvent::PageUp => self.move_selection(-self.page_step()),
+                InputEvent::PageDown => self.move_selection(self.page_step()),
                 InputEvent::Home => self.select_first(),
                 InputEvent::End => self.select_last(),
                 InputEvent::Enter => self.enter_detail(),
                 InputEvent::Char('/') => self.start_input(InputKind::Filter),
                 InputEvent::Char('b') => self.start_input(InputKind::Binding),
-                InputEvent::Char('p') => self.open_curve()?,
+                InputEvent::Char('p') => self.open_curve(),
+                InputEvent::Char('d') => self.enter_databases(),
+                InputEvent::Char('e') => self.export_csv(),
                 InputEvent::Esc => self.clear_filter(),
                 InputEvent::Mouse(mouse) => self.handle_message_mouse(mouse),
                 _ => {}
@@ -264,14 +422,34 @@ impl App {
                 InputEvent::Char('q') => return Ok(true),
                 InputEvent::Up | InputEvent::Char('k') => self.move_signal(-1),
                 InputEvent::Down | InputEvent::Char('j') => self.move_signal(1),
-                InputEvent::PageUp => self.move_signal(-10),
-                InputEvent::PageDown => self.move_signal(10),
+                InputEvent::PageUp => self.move_signal(-self.page_step()),
+                InputEvent::PageDown => self.move_signal(self.page_step()),
                 InputEvent::Home => self.select_first_signal(),
                 InputEvent::End => self.select_last_signal(),
-                InputEvent::Char('p') => self.open_curve()?,
+                InputEvent::Char('p') => self.open_curve(),
                 InputEvent::Char('b') => self.start_input(InputKind::Binding),
+                InputEvent::Char('e') => self.export_csv(),
                 InputEvent::Esc | InputEvent::Left => self.mode = Mode::Messages,
                 InputEvent::Mouse(mouse) => self.handle_detail_mouse(mouse),
+                _ => {}
+            },
+            Mode::Databases => match event {
+                InputEvent::Char('q') => return Ok(true),
+                InputEvent::Up | InputEvent::Char('k') => self.move_database_object(-1),
+                InputEvent::Down | InputEvent::Char('j') => self.move_database_object(1),
+                InputEvent::PageUp => self.move_database_object(-self.page_step()),
+                InputEvent::PageDown => self.move_database_object(self.page_step()),
+                InputEvent::Home => self.select_first_database_object(),
+                InputEvent::End => self.select_last_database_object(),
+                InputEvent::Left => self.move_database_category(-1),
+                InputEvent::Right => self.move_database_category(1),
+                InputEvent::Char('[') => self.switch_database(-1),
+                InputEvent::Char(']') => self.switch_database(1),
+                InputEvent::Char('/') => self.start_input(InputKind::DatabaseFilter),
+                InputEvent::Enter => self.select_database_object(),
+                InputEvent::Char('b') => self.start_input(InputKind::Binding),
+                InputEvent::Esc => self.mode = Mode::Messages,
+                InputEvent::Mouse(mouse) => self.handle_database_mouse(mouse),
                 _ => {}
             },
             Mode::Curve => match event {
@@ -307,6 +485,7 @@ impl App {
                             self.filter = value;
                             self.selected = 0;
                             self.list_offset = 0;
+                            self.rebuild_filtered();
                             self.status = format!("Filter: {}", display_filter(&self.filter));
                         }
                         InputKind::Binding => {
@@ -315,6 +494,16 @@ impl App {
                                 self.input = Some(InputKind::Binding);
                                 self.input_buffer = value;
                             }
+                        }
+                        InputKind::DatabaseFilter => {
+                            self.database_filter = value;
+                            self.database_object_selected = 0;
+                            self.database_object_offset = 0;
+                            self.rebuild_database_objects();
+                            self.status = format!(
+                                "Database filter: {}",
+                                display_filter(&self.database_filter)
+                            );
                         }
                     }
                 }
@@ -377,11 +566,14 @@ impl App {
         if self.mode == Mode::Detail {
             self.refresh_detail();
         }
+        if self.mode == Mode::Databases {
+            self.rebuild_database_objects();
+        }
         Ok(())
     }
 
     fn move_selection(&mut self, delta: isize) {
-        let count = self.filtered_indices().len();
+        let count = self.filtered.len();
         self.selected = move_index(self.selected, count, delta);
         self.selected_signal = 0;
         self.keep_selection_visible();
@@ -399,7 +591,7 @@ impl App {
     }
 
     fn select_last(&mut self) {
-        self.selected = self.filtered_indices().len().saturating_sub(1);
+        self.selected = self.filtered.len().saturating_sub(1);
         self.keep_selection_visible();
     }
 
@@ -438,25 +630,182 @@ impl App {
     }
 
     fn message_page_size(&self) -> usize {
-        self.viewport_height.saturating_sub(7).max(1)
+        list_page_size(self.viewport_height, 7)
     }
 
     fn detail_page_size(&self) -> usize {
-        self.viewport_height.saturating_sub(5).max(1)
+        list_page_size(self.viewport_height, 5)
+    }
+
+    fn database_page_size(&self) -> usize {
+        list_page_size(self.viewport_height, 8)
+    }
+
+    /// Rows to move for PageUp/PageDown in the active mode.
+    fn page_step(&self) -> isize {
+        let rows = match self.mode {
+            Mode::Messages => self.message_page_size(),
+            Mode::Detail => self.detail_page_size(),
+            Mode::Databases => self.database_page_size(),
+            Mode::Curve => 1,
+        };
+        rows as isize
     }
 
     fn clear_filter(&mut self) {
         self.filter.clear();
         self.selected = 0;
         self.list_offset = 0;
+        self.rebuild_filtered();
         self.status = "Filter cleared".to_string();
     }
 
+    fn enter_databases(&mut self) {
+        self.database_selected = self
+            .database_selected
+            .min(self.bindings.len().saturating_sub(1));
+        self.database_category = 0;
+        self.database_object_selected = 0;
+        self.database_object_offset = 0;
+        self.rebuild_database_objects();
+        self.mode = Mode::Databases;
+    }
+
+    fn database_categories(&self) -> Vec<DbCategory> {
+        let Some(entry) = self.bindings.get(self.database_selected) else {
+            return Vec::new();
+        };
+        match entry.binding.database() {
+            Database::Can(_) => vec![
+                DbCategory::Overview,
+                DbCategory::Messages,
+                DbCategory::Signals,
+                DbCategory::Nodes,
+                DbCategory::Attributes,
+                DbCategory::ValueTables,
+            ],
+            Database::Lin(_) => vec![
+                DbCategory::Overview,
+                DbCategory::Frames,
+                DbCategory::Signals,
+                DbCategory::Nodes,
+                DbCategory::DiagnosticFrames,
+                DbCategory::DiagnosticSignals,
+                DbCategory::Schedules,
+                DbCategory::DynamicFrames,
+                DbCategory::OptionalSections,
+            ],
+        }
+    }
+
+    fn selected_database_category(&self) -> Option<DbCategory> {
+        self.database_categories()
+            .get(self.database_category)
+            .copied()
+    }
+
+    /// Rebuild the object list once per database/category/filter change.
+    fn rebuild_database_objects(&mut self) {
+        let objects = match self.bindings.get(self.database_selected) {
+            Some(entry) => database_objects(
+                entry,
+                self.selected_database_category()
+                    .unwrap_or(DbCategory::Overview),
+            ),
+            None => Vec::new(),
+        };
+        let filter = self.database_filter.to_ascii_lowercase();
+        self.db_objects = if filter.is_empty() {
+            objects
+        } else {
+            objects
+                .into_iter()
+                .filter(|object| {
+                    object.title.to_ascii_lowercase().contains(&filter)
+                        || object.subtitle.to_ascii_lowercase().contains(&filter)
+                        || object
+                            .details
+                            .iter()
+                            .any(|detail| detail.to_ascii_lowercase().contains(&filter))
+                })
+                .collect()
+        };
+        self.database_object_selected = self
+            .database_object_selected
+            .min(self.db_objects.len().saturating_sub(1));
+    }
+
+    fn move_database_category(&mut self, delta: isize) {
+        let count = self.database_categories().len();
+        self.database_category = move_index(self.database_category, count, delta);
+        self.database_object_selected = 0;
+        self.database_object_offset = 0;
+        self.database_filter.clear();
+        self.rebuild_database_objects();
+    }
+
+    fn switch_database(&mut self, delta: isize) {
+        self.database_selected = move_index(self.database_selected, self.bindings.len(), delta);
+        self.database_category = 0;
+        self.database_object_selected = 0;
+        self.database_object_offset = 0;
+        self.database_filter.clear();
+        self.rebuild_database_objects();
+    }
+
+    fn move_database_object(&mut self, delta: isize) {
+        let count = self.db_objects.len();
+        self.database_object_selected = move_index(self.database_object_selected, count, delta);
+        self.keep_database_object_visible();
+    }
+
+    fn select_first_database_object(&mut self) {
+        self.database_object_selected = 0;
+        self.database_object_offset = 0;
+    }
+
+    fn select_last_database_object(&mut self) {
+        self.database_object_selected = self.db_objects.len().saturating_sub(1);
+        self.keep_database_object_visible();
+    }
+
+    fn keep_database_object_visible(&mut self) {
+        let page = self.viewport_height.saturating_sub(8).max(1);
+        if self.database_object_selected < self.database_object_offset {
+            self.database_object_offset = self.database_object_selected;
+        } else if self.database_object_selected >= self.database_object_offset + page {
+            self.database_object_offset = self.database_object_selected + 1 - page;
+        }
+    }
+
+    fn select_database_object(&mut self) {
+        if let Some(object) = self.db_objects.get(self.database_object_selected) {
+            self.status = format!("Selected {}", object.title);
+        }
+    }
+
     fn selected_summary(&self) -> Option<&MessageSummary> {
-        let indices = self.filtered_indices();
-        indices
+        self.filtered
             .get(self.selected)
             .and_then(|index| self.summaries.get(*index))
+    }
+
+    /// Cycle timing for the frame id of `summary` on its own bus and channel.
+    fn frame_timing(&self, summary: &MessageSummary) -> Option<TimingStats> {
+        let bus = summary.bus?;
+        let channel = summary.channel?;
+        let frame_id = summary.frame_id?;
+        let timestamps = self
+            .summaries
+            .iter()
+            .filter(|candidate| {
+                candidate.bus == Some(bus)
+                    && candidate.channel == Some(channel)
+                    && candidate.frame_id == Some(frame_id)
+            })
+            .filter_map(|candidate| candidate.timestamp_ns)
+            .collect::<Vec<_>>();
+        timing_stats(&timestamps)
     }
 
     fn selected_object(&self) -> Option<&Object> {
@@ -464,14 +813,17 @@ impl App {
             .and_then(|summary| self.objects.get(summary.object_index))
     }
 
-    fn filtered_indices(&self) -> Vec<usize> {
+    /// Recompute the filter once per filter change instead of once per frame.
+    fn rebuild_filtered(&mut self) {
         let filter = self.filter.to_ascii_lowercase();
-        self.summaries
+        self.filtered = self
+            .summaries
             .iter()
             .enumerate()
             .filter(|(_, summary)| filter.is_empty() || summary_matches(summary, &filter))
             .map(|(index, _)| index)
-            .collect()
+            .collect();
+        self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
     }
 
     fn enter_detail(&mut self) {
@@ -512,51 +864,168 @@ impl App {
             .map(|entry| &entry.binding)
     }
 
-    fn open_curve(&mut self) -> Result<(), String> {
+    /// Plotting is best effort: a decode/query failure becomes a status line
+    /// instead of tearing down the whole session.
+    /// Write the filtered messages, with their decoded signals, to a CSV
+    /// next to the trace so a bench report can quote real numbers.
+    fn export_csv(&mut self) {
+        let path = export_path(&self.path);
+        match self.write_csv(&path) {
+            Ok((rows, signals)) => {
+                self.status = format!(
+                    "Exported {rows} rows, {signals} signals -> {}",
+                    path.display()
+                );
+            }
+            Err(error) => self.status = format!("Export failed: {error}"),
+        }
+    }
+
+    fn write_csv(&self, path: &Path) -> Result<(usize, usize), String> {
+        let file =
+            StdFile::create(path).map_err(|error| format!("create {}: {error}", path.display()))?;
+        let mut writer = BufWriter::new(file);
+        let mut columns: Vec<String> = Vec::new();
+        for summary in self.filtered_rows() {
+            for row in self.decoded_rows(summary) {
+                if !columns.iter().any(|name| name == &row.name) && columns.len() < MAX_CSV_SIGNALS
+                {
+                    columns.push(row.name.clone());
+                }
+            }
+        }
+        let mut header = vec![
+            "timestamp_s".to_string(),
+            "bus".to_string(),
+            "channel".to_string(),
+            "frame_id".to_string(),
+            "direction".to_string(),
+            "dlc".to_string(),
+            "data".to_string(),
+            "status".to_string(),
+        ];
+        header.extend(columns.iter().cloned());
+        writeln!(writer, "{}", csv_line(&header)).map_err(|error| error.to_string())?;
+
+        let mut written = 0;
+        for summary in self.filtered_rows() {
+            let decoded = self.decoded_rows(summary);
+            let mut fields = vec![
+                format_timestamp(summary.timestamp_ns),
+                summary
+                    .bus
+                    .map_or(String::new(), |bus| bus.as_str().to_string()),
+                summary
+                    .channel
+                    .map_or_else(String::new, |value| value.to_string()),
+                summary
+                    .frame_id
+                    .map_or_else(String::new, |value| format!("0x{value:X}")),
+                summary.direction.unwrap_or_default().to_string(),
+                summary
+                    .dlc
+                    .map_or_else(String::new, |value| value.to_string()),
+                hex_bytes(&summary.payload),
+                summary.status.to_string(),
+            ];
+            for column in &columns {
+                let value = decoded
+                    .iter()
+                    .find(|row| &row.name == column)
+                    .map(csv_signal_value)
+                    .unwrap_or_default();
+                fields.push(value);
+            }
+            writeln!(writer, "{}", csv_line(&fields)).map_err(|error| error.to_string())?;
+            written += 1;
+        }
+        writer.flush().map_err(|error| error.to_string())?;
+        Ok((written, columns.len()))
+    }
+
+    fn filtered_rows(&self) -> impl Iterator<Item = &MessageSummary> + '_ {
+        self.filtered
+            .iter()
+            .filter_map(|index| self.summaries.get(*index))
+    }
+
+    fn decoded_rows(&self, summary: &MessageSummary) -> Vec<SignalRow> {
+        let Some(object) = self.objects.get(summary.object_index) else {
+            return Vec::new();
+        };
+        self.binding_for_summary(summary)
+            .map(|binding| decode_object_signals(object, binding))
+            .unwrap_or_default()
+    }
+
+    fn open_curve(&mut self) {
         if self.mode == Mode::Messages {
             self.enter_detail();
         }
         if self.detail_rows.is_empty() {
             self.status = "Select a decoded numeric signal first".to_string();
-            return Ok(());
+            return;
         }
         let Some(summary) = self.selected_summary().cloned() else {
-            return Ok(());
+            return;
         };
         let Some(binding) = self.binding_for_summary(&summary).cloned() else {
             self.status = "No database bound for this bus/channel".to_string();
-            return Ok(());
+            return;
         };
         let row = &self.detail_rows[self.selected_signal];
+        if row.error.is_some() {
+            self.status = format!("{} is not decodable: select a decoded signal", row.name);
+            return;
+        }
         let signal_name = qualified_signal_name(
             binding.database(),
             &row.name,
             &self.objects[summary.object_index],
         );
-        let query = self
+        let query = match self
             .reader
             .signal_query(binding, signal_name.clone(), false)
-            .map_err(|error| format!("start signal query: {error}"))?;
-        let samples = query
-            .collect()
-            .map_err(|error| format!("read signal query: {error}"))?;
-        let curve_samples = samples
-            .iter()
-            .filter_map(|sample| {
-                sample
-                    .physical_value
-                    .map(|value| (sample.timestamp_ns, value))
-            })
-            .collect::<Vec<_>>();
+        {
+            Ok(query) => query,
+            Err(error) => {
+                self.status = format!("start signal query: {error}");
+                return;
+            }
+        };
+        let mut curve_samples = Vec::new();
+        let mut decode_error: Option<String> = None;
+        let mut truncated = false;
+        for item in query {
+            match item {
+                Ok(sample) => {
+                    if decode_error.is_none() {
+                        decode_error = sample.error.clone();
+                    }
+                    let Some(value) = sample.physical_value else {
+                        continue;
+                    };
+                    if curve_samples.len() >= MAX_CURVE_SAMPLES {
+                        truncated = true;
+                        break;
+                    }
+                    curve_samples.push((sample.timestamp_ns, value));
+                }
+                Err(error) => {
+                    decode_error = Some(error.to_string());
+                    break;
+                }
+            }
+        }
         self.curve = Some(CurveData {
             title: signal_name,
             window_len: curve_samples.len().max(1),
             samples: curve_samples,
-            error: samples.iter().find_map(|sample| sample.error.clone()),
+            error: decode_error,
+            truncated,
             window_start: 0,
         });
         self.mode = Mode::Curve;
-        Ok(())
     }
 
     fn curve_pan(&mut self, direction: isize) {
@@ -599,10 +1068,10 @@ impl App {
     fn handle_message_mouse(&mut self, mouse: MouseEvent) {
         if mouse.wheel != 0 {
             self.move_selection(-isize::from(mouse.wheel));
-        } else if mouse.button == 0 && !mouse.release && mouse.row >= 5 {
-            let row = usize::from(mouse.row - 5);
+        } else if mouse.button == 0 && !mouse.release && mouse.row >= LIST_FIRST_ROW {
+            let row = usize::from(mouse.row - LIST_FIRST_ROW);
             let index = self.list_offset + row;
-            if index < self.filtered_indices().len() {
+            if index < self.filtered.len() {
                 self.selected = index;
                 self.selected_signal = 0;
             }
@@ -612,10 +1081,10 @@ impl App {
     fn handle_detail_mouse(&mut self, mouse: MouseEvent) {
         if mouse.wheel != 0 {
             self.move_signal(-isize::from(mouse.wheel));
-        } else if mouse.button == 0 && !mouse.release && mouse.row >= 4 {
+        } else if mouse.button == 0 && !mouse.release && mouse.row >= DETAIL_FIRST_ROW {
             let split = (usize::from(mouse.column) * 43 / 100).max(24);
             if usize::from(mouse.column) > split {
-                let index = self.detail_offset + usize::from(mouse.row - 4);
+                let index = self.detail_offset + usize::from(mouse.row - DETAIL_FIRST_ROW);
                 if index < self.detail_rows.len() {
                     self.selected_signal = index;
                     self.keep_signal_visible();
@@ -630,87 +1099,130 @@ impl App {
         }
     }
 
-    fn render(&mut self, terminal: &mut RawTerminal) -> Result<(), String> {
-        if self.last_size_check.elapsed() >= Duration::from_millis(250) {
-            let (width, height) = terminal.size();
-            self.viewport_width = width;
-            self.viewport_height = height;
-            self.last_size_check = Instant::now();
+    fn handle_database_mouse(&mut self, mouse: MouseEvent) {
+        if mouse.wheel != 0 {
+            if mouse.column < self.database_left_width() as u16 {
+                self.switch_database(-isize::from(mouse.wheel));
+            } else {
+                self.move_database_object(-isize::from(mouse.wheel));
+            }
+        } else if mouse.button == 0 && !mouse.release && mouse.row >= LIST_FIRST_ROW {
+            if mouse.column < self.database_left_width() as u16 {
+                let row = usize::from(mouse.row - LIST_FIRST_ROW);
+                if row == 0 {
+                    self.switch_database(1);
+                } else if row - 1 < self.database_categories().len() {
+                    self.database_category = row - 1;
+                    self.database_object_selected = 0;
+                    self.database_object_offset = 0;
+                }
+            } else {
+                let index = self.database_object_offset + usize::from(mouse.row - LIST_FIRST_ROW);
+                if index < self.db_objects.len() {
+                    self.database_object_selected = index;
+                }
+            }
         }
+    }
+
+    fn database_left_width(&self) -> usize {
+        (self.viewport_width * 25 / 100).max(24)
+    }
+
+    fn render(&mut self, terminal: &mut RawTerminal) -> Result<(), String> {
         let width = self.viewport_width;
         let height = self.viewport_height;
         let mut lines = Vec::new();
-        let filtered_count = self.filtered_indices().len();
-        lines.push(format!(
-            " vector-log-tui  {}  objects={}/{}  skipped={}  mode={:?}",
-            self.path.display(),
-            filtered_count,
-            self.summaries.len(),
-            self.skipped_objects,
-            self.mode
+        let filtered_count = self.filtered.len();
+        lines.push(paint_bold(
+            format!(
+                " vector-log-tui  {}  objects={}/{}  skipped={}  mode={:?}",
+                self.path.display(),
+                filtered_count,
+                self.summaries.len(),
+                self.skipped_objects,
+                self.mode
+            ),
+            ANSI_BRIGHT_CYAN,
         ));
-        lines.push(
-            " databases: ".to_string()
-                + &if self.bindings.is_empty() {
-                    "none".to_string()
-                } else {
-                    self.bindings
-                        .iter()
-                        .map(|entry| {
-                            format!(
-                                "{}{}={}",
-                                entry.binding.bus(),
-                                entry.binding.channel(),
-                                entry.path.display()
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("  ")
-                },
-        );
-        lines.push("─".repeat(width));
+        let databases = if self.bindings.is_empty() {
+            "none".to_string()
+        } else {
+            self.bindings
+                .iter()
+                .map(|entry| {
+                    format!(
+                        "{}{}={}",
+                        entry.binding.bus(),
+                        entry.binding.channel(),
+                        entry.path.display()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("  ")
+        };
+        lines.push(paint(format!(" databases: {databases}"), ANSI_CYAN));
+        lines.push(paint("─".repeat(width), ANSI_BRIGHT_CYAN));
         match self.mode {
             Mode::Messages => self.render_messages(&mut lines, width, height),
             Mode::Detail => self.render_detail(&mut lines, width, height),
             Mode::Curve => self.render_curve(&mut lines, width, height),
+            Mode::Databases => self.render_databases(&mut lines, width, height),
         }
-        lines.push("─".repeat(width));
+        lines.push(paint("─".repeat(width), ANSI_BRIGHT_CYAN));
         let footer = if let Some(kind) = self.input {
             let prompt = match kind {
                 InputKind::Filter => "/",
                 InputKind::Binding => "bind (can|lin CHANNEL PATH): ",
+                InputKind::DatabaseFilter => "db /",
             };
             format!("{prompt}{}  [Enter] apply  [Esc] cancel", self.input_buffer)
         } else {
             match self.mode {
                 Mode::Messages => {
-                    "[j/k] move [Enter] detail [/] filter [b] bind [p] curve [q] quit"
+                    "[j/k] move [Enter] detail [/] filter [e] export [b] bind [d] databases [p] curve [q] quit"
                 }
-                Mode::Detail => "[j/k] signal [p] curve [b] bind [Esc] back [q] quit",
+                Mode::Detail => "[j/k] signal [p] curve [e] export [b] bind [Esc] back [q] quit",
                 Mode::Curve => "[Esc] back [q] quit",
+                Mode::Databases => {
+                    "[j/k] object [Left/Right] category [/] search [[]/[]] database [b] bind [Esc] back [q] quit"
+                }
             }
             .to_string()
         };
-        lines.push(format!("{footer}  {}", self.status));
-        let mut output = String::from("\x1b[2J\x1b[H");
+        lines.push(paint_bold(
+            format!("{footer}  {}", self.status),
+            ANSI_BRIGHT_YELLOW,
+        ));
+        let mut output = String::from("\x1b[H");
         for line in lines.into_iter().take(height) {
-            output.push_str(&truncate(&line, width));
+            output.push_str(&truncate_ansi(&line, width));
+            output.push_str("\x1b[K");
             output.push('\n');
         }
+        output.push_str("\x1b[J");
         terminal.write(&output).map_err(|error| error.to_string())
     }
 
     fn render_messages(&self, lines: &mut Vec<String>, width: usize, height: usize) {
-        let indices = self.filtered_indices();
+        let indices = &self.filtered;
         let split = (width * 43 / 100).max(24);
-        lines.push(format!(
-            "{:<split$} │ Preview",
-            format!("Messages ({}/{})", indices.len(), self.summaries.len())
+        lines.push(paint_bold(
+            two_column(
+                &format!("Messages ({}/{})", indices.len(), self.summaries.len()),
+                "Preview",
+                split,
+                width,
+            ),
+            ANSI_BRIGHT_CYAN,
         ));
-        lines.push(format!(
-            "{}─┼{}",
-            "─".repeat(split),
-            "─".repeat(width.saturating_sub(split + 1))
+        lines.push(paint(
+            format!(
+                "{}─┼{}",
+                "─".repeat(split),
+                "─".repeat(width.saturating_sub(split + 1))
+            ),
+            ANSI_CYAN,
         ));
         let available = height.saturating_sub(7);
         let preview = self
@@ -719,27 +1231,28 @@ impl App {
             .unwrap_or_else(|| vec!["No matching messages".to_string()]);
         for row in 0..available {
             let message_index = self.list_offset + row;
-            let left = indices
+            let selected = message_index == self.selected;
+            let summary = indices
                 .get(message_index)
-                .and_then(|index| self.summaries.get(*index))
+                .and_then(|index| self.summaries.get(*index));
+            let left = summary
                 .map(|summary| {
                     format!(
                         "{}{}",
-                        if message_index == self.selected {
-                            "▶ "
-                        } else {
-                            "  "
-                        },
+                        if selected { "▶ " } else { "  " },
                         summary_line(summary)
                     )
                 })
                 .unwrap_or_default();
             let right = preview.get(row).cloned().unwrap_or_default();
-            lines.push(format!(
-                "{:<split$} │ {}",
-                truncate(&left, split),
-                truncate(&right, width.saturating_sub(split + 3))
-            ));
+            let line = two_column(&left, &right, split, width);
+            lines.push(if selected {
+                paint_selected(line)
+            } else if let Some(summary) = summary {
+                message_color(summary, line)
+            } else {
+                paint(line, ANSI_WHITE)
+            });
         }
     }
 
@@ -749,7 +1262,8 @@ impl App {
             return;
         };
         let split = (width * 43 / 100).max(24);
-        let left = summary_detail_lines(summary, self.selected_object());
+        let mut left = summary_detail_lines(summary, self.selected_object());
+        left.extend(timing_lines(self.frame_timing(summary)));
         let mut right = vec!["Signals".to_string()];
         if self.detail_rows.is_empty() {
             right.push("  no decoded signals (bind a matching database with b)".to_string());
@@ -767,14 +1281,22 @@ impl App {
             ));
         }
         for row in 0..height.saturating_sub(5) {
-            lines.push(format!(
-                "{:<split$} │ {}",
-                truncate(left.get(row).map_or("", String::as_str), split),
-                truncate(
-                    right.get(row).map_or("", String::as_str),
-                    width.saturating_sub(split + 3)
-                )
-            ));
+            let line = two_column(
+                left.get(row).map_or("", String::as_str),
+                right.get(row).map_or("", String::as_str),
+                split,
+                width,
+            );
+            let signal_selected = row > 0
+                && self.detail_offset + row - 1 == self.selected_signal
+                && self.detail_offset + row - 1 < self.detail_rows.len();
+            lines.push(if signal_selected {
+                paint_selected(line)
+            } else if row == 0 {
+                paint_bold(line, ANSI_BRIGHT_CYAN)
+            } else {
+                paint(line, ANSI_WHITE)
+            });
         }
     }
 
@@ -788,27 +1310,449 @@ impl App {
             .saturating_add(curve.window_len)
             .min(curve.samples.len());
         let visible = &curve.samples[start..end];
-        lines.push(format!(
-            "Curve: {}  samples={}/{}  window={}-{}",
-            curve.title,
-            visible.len(),
-            curve.samples.len(),
-            start,
-            end
+        lines.push(paint_bold(
+            format!(
+                "Curve: {}  samples={}/{}  window={}-{}{}",
+                curve.title,
+                visible.len(),
+                curve.samples.len(),
+                start,
+                end,
+                if curve.truncated {
+                    "  (first samples only)"
+                } else {
+                    ""
+                }
+            ),
+            ANSI_BRIGHT_CYAN,
         ));
         if let Some(error) = &curve.error {
-            lines.push(format!("decode note: {error}"));
+            lines.push(paint(format!("decode note: {error}"), ANSI_RED));
         }
         if visible.is_empty() {
-            lines.push("No numeric samples available".to_string());
+            lines.push(paint("No numeric samples available", ANSI_BRIGHT_YELLOW));
             return;
         }
         lines.extend(
             ascii_curve(visible, width.saturating_sub(2), height.saturating_sub(6))
                 .lines()
-                .map(str::to_string),
+                .map(|line| paint(line, ANSI_BRIGHT_GREEN)),
         );
     }
+
+    fn render_databases(&self, lines: &mut Vec<String>, width: usize, height: usize) {
+        let left = self.database_left_width().min(width.saturating_sub(2));
+        let middle = (width * 32 / 100)
+            .max(30)
+            .min(width.saturating_sub(left + 1));
+        let right = width.saturating_sub(left + middle + 6);
+        let objects = &self.db_objects;
+        let categories = self.database_categories();
+        let selected_object = objects.get(self.database_object_selected);
+        let database_label = self
+            .bindings
+            .get(self.database_selected)
+            .map(|entry| {
+                format!(
+                    "{} ch{} {}",
+                    entry.binding.bus(),
+                    entry.binding.channel(),
+                    entry.path.display()
+                )
+            })
+            .unwrap_or_else(|| "No database loaded".to_string());
+        lines.push(paint_bold(
+            three_column(
+                "Database tree",
+                &format!(
+                    "{} ({})",
+                    self.selected_database_category()
+                        .map_or("Objects", DbCategory::label),
+                    objects.len()
+                ),
+                selected_object.map_or("Details", |object| object.title.as_str()),
+                left,
+                middle,
+                width,
+            ),
+            ANSI_BRIGHT_CYAN,
+        ));
+        lines.push(paint(
+            format!(
+                "{}─┼{}─┼{}",
+                "─".repeat(left),
+                "─".repeat(middle),
+                "─".repeat(right)
+            ),
+            ANSI_CYAN,
+        ));
+        let rows = height.saturating_sub(7).max(1);
+        for row in 0..rows {
+            let category = if row == 0 {
+                format!("▶ {database_label}")
+            } else {
+                categories
+                    .get(row - 1)
+                    .map(|category| {
+                        let marker = if row - 1 == self.database_category {
+                            "▶ "
+                        } else {
+                            "  "
+                        };
+                        format!("{marker}{}", category.label())
+                    })
+                    .unwrap_or_default()
+            };
+            let object_index = self.database_object_offset + row;
+            let object = objects.get(object_index);
+            let object_line = object.map_or_else(String::new, |object| {
+                format!(
+                    "{}{}  {}",
+                    if object_index == self.database_object_selected {
+                        "▶ "
+                    } else {
+                        "  "
+                    },
+                    object.title,
+                    object.subtitle
+                )
+            });
+            let detail_line = selected_object
+                .and_then(|object| object.details.get(row))
+                .map_or("", String::as_str);
+            let line = three_column(&category, &object_line, detail_line, left, middle, width);
+            let category_selected = row > 0 && row - 1 == self.database_category;
+            let object_selected = object.is_some() && object_index == self.database_object_selected;
+            lines.push(if row == 0 {
+                paint_bold(line, ANSI_BRIGHT_YELLOW)
+            } else if category_selected || object_selected {
+                paint_selected(line)
+            } else {
+                paint(line, ANSI_WHITE)
+            });
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DbObject {
+    title: String,
+    subtitle: String,
+    details: Vec<String>,
+}
+
+fn database_objects(entry: &BindingEntry, category: DbCategory) -> Vec<DbObject> {
+    match (entry.binding.database(), category) {
+        (Database::Can(database), DbCategory::Overview) => vec![DbObject {
+            title: "DBC overview".to_string(),
+            subtitle: format!(
+                "{} messages, {} signals",
+                database.len(),
+                database.signal_names().count()
+            ),
+            details: vec![
+                format!("source: {}", database.source_path().unwrap_or("-")),
+                format!("version: {}", database.version().unwrap_or("-")),
+                format!("messages: {}", database.len()),
+                format!("signals: {}", database.signal_names().count()),
+                format!("nodes: {}", database.nodes().count()),
+                format!("attributes: {}", database.attributes().count()),
+            ],
+        }],
+        (Database::Can(database), DbCategory::Messages) => database
+            .messages()
+            .map(|message| DbObject {
+                title: message.name.clone(),
+                subtitle: format!(
+                    "0x{:X}  dlc={}  {} signals{}",
+                    message.id.id,
+                    message.dlc,
+                    message.signals.len(),
+                    if message.is_fd { "  CAN-FD" } else { "" }
+                ),
+                details: dbc_message_details(message),
+            })
+            .collect(),
+        (Database::Can(database), DbCategory::Signals) => database
+            .messages()
+            .flat_map(|message| {
+                message.signals.iter().map(move |signal| DbObject {
+                    title: format!("{}.{}", message.name, signal.name),
+                    subtitle: format!(
+                        "0x{:X}  [{}|{}]  {:?}",
+                        message.id.id, signal.start_bit, signal.bit_length, signal.signal_type
+                    ),
+                    details: dbc_signal_details(message, signal),
+                })
+            })
+            .collect(),
+        (Database::Can(database), DbCategory::Nodes) => database
+            .nodes()
+            .map(|node| DbObject {
+                title: node.name.clone(),
+                subtitle: format!("node{}", source_suffix(node.source)),
+                details: vec![format!("name: {}", node.name)],
+            })
+            .collect(),
+        (Database::Can(database), DbCategory::Attributes) => database
+            .attributes()
+            .map(|(name, value)| DbObject {
+                title: name.to_string(),
+                subtitle: value.to_string(),
+                details: vec![format!("name: {name}"), format!("value: {value}")],
+            })
+            .collect(),
+        (Database::Can(database), DbCategory::ValueTables) => database
+            .value_tables()
+            .map(|(name, table)| DbObject {
+                title: name.to_string(),
+                subtitle: format!("{} values", table.iter().count()),
+                details: vec![format!("values: {}", value_table_text(table))],
+            })
+            .collect(),
+        (Database::Lin(database), DbCategory::Overview) => vec![DbObject {
+            title: "LDF overview".to_string(),
+            subtitle: format!(
+                "{} frames, {} signals",
+                database.len(),
+                database.signal_count()
+            ),
+            details: vec![
+                format!("source: {}", database.source_path().unwrap_or("-")),
+                format!("protocol: {}", database.protocol_version().unwrap_or("-")),
+                format!("language: {}", database.language_version().unwrap_or("-")),
+                format!("speed: {:?} kbps", database.speed_kbps()),
+                format!("frames: {}", database.len()),
+                format!(
+                    "diagnostic frames: {}",
+                    database.diagnostic_frames().count()
+                ),
+                format!("nodes: {}", database.nodes().count()),
+            ],
+        }],
+        (Database::Lin(database), DbCategory::Frames) => database
+            .frames()
+            .map(|frame| DbObject {
+                title: frame.name.clone(),
+                subtitle: format!(
+                    "0x{:02X}  dlc={}  {} signals",
+                    frame.id,
+                    frame.dlc,
+                    frame.signals.len()
+                ),
+                details: lin_frame_details(frame),
+            })
+            .collect(),
+        (Database::Lin(database), DbCategory::Signals) => database
+            .frames()
+            .flat_map(|frame| {
+                frame.signals.iter().map(move |signal| DbObject {
+                    title: format!("{}.{}", frame.name, signal.name),
+                    subtitle: format!(
+                        "[{}|{}] factor={} offset={}",
+                        signal.start_bit, signal.bit_length, signal.factor, signal.offset
+                    ),
+                    details: lin_signal_details(signal),
+                })
+            })
+            .collect(),
+        (Database::Lin(database), DbCategory::Nodes) => database
+            .nodes()
+            .map(|node| DbObject {
+                title: node.name.clone(),
+                subtitle: format!(
+                    "NAD={}",
+                    node.configured_nad
+                        .map_or_else(|| "-".to_string(), |value| value.to_string())
+                ),
+                details: vec![
+                    format!("name: {}", node.name),
+                    format!("configured NAD: {:?}", node.configured_nad),
+                    format!("timebase ms: {:?}", node.timebase_ms),
+                    format!("jitter ms: {:?}", node.jitter_ms),
+                ],
+            })
+            .collect(),
+        (Database::Lin(database), DbCategory::DiagnosticFrames) => database
+            .diagnostic_frames()
+            .map(|frame| DbObject {
+                title: frame.name.clone(),
+                subtitle: format!(
+                    "0x{:02X}  dlc={}  {} signals",
+                    frame.id,
+                    frame.dlc,
+                    frame.signals.len()
+                ),
+                details: lin_diagnostic_frame_details(frame),
+            })
+            .collect(),
+        (Database::Lin(database), DbCategory::DiagnosticSignals) => database
+            .diagnostic_signals()
+            .map(|signal| DbObject {
+                title: signal.name.clone(),
+                subtitle: format!(
+                    "len={} initial={:?}",
+                    signal.bit_length, signal.initial_value
+                ),
+                details: vec![
+                    format!("name: {}", signal.name),
+                    format!("bit length: {}", signal.bit_length),
+                    format!("initial value: {:?}", signal.initial_value),
+                ],
+            })
+            .collect(),
+        (Database::Lin(database), DbCategory::Schedules) => database
+            .schedules()
+            .map(|(name, entries)| DbObject {
+                title: name.to_string(),
+                subtitle: format!("{} entries", entries.len()),
+                details: entries
+                    .iter()
+                    .map(|entry| format!("{} delay_ms={}", entry.frame_name, entry.delay_ms))
+                    .collect(),
+            })
+            .collect(),
+        (Database::Lin(database), DbCategory::DynamicFrames) => database
+            .dynamic_frames()
+            .map(|frame| DbObject {
+                title: frame.name.clone(),
+                subtitle: format!("{:?} trigger={:?}", frame.kind, frame.trigger_frame_id),
+                details: vec![
+                    format!("kind: {:?}", frame.kind),
+                    format!("trigger frame id: {:?}", frame.trigger_frame_id),
+                    format!("members: {}", frame.frame_names.join(", ")),
+                ],
+            })
+            .collect(),
+        (Database::Lin(database), DbCategory::OptionalSections) => database
+            .optional_sections()
+            .map(|section| DbObject {
+                title: section.name.clone(),
+                subtitle: source_suffix(section.source),
+                details: vec![format!("name: {}", section.name)],
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn dbc_message_details(message: &blf_core::DbcMessage) -> Vec<String> {
+    let mut details = vec![
+        format!("name: {}", message.name),
+        format!(
+            "frame id: 0x{:X} ({})",
+            message.id.id,
+            if message.id.extended {
+                "extended"
+            } else {
+                "standard"
+            }
+        ),
+        format!("DLC: {}  FD: {}", message.dlc, message.is_fd),
+        format!("transmitter: {}", message.transmitter),
+        format!("payload: {:?}", message.payload_kind),
+        format!("signals: {}", message.signals.len()),
+    ];
+    if let Some(comment) = &message.comment {
+        details.push(format!("comment: {comment}"));
+    }
+    details.extend(
+        message
+            .signals
+            .iter()
+            .map(|signal| format!("signal: {}", signal.name)),
+    );
+    details
+}
+
+fn dbc_signal_details(message: &blf_core::DbcMessage, signal: &blf_core::CanSignal) -> Vec<String> {
+    let mut details = vec![
+        format!("message: {}  frame=0x{:X}", message.name, message.id.id),
+        format!(
+            "layout: start={} length={}",
+            signal.start_bit, signal.bit_length
+        ),
+        format!(
+            "byte order: {:?}  type: {:?}",
+            signal.byte_order, signal.signal_type
+        ),
+        format!("scale/offset: {} / {}", signal.factor, signal.offset),
+        format!("range: {:?}..{:?}", signal.minimum, signal.maximum),
+        format!("unit: {}", signal.unit.as_deref().unwrap_or("-")),
+        format!("receivers: {}", signal.receivers.join(", ")),
+        format!("multiplex: {:?}", signal.multiplex),
+    ];
+    if !signal.choices.is_empty() {
+        details.push(format!("choices: {}", value_table_text(&signal.choices)));
+    }
+    if let Some(comment) = &signal.comment {
+        details.push(format!("comment: {comment}"));
+    }
+    details
+}
+
+fn lin_frame_details(frame: &blf_core::LinFrame) -> Vec<String> {
+    let mut details = vec![
+        format!("frame id: 0x{:02X}", frame.id),
+        format!("DLC: {}  publisher: {}", frame.dlc, frame.publisher),
+        format!("checksum: {:?}", frame.checksum),
+        format!("signals: {}", frame.signals.len()),
+    ];
+    details.extend(
+        frame
+            .signals
+            .iter()
+            .map(|signal| format!("signal: {}", signal.name)),
+    );
+    details
+}
+
+fn lin_diagnostic_frame_details(frame: &blf_core::LinDiagnosticFrame) -> Vec<String> {
+    let mut details = vec![
+        format!("frame id: 0x{:02X}", frame.id),
+        format!("DLC: {}", frame.dlc),
+        format!("checksum: {:?}", frame.checksum),
+        format!("signals: {}", frame.signals.len()),
+    ];
+    details.extend(
+        frame
+            .signals
+            .iter()
+            .map(|signal| format!("signal: {}", signal.name)),
+    );
+    details
+}
+
+fn lin_signal_details(signal: &blf_core::LinSignal) -> Vec<String> {
+    let mut details = vec![
+        format!(
+            "layout: start={} length={}",
+            signal.start_bit, signal.bit_length
+        ),
+        format!("publisher: {}", signal.publisher.as_deref().unwrap_or("-")),
+        format!("subscribers: {}", signal.subscribers.join(", ")),
+        format!("scale/offset: {} / {}", signal.factor, signal.offset),
+        format!("range: {:?}..{:?}", signal.minimum, signal.maximum),
+        format!("encoding: {}", signal.encoding.as_deref().unwrap_or("-")),
+    ];
+    if !signal.choices.is_empty() {
+        details.push(format!("choices: {}", value_table_text(&signal.choices)));
+    }
+    details
+}
+
+fn value_table_text(table: &blf_core::ValueTable) -> String {
+    table
+        .iter()
+        .map(|(value, text)| format!("{value}={text}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn source_suffix(source: Option<blf_core::SourceSpan>) -> String {
+    source.map_or_else(String::new, |span| {
+        format!(" @{}:{}", span.line, span.column)
+    })
 }
 
 fn summary_for(object_index: usize, object: &Object) -> MessageSummary {
@@ -859,12 +1803,12 @@ fn summary_for(object_index: usize, object: &Object) -> MessageSummary {
         _ => (None, None, None, None, None, Vec::new()),
     };
     let status = match object {
-        Object::Lin(value) => lin_status(classify_lin_object(value).state).to_string(),
+        Object::Lin(value) => lin_status(classify_lin_object(value).state),
         Object::CanMessage(_)
         | Object::CanMessage2(_)
         | Object::CanFdMessage(_)
-        | Object::CanFdMessage64(_) => "ok".to_string(),
-        _ => "event".to_string(),
+        | Object::CanFdMessage64(_) => "ok",
+        _ => "event",
     };
     MessageSummary {
         object_index,
@@ -874,7 +1818,7 @@ fn summary_for(object_index: usize, object: &Object) -> MessageSummary {
         channel,
         frame_id,
         object_type_raw: object.object_type_raw(),
-        class_name: object.object_type().name().to_string(),
+        class_name: object.object_type().name(),
         direction,
         dlc,
         payload,
@@ -1021,7 +1965,7 @@ fn summary_detail_lines(summary: &MessageSummary, object: Option<&Object>) -> Ve
         summary
             .frame_id
             .map_or_else(|| "-".to_string(), |id| format!("0x{id:X}")),
-        summary.direction.as_deref().unwrap_or("-"),
+        summary.direction.unwrap_or("-"),
         summary
             .dlc
             .map_or_else(|| "-".to_string(), |value| value.to_string())
@@ -1077,6 +2021,56 @@ fn field_value(value: &FieldValue) -> String {
     }
 }
 
+fn export_path(trace: &Path) -> PathBuf {
+    let name = trace.file_name().map_or_else(
+        || "trace".to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    trace.with_file_name(format!("{name}.signals.csv"))
+}
+
+fn csv_line(fields: &[String]) -> String {
+    fields
+        .iter()
+        .map(|field| csv_field(field))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn csv_signal_value(row: &SignalRow) -> String {
+    if let Some(error) = &row.error {
+        return format!("ERROR: {error}");
+    }
+    if let Some(physical) = row.physical {
+        return format!("{physical:.6}");
+    }
+    if let Some(choice) = &row.choice {
+        return choice.clone();
+    }
+    row.raw.map_or_else(String::new, |raw| raw.to_string())
+}
+
+fn timing_lines(stats: Option<TimingStats>) -> Vec<String> {
+    let Some(stats) = stats else {
+        return vec!["period: not enough samples".to_string()];
+    };
+    vec![
+        "period:".to_string(),
+        format!("  avg: {:.3} ms", stats.avg_ms),
+        format!("  min/max: {:.3} / {:.3} ms", stats.min_ms, stats.max_ms),
+        format!("  jitter: ±{:.3} ms", stats.jitter_ms),
+        format!("  frames: {}", stats.frames),
+    ]
+}
+
 fn summary_line(summary: &MessageSummary) -> String {
     let time = format_timestamp(summary.timestamp_ns);
     let bus = summary.bus.map_or("--", BusKind::as_str);
@@ -1086,14 +2080,28 @@ fn summary_line(summary: &MessageSummary) -> String {
     let id = summary
         .frame_id
         .map_or_else(|| "------".to_string(), |value| format!("0x{value:03X}"));
-    let direction = summary.direction.as_deref().unwrap_or("-");
+    let direction = summary.direction.unwrap_or("-");
     let payload = hex_bytes(&summary.payload);
-    let mut text = format!("{time:>12} {bus:<3} {channel:>3} {id:>6} {direction:<3} {payload}");
-    if text.len() > 120 {
-        text.truncate(117);
-        text.push_str("...");
+    let text = format!("{time:>12} {bus:<3} {channel:>3} {id:>6} {direction:<3} {payload}");
+    if display_width(&text) > 120 {
+        return truncate(&text, 120);
     }
     text
+}
+
+fn message_color(summary: &MessageSummary, text: String) -> String {
+    if summary.status == "ok" {
+        return match summary.bus {
+            Some(BusKind::Can) => paint(text, ANSI_BRIGHT_GREEN),
+            Some(BusKind::Lin) => paint(text, ANSI_MAGENTA),
+            None => paint(text, ANSI_WHITE),
+        };
+    }
+    match summary.status {
+        "event" => paint(text, ANSI_CYAN),
+        "header_only" | "no_response" | "unsupported" => paint(text, ANSI_BRIGHT_YELLOW),
+        _ => paint(text, ANSI_RED),
+    }
 }
 
 fn row_display(row: &SignalRow) -> String {
@@ -1115,7 +2123,8 @@ fn row_display(row: &SignalRow) -> String {
 fn ascii_curve(samples: &[(u64, f64)], width: usize, height: usize) -> String {
     let plot_width = width.saturating_sub(10).max(1);
     let plot_height = height.saturating_sub(2).max(1);
-    let mut columns = vec![Vec::new(); plot_width];
+    let mut columns_low = vec![usize::MAX; plot_width];
+    let mut columns_high = vec![0_usize; plot_width];
     let first = samples.first().map_or(0, |sample| sample.0);
     let last = samples
         .last()
@@ -1134,9 +2143,10 @@ fn ascii_curve(samples: &[(u64, f64)], width: usize, height: usize) -> String {
             * (plot_width - 1) as f64)
             .round() as usize;
         let y = (((max - value) / range) * (plot_height - 1) as f64).round() as usize;
-        if let Some(column) = columns.get_mut(x.min(plot_width - 1)) {
-            column.push(y.min(plot_height - 1));
-        }
+        let x = x.min(plot_width - 1);
+        let y = y.min(plot_height - 1);
+        columns_low[x] = columns_low[x].min(y);
+        columns_high[x] = columns_high[x].max(y);
     }
     let mut lines = Vec::new();
     for row in 0..plot_height {
@@ -1144,13 +2154,47 @@ fn ascii_curve(samples: &[(u64, f64)], width: usize, height: usize) -> String {
             "{max:>8.3} ",
             max = max - range * row as f64 / plot_height as f64
         );
-        for column in &columns {
-            line.push(if column.contains(&row) { '*' } else { ' ' });
+        for column in 0..plot_width {
+            let drawn = columns_low[column] != usize::MAX
+                && columns_low[column] <= row
+                && row <= columns_high[column];
+            line.push(if drawn { '*' } else { ' ' });
         }
         lines.push(line);
     }
     lines.push(format!("{min:>8.3} {}", "-".repeat(plot_width)));
     lines.join("\n")
+}
+
+fn timing_stats(timestamps: &[u64]) -> Option<TimingStats> {
+    if timestamps.len() < 2 {
+        return None;
+    }
+    let mut ordered = timestamps.to_vec();
+    ordered.sort_unstable();
+    let deltas = ordered
+        .windows(2)
+        .map(|pair| pair[1].saturating_sub(pair[0]))
+        .filter(|delta| *delta > 0)
+        .collect::<Vec<_>>();
+    if deltas.is_empty() {
+        return None;
+    }
+    let average = deltas.iter().map(|delta| *delta as f64).sum::<f64>() / deltas.len() as f64;
+    let min = deltas.iter().copied().min().unwrap_or_default() as f64;
+    let max = deltas.iter().copied().max().unwrap_or_default() as f64;
+    let jitter = deltas
+        .iter()
+        .map(|delta| (*delta as f64 - average).abs())
+        .sum::<f64>()
+        / deltas.len() as f64;
+    Some(TimingStats {
+        frames: ordered.len(),
+        avg_ms: average / 1_000_000.0,
+        min_ms: min / 1_000_000.0,
+        max_ms: max / 1_000_000.0,
+        jitter_ms: jitter / 1_000_000.0,
+    })
 }
 
 fn format_timestamp(timestamp: Option<u64>) -> String {
@@ -1186,7 +2230,7 @@ fn summary_matches(summary: &MessageSummary, filter: &str) -> bool {
         summary
             .frame_id
             .map_or_else(|| "".to_string(), |value| format!("{value:X}")),
-        summary.direction.as_deref().unwrap_or(""),
+        summary.direction.unwrap_or(""),
         hex_bytes(&summary.payload),
         summary.status,
         summary.object_type_raw,
@@ -1209,6 +2253,10 @@ fn lin_status(state: blf_core::LinResponseState) -> &'static str {
     }
 }
 
+fn list_page_size(viewport_height: usize, reserved_rows: usize) -> usize {
+    viewport_height.saturating_sub(reserved_rows).max(1)
+}
+
 fn move_index(index: usize, count: usize, delta: isize) -> usize {
     if count == 0 {
         return 0;
@@ -1217,23 +2265,21 @@ fn move_index(index: usize, count: usize, delta: isize) -> usize {
     index.clamp(0, count as isize - 1) as usize
 }
 
-fn can_direction(value: u8) -> String {
+fn can_direction(value: u8) -> &'static str {
     match value {
         0 => "Rx",
         1 => "Tx",
         _ => "?",
     }
-    .to_string()
 }
 
-fn lin_direction(value: u8) -> String {
+fn lin_direction(value: u8) -> &'static str {
     match value {
         0 => "Rx",
         1 => "Tx",
         2 => "TxRq",
         _ => "?",
     }
-    .to_string()
 }
 
 fn normalize_can_id(raw: u32) -> (u32, bool) {
@@ -1468,25 +2514,150 @@ fn parse_terminal_size(value: &str) -> Option<(usize, usize)> {
     }
 }
 
+/// Terminal cells used by one character; CJK/fullwidth glyphs occupy two.
+fn char_width(character: char) -> usize {
+    match u32::from(character) {
+        0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x20D0..=0x20F0 => 0,
+        0x1100..=0x115F
+        | 0x2E80..=0x303E
+        | 0x3041..=0x33FF
+        | 0x3400..=0x4DBF
+        | 0x4E00..=0x9FFF
+        | 0xA000..=0xA4CF
+        | 0xA960..=0xA97F
+        | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF
+        | 0xFE10..=0xFE19
+        | 0xFE30..=0xFE6F
+        | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6
+        | 0x1F300..=0x1F64F
+        | 0x1F900..=0x1F9FF
+        | 0x20000..=0x3FFFD => 2,
+        _ => 1,
+    }
+}
+
+fn display_width(value: &str) -> usize {
+    value.chars().map(char_width).sum()
+}
+
 fn truncate(value: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    let mut chars = value.chars();
-    let visible = chars.by_ref().take(width).collect::<String>();
-    if chars.next().is_none() {
-        return visible;
+    if display_width(value) <= width {
+        return value.to_string();
     }
     if width <= 3 {
         return ".".repeat(width);
     }
-    let mut truncated = value.chars().take(width - 3).collect::<String>();
+    let mut truncated = take_width(value, width - 3);
     truncated.push_str("...");
     truncated
 }
 
+/// Copy characters until adding the next one would exceed `width` cells.
+fn take_width(value: &str, width: usize) -> String {
+    let mut output = String::new();
+    let mut used = 0;
+    for character in value.chars() {
+        let cells = char_width(character);
+        if used + cells > width {
+            break;
+        }
+        used += cells;
+        output.push(character);
+    }
+    output
+}
+
+/// Left-pad to an exact display width so columns line up for wide glyphs too.
+fn pad_to_width(value: &str, width: usize) -> String {
+    let mut padded = value.to_string();
+    let used = display_width(value);
+    padded.extend(std::iter::repeat_n(' ', width.saturating_sub(used)));
+    padded
+}
+
+fn two_column(left: &str, right: &str, split: usize, width: usize) -> String {
+    let split = split.min(width.saturating_sub(3));
+    format!(
+        "{} │ {}",
+        pad_to_width(&truncate(left, split), split),
+        truncate(right, width.saturating_sub(split + 3))
+    )
+}
+
+fn three_column(
+    left: &str,
+    middle: &str,
+    right: &str,
+    left_width: usize,
+    middle_width: usize,
+    width: usize,
+) -> String {
+    let left_width = left_width.min(width.saturating_sub(6));
+    let middle_width = middle_width.min(width.saturating_sub(left_width + 6));
+    format!(
+        "{} │ {} │ {}",
+        pad_to_width(&truncate(left, left_width), left_width),
+        pad_to_width(&truncate(middle, middle_width), middle_width),
+        truncate(right, width.saturating_sub(left_width + middle_width + 6))
+    )
+}
+
+/// Copy ANSI escapes verbatim while counting only visible cells.
+fn ansi_prefix(value: &str, width: usize) -> (String, bool) {
+    let mut output = String::new();
+    let mut used = 0;
+    let mut chars = value.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '\x1b' {
+            output.push(character);
+            if chars.next_if_eq(&'[').is_some() {
+                output.push('[');
+                for code in chars.by_ref() {
+                    output.push(code);
+                    if ('@'..='~').contains(&code) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        let cells = char_width(character);
+        if used + cells > width {
+            return (output, false);
+        }
+        used += cells;
+        output.push(character);
+    }
+    (output, true)
+}
+
+fn truncate_ansi(value: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let (prefix, complete) = ansi_prefix(value, width);
+    if complete {
+        return prefix;
+    }
+    if width <= 3 {
+        let (short, _) = ansi_prefix(value, width);
+        return format!("{short}{ANSI_RESET}");
+    }
+    let (short, _) = ansi_prefix(value, width - 3);
+    format!("{short}...{ANSI_RESET}")
+}
+
 fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        println!("{}", usage());
+        return;
+    }
     let (path, specs) = match parse_args(&args) {
         Ok(value) => value,
         Err(error) => {
@@ -1502,6 +2673,25 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn strip_ansi(value: &str) -> String {
+        let mut output = String::new();
+        let mut chars = value.chars().peekable();
+        while let Some(character) = chars.next() {
+            if character == '\x1b' {
+                if chars.next_if_eq(&'[').is_some() {
+                    for code in chars.by_ref() {
+                        if ('@'..='~').contains(&code) {
+                            break;
+                        }
+                    }
+                }
+                continue;
+            }
+            output.push(character);
+        }
+        output
+    }
 
     #[test]
     fn moves_selection_with_bounds() {
@@ -1536,13 +2726,26 @@ mod tests {
     }
 
     #[test]
-    fn truncates_by_character_without_splitting_utf8() {
+    fn truncates_without_splitting_utf8_or_wide_glyphs() {
         assert_eq!(truncate("abcdef", 0), "");
         assert_eq!(truncate("abcdef", 3), "...");
         assert_eq!(truncate("abcdef", 5), "ab...");
         assert_eq!(truncate("信号曲线", 3), "...");
-        assert_eq!(truncate("信号曲线", 4), "信号曲线");
+        // Four CJK glyphs need eight cells; they must not be split in half.
+        assert_eq!(truncate("信号曲线", 8), "信号曲线");
+        assert_eq!(truncate("信号曲线", 4), "...");
         assert_eq!(truncate("信号", 4), "信号");
+    }
+
+    #[test]
+    fn truncates_ansi_by_visible_width_and_keeps_reset() {
+        let value = paint("abcdef", ANSI_BRIGHT_GREEN);
+        let truncated = truncate_ansi(&value, 5);
+        assert!(truncated.starts_with(ANSI_BRIGHT_GREEN));
+        assert!(truncated.ends_with(ANSI_RESET));
+        assert!(truncated.contains("ab..."));
+        assert!(!truncated.contains("cdef"));
+        assert_eq!(truncate_ansi(&value, 6), value);
     }
 
     #[test]
@@ -1577,11 +2780,148 @@ mod tests {
     }
 
     #[test]
+    fn display_width_counts_wide_glyphs_as_two_cells() {
+        assert_eq!(display_width("abc"), 3);
+        assert_eq!(display_width("信号"), 4);
+        assert_eq!(display_width("信号abc"), 7);
+        assert_eq!(display_width(""), 0);
+        // Combining marks take no cell of their own.
+        assert_eq!(display_width("e\u{301}"), 1);
+    }
+
+    #[test]
+    fn truncate_never_exceeds_the_requested_cells() {
+        assert!(display_width(&truncate("信号曲线信号曲线", 6)) <= 6);
+        assert!(display_width(&truncate("信号曲线信号曲线", 7)) <= 7);
+        assert_eq!(truncate("信号曲线", 8), "信号曲线");
+        assert!(display_width(&truncate("abcdef", 5)) <= 5);
+    }
+
+    #[test]
+    fn columns_stay_aligned_with_wide_glyphs() {
+        let line = two_column("信号 0x344", "预览内容", 20, 40);
+        let (left, right) = line.split_once(" │ ").unwrap();
+        assert_eq!(display_width(left), 20);
+        assert_eq!(right, "预览内容");
+        assert!(display_width(&line) <= 40);
+
+        let line = three_column("Database", "信号 (2)", "details", 12, 14, 40);
+        let parts = line.split(" │ ").collect::<Vec<_>>();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(display_width(parts[0]), 12);
+        assert_eq!(display_width(parts[1]), 14);
+        assert!(display_width(&line) <= 40);
+
+        // Degenerate narrow terminals must clamp instead of wrapping.
+        let line = three_column("a", "b", "c", 10, 10, 12);
+        assert!(display_width(&line) <= 12);
+    }
+
+    #[test]
+    fn ansi_columns_stay_aligned_after_painting() {
+        let line = paint(
+            two_column("信号 0x344", "preview", 20, 40),
+            ANSI_BRIGHT_GREEN,
+        );
+        let visible = strip_ansi(&line);
+        let (left, _) = visible.split_once(" │ ").unwrap();
+        assert_eq!(display_width(left), 20);
+
+        let truncated = truncate_ansi(&line, 40);
+        assert!(display_width(&strip_ansi(&truncated)) <= 40);
+        assert!(truncated.contains(ANSI_RESET));
+    }
+
+    #[test]
+    fn summary_line_truncates_by_display_width() {
+        let summary = MessageSummary {
+            object_index: 0,
+            timestamp_ns: Some(1),
+            timestamp_source: None,
+            bus: Some(BusKind::Can),
+            channel: Some(1),
+            frame_id: Some(0x344),
+            object_type_raw: 1,
+            class_name: "CAN_MESSAGE",
+            direction: Some("Rx"),
+            dlc: Some(64),
+            payload: vec![0xAB; 64],
+            status: "ok",
+        };
+        let line = summary_line(&summary);
+        assert!(display_width(&line) <= 120);
+        assert!(line.ends_with("..."));
+    }
+
+    #[test]
+    fn pages_move_by_a_visible_page() {
+        assert_eq!(list_page_size(40, 7), 33);
+        assert_eq!(list_page_size(5, 9), 1);
+        assert_eq!(list_page_size(0, 7), 1);
+    }
+
+    #[test]
+    fn timing_reports_cycle_and_jitter() {
+        // 10 ms cycles with one 20 ms gap.
+        let timestamps = [0, 10_000_000, 20_000_000, 40_000_000];
+        let stats = timing_stats(&timestamps).expect("stats");
+        assert_eq!(stats.frames, 4);
+        assert!((stats.min_ms - 10.0).abs() < 1e-6);
+        assert!((stats.max_ms - 20.0).abs() < 1e-6);
+        assert!((stats.avg_ms - 13.333_333).abs() < 1e-3);
+        assert!(stats.jitter_ms > 0.0);
+    }
+
+    #[test]
+    fn timing_needs_two_samples() {
+        assert!(timing_stats(&[]).is_none());
+        assert!(timing_stats(&[1]).is_none());
+        // Duplicate timestamps carry no period.
+        assert!(timing_stats(&[5, 5, 5]).is_none());
+    }
+
+    #[test]
+    fn timing_lines_explain_missing_samples() {
+        let lines = timing_lines(None);
+        assert_eq!(lines, vec!["period: not enough samples".to_string()]);
+        let lines = timing_lines(timing_stats(&[0, 1_000_000]));
+        assert!(lines.iter().any(|line| line.contains("1.000 ms")));
+    }
+
+    #[test]
+    fn csv_fields_are_quoted_only_when_needed() {
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(csv_field("line\nbreak"), "\"line\nbreak\"");
+        assert_eq!(csv_line(&["a".into(), "b,c".into()]), "a,\"b,c\"");
+    }
+
+    #[test]
+    fn export_path_sits_next_to_the_trace() {
+        let path = export_path(&PathBuf::from("/tmp/run.blf"));
+        assert_eq!(path, PathBuf::from("/tmp/run.blf.signals.csv"));
+    }
+
+    #[test]
+    fn curve_columns_span_the_vertical_range() {
+        // Dense samples in one column must paint a vertical span, not one dot.
+        let samples = (0..200)
+            .map(|index| (index as u64, (index % 7) as f64))
+            .collect::<Vec<_>>();
+        let chart = ascii_curve(&samples, 30, 8);
+        assert!(chart.contains('*'));
+        let painted = chart.lines().filter(|line| line.contains('*')).count();
+        assert!(painted > 2, "expected a painted span, got {painted} rows");
+    }
+
+    #[test]
     fn curve_window_bounds_are_stable() {
         let mut curve = CurveData {
             title: "Speed".to_string(),
             samples: (0..100).map(|index| (index, index as f64)).collect(),
             error: None,
+            truncated: false,
             window_start: 0,
             window_len: 100,
         };
