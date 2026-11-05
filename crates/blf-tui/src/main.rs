@@ -125,6 +125,13 @@ enum Mode {
     Databases,
 }
 
+/// Which column of the database browser owns the keyboard focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatabasePane {
+    Tree,
+    Objects,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DbCategory {
     Overview,
@@ -180,6 +187,8 @@ enum InputEvent {
     Home,
     End,
     Enter,
+    Tab,
+    BackTab,
     Esc,
     Backspace,
     CtrlC,
@@ -308,6 +317,7 @@ struct App {
     viewport_height: usize,
     last_size_check: Instant,
     database_selected: usize,
+    database_pane: DatabasePane,
     database_category: usize,
     database_object_selected: usize,
     database_object_offset: usize,
@@ -373,6 +383,7 @@ impl App {
             viewport_height: 40,
             last_size_check: Instant::now() - Duration::from_secs(1),
             database_selected: 0,
+            database_pane: DatabasePane::Tree,
             database_category: 0,
             database_object_selected: 0,
             database_object_offset: 0,
@@ -474,18 +485,23 @@ impl App {
             },
             Mode::Databases => match event {
                 InputEvent::Char('q') => return Ok(true),
-                InputEvent::Up | InputEvent::Char('k') => self.move_database_object(-1),
-                InputEvent::Down | InputEvent::Char('j') => self.move_database_object(1),
-                InputEvent::PageUp => self.move_database_object(-self.page_step()),
-                InputEvent::PageDown => self.move_database_object(self.page_step()),
-                InputEvent::Home => self.select_first_database_object(),
-                InputEvent::End => self.select_last_database_object(),
-                InputEvent::Left => self.move_database_category(-1),
-                InputEvent::Right => self.move_database_category(1),
+                InputEvent::Up | InputEvent::Char('k') => self.move_database_row(-1),
+                InputEvent::Down | InputEvent::Char('j') => self.move_database_row(1),
+                InputEvent::PageUp => self.move_database_row(-self.page_step()),
+                InputEvent::PageDown => self.move_database_row(self.page_step()),
+                InputEvent::Home => self.select_first_database_row(),
+                InputEvent::End => self.select_last_database_row(),
+                InputEvent::Left | InputEvent::Char('h') => {
+                    self.focus_database_pane(DatabasePane::Tree);
+                }
+                InputEvent::Right | InputEvent::Char('l') => {
+                    self.focus_database_pane(DatabasePane::Objects);
+                }
+                InputEvent::Tab | InputEvent::BackTab => self.toggle_database_pane(),
                 InputEvent::Char('[') => self.switch_database(-1),
                 InputEvent::Char(']') => self.switch_database(1),
                 InputEvent::Char('/') => self.start_input(InputKind::DatabaseFilter),
-                InputEvent::Enter => self.select_database_object(),
+                InputEvent::Enter => self.activate_database_row(),
                 InputEvent::Char('b') => self.start_input(InputKind::Binding),
                 InputEvent::Char('?') => self.open_help(),
                 InputEvent::Esc => self.mode = Mode::Messages,
@@ -872,6 +888,7 @@ impl App {
         self.database_selected = self
             .database_selected
             .min(self.bindings.len().saturating_sub(1));
+        self.database_pane = DatabasePane::Tree;
         self.database_category = 0;
         self.database_object_selected = 0;
         self.database_object_offset = 0;
@@ -945,7 +962,13 @@ impl App {
 
     fn move_database_category(&mut self, delta: isize) {
         let count = self.database_categories().len();
-        self.database_category = move_index(self.database_category, count, delta);
+        let category = move_index(self.database_category, count, delta);
+        self.set_database_category(category);
+    }
+
+    fn set_database_category(&mut self, category: usize) {
+        let count = self.database_categories().len();
+        self.database_category = category.min(count.saturating_sub(1));
         self.database_object_selected = 0;
         self.database_object_offset = 0;
         self.database_filter.clear();
@@ -983,6 +1006,57 @@ impl App {
             self.database_object_offset = self.database_object_selected;
         } else if self.database_object_selected >= self.database_object_offset + page {
             self.database_object_offset = self.database_object_selected + 1 - page;
+        }
+    }
+
+    fn select_first_database_category(&mut self) {
+        self.set_database_category(0);
+    }
+
+    fn select_last_database_category(&mut self) {
+        let count = self.database_categories().len();
+        self.set_database_category(count.saturating_sub(1));
+    }
+
+    fn focus_database_pane(&mut self, pane: DatabasePane) {
+        self.database_pane = pane;
+    }
+
+    fn toggle_database_pane(&mut self) {
+        self.database_pane = match self.database_pane {
+            DatabasePane::Tree => DatabasePane::Objects,
+            DatabasePane::Objects => DatabasePane::Tree,
+        };
+    }
+
+    /// Up/Down, PageUp/PageDown and Home/End act on the focused pane only.
+    fn move_database_row(&mut self, delta: isize) {
+        match self.database_pane {
+            DatabasePane::Tree => self.move_database_category(delta),
+            DatabasePane::Objects => self.move_database_object(delta),
+        }
+    }
+
+    fn select_first_database_row(&mut self) {
+        match self.database_pane {
+            DatabasePane::Tree => self.select_first_database_category(),
+            DatabasePane::Objects => self.select_first_database_object(),
+        }
+    }
+
+    fn select_last_database_row(&mut self) {
+        match self.database_pane {
+            DatabasePane::Tree => self.select_last_database_category(),
+            DatabasePane::Objects => self.select_last_database_object(),
+        }
+    }
+
+    /// Enter opens the object list from the tree and reports the object
+    /// selection from the object list, without moving focus.
+    fn activate_database_row(&mut self) {
+        match self.database_pane {
+            DatabasePane::Tree => self.database_pane = DatabasePane::Objects,
+            DatabasePane::Objects => self.select_database_object(),
         }
     }
 
@@ -1317,33 +1391,47 @@ impl App {
     }
 
     fn handle_database_mouse(&mut self, mouse: MouseEvent) {
+        let (left, middle, _) = self.database_layout(self.viewport_width);
+        let objects_start = left + 3;
+        let details_start = objects_start + middle;
         if mouse.wheel != 0 {
-            if mouse.column < self.database_left_width() as u16 {
-                self.switch_database(-isize::from(mouse.wheel));
+            if usize::from(mouse.column) < left {
+                self.move_database_category(-isize::from(mouse.wheel));
             } else {
                 self.move_database_object(-isize::from(mouse.wheel));
             }
-        } else if mouse.button == 0 && !mouse.release && mouse.row >= LIST_FIRST_ROW {
-            if mouse.column < self.database_left_width() as u16 {
-                let row = usize::from(mouse.row - LIST_FIRST_ROW);
-                if row == 0 {
-                    self.switch_database(1);
-                } else if row - 1 < self.database_categories().len() {
-                    self.database_category = row - 1;
-                    self.database_object_selected = 0;
-                    self.database_object_offset = 0;
-                }
-            } else {
-                let index = self.database_object_offset + usize::from(mouse.row - LIST_FIRST_ROW);
-                if index < self.db_objects.len() {
-                    self.database_object_selected = index;
-                }
+            return;
+        }
+        if mouse.button != 0 || mouse.release || mouse.row < LIST_FIRST_ROW {
+            return;
+        }
+        let row = usize::from(mouse.row - LIST_FIRST_ROW);
+        let column = usize::from(mouse.column);
+        if column < left {
+            self.database_pane = DatabasePane::Tree;
+            if row >= 1 && row - 1 < self.database_categories().len() {
+                self.set_database_category(row - 1);
+            }
+        } else if column < details_start {
+            self.database_pane = DatabasePane::Objects;
+            let index = self.database_object_offset + row;
+            if index < self.db_objects.len() {
+                self.database_object_selected = index;
             }
         }
     }
 
     fn database_left_width(&self) -> usize {
         (self.viewport_width * 25 / 100).max(24)
+    }
+
+    fn database_layout(&self, width: usize) -> (usize, usize, usize) {
+        let left = self.database_left_width().min(width.saturating_sub(2));
+        let middle = (width * 32 / 100)
+            .max(30)
+            .min(width.saturating_sub(left + 1));
+        let right = width.saturating_sub(left + middle + 6);
+        (left, middle, right)
     }
 
     /// `?`: open the help overlay; `?`, `q` or `Esc` closes it again.
@@ -1614,11 +1702,7 @@ impl App {
     }
 
     fn render_databases(&self, lines: &mut Vec<String>, width: usize, height: usize) {
-        let left = self.database_left_width().min(width.saturating_sub(2));
-        let middle = (width * 32 / 100)
-            .max(30)
-            .min(width.saturating_sub(left + 1));
-        let right = width.saturating_sub(left + middle + 6);
+        let (left, middle, _) = self.database_layout(width);
         let objects = &self.db_objects;
         let categories = self.database_categories();
         let selected_object = objects.get(self.database_object_selected);
@@ -1634,77 +1718,155 @@ impl App {
                 )
             })
             .unwrap_or_else(|| "No database loaded".to_string());
-        lines.push(paint_bold(
-            three_column(
-                "Database tree",
-                &format!(
-                    "{} ({})",
-                    self.selected_database_category()
-                        .map_or("Objects", DbCategory::label),
-                    objects.len()
-                ),
-                selected_object.map_or("Details", |object| object.title.as_str()),
-                left,
-                middle,
-                width,
-            ),
-            ANSI_BRIGHT_CYAN,
+        let tree_focused = self.database_pane == DatabasePane::Tree;
+        let objects_focused = self.database_pane == DatabasePane::Objects;
+        let tree_header = "Database tree";
+        let object_header = format!(
+            "{} ({})",
+            self.selected_database_category()
+                .map_or("Objects", DbCategory::label),
+            objects.len()
+        );
+        let detail_header = selected_object.map_or("Details", |object| object.title.as_str());
+        lines.push(styled_three_column(
+            (tree_header, pane_header_style(tree_focused)),
+            (object_header.as_str(), pane_header_style(objects_focused)),
+            (detail_header, CellStyle::PaneHeaderIdle),
+            left,
+            middle,
+            width,
         ));
         lines.push(paint(
             format!(
                 "{}─┼{}─┼{}",
                 "─".repeat(left),
                 "─".repeat(middle),
-                "─".repeat(right)
+                "─".repeat(width.saturating_sub(left + middle + 6))
             ),
             ANSI_CYAN,
         ));
         let rows = height.saturating_sub(7).max(1);
         for row in 0..rows {
-            let category = if row == 0 {
-                format!("▶ {database_label}")
+            let (tree_text, tree_style) = if row == 0 {
+                (format!(" {database_label}"), CellStyle::DatabaseHeader)
             } else {
-                categories
-                    .get(row - 1)
-                    .map(|category| {
-                        let marker = if row - 1 == self.database_category {
-                            "▶ "
-                        } else {
-                            "  "
-                        };
+                let category_index = row - 1;
+                let selected = category_index == self.database_category;
+                let marker = if selected {
+                    if tree_focused {
+                        "▶ "
+                    } else {
+                        "· "
+                    }
+                } else {
+                    "  "
+                };
+                let text = categories
+                    .get(category_index)
+                    .map_or_else(String::new, |category| {
                         format!("{marker}{}", category.label())
-                    })
-                    .unwrap_or_default()
+                    });
+                let style = if selected {
+                    selection_style(tree_focused)
+                } else {
+                    CellStyle::Normal
+                };
+                (text, style)
             };
             let object_index = self.database_object_offset + row;
             let object = objects.get(object_index);
-            let object_line = object.map_or_else(String::new, |object| {
-                format!(
-                    "{}{}  {}",
-                    if object_index == self.database_object_selected {
+            let object_selected = object.is_some() && object_index == self.database_object_selected;
+            let object_text = object.map_or_else(String::new, |object| {
+                let marker = if object_selected {
+                    if objects_focused {
                         "▶ "
                     } else {
-                        "  "
-                    },
-                    object.title,
-                    object.subtitle
-                )
+                        "· "
+                    }
+                } else {
+                    "  "
+                };
+                format!("{marker}{}  {}", object.title, object.subtitle)
             });
-            let detail_line = selected_object
+            let object_style = if object_selected {
+                selection_style(objects_focused)
+            } else {
+                CellStyle::Normal
+            };
+            let detail_text = selected_object
                 .and_then(|object| object.details.get(row))
                 .map_or("", String::as_str);
-            let line = three_column(&category, &object_line, detail_line, left, middle, width);
-            let category_selected = row > 0 && row - 1 == self.database_category;
-            let object_selected = object.is_some() && object_index == self.database_object_selected;
-            lines.push(if row == 0 {
-                paint_bold(line, ANSI_BRIGHT_YELLOW)
-            } else if category_selected || object_selected {
-                paint_selected(line)
-            } else {
-                paint(line, ANSI_WHITE)
-            });
+            lines.push(styled_three_column(
+                (&tree_text, tree_style),
+                (&object_text, object_style),
+                (detail_text, CellStyle::Normal),
+                left,
+                middle,
+                width,
+            ));
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CellStyle {
+    Normal,
+    Selected,
+    Dim,
+    PaneHeader,
+    PaneHeaderIdle,
+    DatabaseHeader,
+}
+
+fn selection_style(focused: bool) -> CellStyle {
+    if focused {
+        CellStyle::Selected
+    } else {
+        CellStyle::Dim
+    }
+}
+
+fn pane_header_style(focused: bool) -> CellStyle {
+    if focused {
+        CellStyle::PaneHeader
+    } else {
+        CellStyle::PaneHeaderIdle
+    }
+}
+
+fn paint_cell(value: impl AsRef<str>, style: CellStyle) -> String {
+    match style {
+        CellStyle::Normal => paint(value, ANSI_WHITE),
+        CellStyle::Selected => paint_selected(value),
+        CellStyle::Dim => paint(value, ANSI_CYAN),
+        CellStyle::PaneHeader => paint_bold(value, ANSI_BRIGHT_CYAN),
+        CellStyle::PaneHeaderIdle => paint(value, ANSI_BRIGHT_CYAN),
+        CellStyle::DatabaseHeader => paint_bold(value, ANSI_BRIGHT_YELLOW),
+    }
+}
+
+/// Render three padded columns, styling each cell independently so one pane's
+/// selection never changes how the neighbouring pane is drawn.
+fn styled_three_column(
+    left: (&str, CellStyle),
+    middle: (&str, CellStyle),
+    right: (&str, CellStyle),
+    left_width: usize,
+    middle_width: usize,
+    width: usize,
+) -> String {
+    let left_width = left_width.min(width.saturating_sub(6));
+    let middle_width = middle_width.min(width.saturating_sub(left_width + 6));
+    let right_width = width.saturating_sub(left_width + middle_width + 6);
+    let cell = |(text, style): (&str, CellStyle), width: usize| {
+        paint_cell(pad_to_width(&truncate(text, width), width), style)
+    };
+    format!(
+        "{} │ {} │ {}",
+        cell(left, left_width),
+        cell(middle, middle_width),
+        cell(right, right_width)
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -1909,6 +2071,24 @@ fn database_objects(entry: &BindingEntry, category: DbCategory) -> Vec<DbObject>
     }
 }
 
+/// Union of signal-level node lists, deduplicated in first-seen order and
+/// without the DBC placeholder names.
+fn union_names<'a>(groups: impl IntoIterator<Item = &'a [String]>) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for group in groups {
+        for name in group {
+            let name = name.trim();
+            if name.is_empty() || name == "Vector__XXX" {
+                continue;
+            }
+            if !names.iter().any(|existing| existing.as_str() == name) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
 fn dbc_message_details(message: &blf_core::DbcMessage) -> Vec<String> {
     let mut details = vec![
         format!("name: {}", message.name),
@@ -1923,6 +2103,16 @@ fn dbc_message_details(message: &blf_core::DbcMessage) -> Vec<String> {
         ),
         format!("DLC: {}  FD: {}", message.dlc, message.is_fd),
         format!("transmitter: {}", message.transmitter),
+        format!(
+            "receivers: {}",
+            union_names(
+                message
+                    .signals
+                    .iter()
+                    .map(|signal| signal.receivers.as_slice())
+            )
+            .join(", ")
+        ),
         format!("payload: {:?}", message.payload_kind),
         format!("signals: {}", message.signals.len()),
     ];
@@ -1968,6 +2158,16 @@ fn lin_frame_details(frame: &blf_core::LinFrame) -> Vec<String> {
     let mut details = vec![
         format!("frame id: 0x{:02X}", frame.id),
         format!("DLC: {}  publisher: {}", frame.dlc, frame.publisher),
+        format!(
+            "subscribers: {}",
+            union_names(
+                frame
+                    .signals
+                    .iter()
+                    .map(|signal| signal.subscribers.as_slice())
+            )
+            .join(", ")
+        ),
         format!("checksum: {:?}", frame.checksum),
         format!("signals: {}", frame.signals.len()),
     ];
@@ -2769,14 +2969,15 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     binding("Esc", "back to the message detail"),
     binding("q", "quit"),
     heading("Databases"),
-    binding("j / Down", "next object"),
-    binding("k / Up", "previous object"),
-    binding("PageUp/PageDown", "move one screen"),
-    binding("Home / End", "first / last object"),
-    binding("Left / Right", "previous / next category"),
+    binding("j / Down", "next category or object"),
+    binding("k / Up", "previous category or object"),
+    binding("PageUp/PageDown", "move one screen in the focused pane"),
+    binding("Home / End", "first / last row in the focused pane"),
+    binding("Left/Right or h/l", "focus the tree or object pane"),
+    binding("Tab / Shift-Tab", "switch pane focus"),
     binding("] / [", "next / previous database"),
     binding("/", "search objects"),
-    binding("Enter", "select the current object"),
+    binding("Enter", "focus objects or report the selection"),
     binding("b", "bind a DBC or LDF database"),
     binding("Esc", "back to the message list"),
     binding("q", "quit"),
@@ -2964,6 +3165,7 @@ fn read_event_from<R: Read>(input: &mut R) -> Result<Option<InputEvent>, String>
         4 => InputEvent::Eof,
         b'\r' | b'\n' => InputEvent::Enter,
         8 | 127 => InputEvent::Backspace,
+        b'\t' => InputEvent::Tab,
         27 => read_escape_event(input)?,
         value if value.is_ascii() && !value.is_ascii_control() => InputEvent::Char(value as char),
         _ => return Ok(None),
@@ -3048,6 +3250,7 @@ fn csi_event(sequence: &[u8]) -> InputEvent {
         [b'6', b'~'] => InputEvent::PageDown,
         [b'H'] | [b'1', b'~'] => InputEvent::Home,
         [b'F'] | [b'4', b'~'] => InputEvent::End,
+        [b'Z'] => InputEvent::BackTab,
         _ => InputEvent::Esc,
     }
 }
@@ -3145,6 +3348,7 @@ fn two_column(left: &str, right: &str, split: usize, width: usize) -> String {
     )
 }
 
+#[cfg(test)]
 fn three_column(
     left: &str,
     middle: &str,
@@ -3249,6 +3453,194 @@ mod tests {
         output
     }
 
+    const TEST_DBC: &str = r#"
+VERSION "1.0"
+BU_: Vector__XXX BCM TCM Gateway
+
+BO_ 291 VehicleStatus: 8 BCM
+ SG_ VehicleSpeed : 0|16@1+ (0.01,0) [0|655.35] "km/h" TCM,Gateway
+ SG_ EngineSpeed : 16|16@1+ (0.25,0) [0|16383.75] "rpm" Vector__XXX,TCM
+
+BO_ 292 DoorStatus: 8 BCM
+ SG_ FrontLeft : 0|1@1+ (1,0) [0|1] "" TCM
+
+BO_ 293 BatteryStatus: 8 BMS
+ SG_ PackVoltage : 0|16@1+ (0.01,0) [0|655.35] "V" Gateway
+
+BO_ 294 AdasStatus: 8 ADAS
+ SG_ TargetSpeed : 0|16@1+ (0.01,0) [0|655.35] "km/h" Gateway
+"#;
+
+    /// A real `App` over an empty but valid trace, with one CAN database bound.
+    fn test_database_app() -> App {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "vector-log-tui-test-{}-{}.blf",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut statistics = vec![0_u8; 144];
+        statistics[0..4].copy_from_slice(&blf_core::FILE_SIGNATURE.to_le_bytes());
+        statistics[4..8].copy_from_slice(&144_u32.to_le_bytes());
+        statistics[8..12].copy_from_slice(&4_080_200_u32.to_le_bytes());
+        statistics[16..24].copy_from_slice(&144_u64.to_le_bytes());
+        statistics[24..32].copy_from_slice(&144_u64.to_le_bytes());
+        std::fs::write(&path, &statistics).expect("write empty test trace");
+        let mut app = App::open(path.clone(), Vec::new()).expect("open empty test trace");
+        std::fs::remove_file(&path).ok();
+
+        let database = DbcDatabase::from_str(TEST_DBC).expect("parse test DBC");
+        let binding = DatabaseBinding::new(BusKind::Can, 1, Database::Can(Arc::new(database)))
+            .expect("bind test DBC");
+        app.bindings.push(BindingEntry {
+            binding,
+            path: PathBuf::from("test.dbc"),
+        });
+        app.enter_databases();
+        app
+    }
+
+    #[test]
+    fn database_keys_move_the_focused_pane_and_keep_both_rows() {
+        let mut app = test_database_app();
+        app.set_database_category(1);
+        app.database_object_selected = 2;
+        app.database_pane = DatabasePane::Tree;
+
+        // Moving focus keeps each pane on its own row.
+        app.handle_event(InputEvent::Right).unwrap();
+        assert_eq!(app.database_pane, DatabasePane::Objects);
+        assert_eq!(app.database_category, 1);
+        assert_eq!(app.database_object_selected, 2);
+
+        // Down now moves the object row, not the category.
+        app.handle_event(InputEvent::Down).unwrap();
+        assert_eq!(app.database_object_selected, 3);
+        assert_eq!(app.database_category, 1);
+
+        // h returns to the tree without losing the object row.
+        app.handle_event(InputEvent::Char('h')).unwrap();
+        assert_eq!(app.database_pane, DatabasePane::Tree);
+        assert_eq!(app.database_category, 1);
+        assert_eq!(app.database_object_selected, 3);
+
+        // Up now moves the category row, leaving the object pane focused off.
+        app.handle_event(InputEvent::Up).unwrap();
+        assert_eq!(app.database_category, 0);
+        assert_eq!(app.database_pane, DatabasePane::Tree);
+
+        // Tab and Shift-Tab switch focus without changing either row.
+        app.handle_event(InputEvent::Tab).unwrap();
+        assert_eq!(app.database_pane, DatabasePane::Objects);
+        app.handle_event(InputEvent::BackTab).unwrap();
+        assert_eq!(app.database_pane, DatabasePane::Tree);
+
+        // Home/End stay inside the focused pane too.
+        let last_category = app.database_categories().len() - 1;
+        app.handle_event(InputEvent::End).unwrap();
+        assert_eq!(app.database_category, last_category);
+        app.handle_event(InputEvent::Home).unwrap();
+        assert_eq!(app.database_category, 0);
+
+        app.set_database_category(1);
+        app.database_pane = DatabasePane::Objects;
+        app.handle_event(InputEvent::End).unwrap();
+        assert_eq!(app.database_object_selected, 3);
+        assert_eq!(app.database_category, 1);
+        app.handle_event(InputEvent::Home).unwrap();
+        assert_eq!(app.database_object_selected, 0);
+        assert_eq!(app.database_category, 1);
+    }
+
+    #[test]
+    fn database_enter_moves_into_the_object_list_and_stays_there() {
+        let mut app = test_database_app();
+        app.set_database_category(1);
+        app.database_pane = DatabasePane::Tree;
+        app.database_object_selected = 1;
+
+        app.handle_event(InputEvent::Enter).unwrap();
+        assert_eq!(app.database_pane, DatabasePane::Objects);
+        assert_eq!(app.database_category, 1);
+        assert_eq!(app.database_object_selected, 1);
+        assert_eq!(app.status, "Ready");
+
+        let title = app.db_objects[1].title.clone();
+        app.handle_event(InputEvent::Enter).unwrap();
+        assert_eq!(app.database_pane, DatabasePane::Objects);
+        assert_eq!(app.database_object_selected, 1);
+        assert_eq!(app.status, format!("Selected {title}"));
+    }
+
+    #[test]
+    fn database_mouse_click_focuses_and_selects_the_clicked_row() {
+        let mut app = test_database_app();
+        let left = app.database_left_width() as u16;
+
+        // Row 0 of the tree is the database header, so the second category is
+        // drawn on the row after the first category.
+        app.handle_event(InputEvent::Mouse(MouseEvent {
+            button: 0,
+            column: 1,
+            row: LIST_FIRST_ROW + 2,
+            wheel: 0,
+            release: false,
+        }))
+        .unwrap();
+        assert_eq!(app.database_pane, DatabasePane::Tree);
+        assert_eq!(app.database_category, 1);
+
+        app.handle_event(InputEvent::Mouse(MouseEvent {
+            button: 0,
+            column: left + 3,
+            row: LIST_FIRST_ROW + 1,
+            wheel: 0,
+            release: false,
+        }))
+        .unwrap();
+        assert_eq!(app.database_pane, DatabasePane::Objects);
+        assert_eq!(app.database_object_selected, 1);
+        assert_eq!(app.database_category, 1);
+    }
+
+    #[test]
+    fn database_render_marks_only_the_focused_pane_selection() {
+        let mut app = test_database_app();
+        app.set_database_category(1);
+        app.database_object_selected = 1;
+        app.database_pane = DatabasePane::Tree;
+
+        let mut lines = Vec::new();
+        app.render_databases(&mut lines, 100, 30);
+        // lines[2] is body row 0 (database header + object 0). The selected
+        // object row is body row 1 and the selected category row is body row 2.
+        let database_row = &lines[2];
+        assert!(database_row.contains(" can ch1"));
+        assert!(!database_row.contains("▶"));
+        assert!(!database_row.contains(ANSI_SELECTED));
+
+        assert!(lines[3].contains("· DoorStatus"));
+        assert!(!lines[3].contains(ANSI_SELECTED));
+        assert!(lines[4].contains("▶ Messages"));
+        assert!(lines[4].contains(ANSI_SELECTED));
+        let header_parts = lines[0].split(" │ ").collect::<Vec<_>>();
+        assert!(header_parts[0].starts_with(ANSI_BOLD));
+        assert!(!header_parts[1].starts_with(ANSI_BOLD));
+
+        app.database_pane = DatabasePane::Objects;
+        let mut lines = Vec::new();
+        app.render_databases(&mut lines, 100, 30);
+        assert!(lines[3].contains("▶ DoorStatus"));
+        assert!(lines[3].contains(ANSI_SELECTED));
+        assert!(lines[4].contains("· Messages"));
+        assert!(!lines[4].contains(ANSI_SELECTED));
+        let header_parts = lines[0].split(" │ ").collect::<Vec<_>>();
+        assert!(!header_parts[0].starts_with(ANSI_BOLD));
+        assert!(header_parts[1].starts_with(ANSI_BOLD));
+    }
+
     #[test]
     fn moves_selection_with_bounds() {
         assert_eq!(move_index(0, 0, 1), 0);
@@ -3282,6 +3674,110 @@ mod tests {
     }
 
     #[test]
+    fn unions_receivers_without_placeholders_in_first_seen_order() {
+        let first = vec!["Vector__XXX".to_string(), "BCM".to_string(), String::new()];
+        let second = vec!["TCM".to_string(), "BCM".to_string(), "Gateway".to_string()];
+        assert_eq!(
+            union_names([first.as_slice(), second.as_slice()]),
+            vec!["BCM".to_string(), "TCM".to_string(), "Gateway".to_string()]
+        );
+        assert_eq!(
+            union_names(std::iter::empty::<&[String]>()),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn dbc_message_details_name_receivers_after_the_transmitter() {
+        use blf_core::{ByteOrder, CanMessageId, CanPayloadKind, SignalType};
+
+        let mut speed = blf_core::CanSignal::new(
+            "VehicleSpeed",
+            0,
+            16,
+            ByteOrder::LittleEndian,
+            SignalType::Unsigned,
+        );
+        speed.receivers = vec!["TCM".to_string(), "Vector__XXX".to_string(), String::new()];
+        let mut engine = blf_core::CanSignal::new(
+            "EngineSpeed",
+            16,
+            16,
+            ByteOrder::LittleEndian,
+            SignalType::Unsigned,
+        );
+        engine.receivers = vec!["Gateway".to_string(), "TCM".to_string()];
+        let message = blf_core::DbcMessage {
+            id: CanMessageId::new(0x123, false),
+            name: "VehicleStatus".to_string(),
+            dlc: 8,
+            is_fd: false,
+            payload_kind: CanPayloadKind::Physical,
+            transmitter: "BCM".to_string(),
+            signals: vec![speed, engine],
+            comment: None,
+            attributes: Default::default(),
+            source: None,
+        };
+
+        let details = dbc_message_details(&message);
+        let transmitter = details
+            .iter()
+            .position(|line| line == "transmitter: BCM")
+            .expect("transmitter line");
+        assert_eq!(details[transmitter + 1], "receivers: TCM, Gateway");
+        assert_eq!(
+            details
+                .iter()
+                .filter(|line| line.starts_with("receivers:"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn lin_frame_details_name_subscribers_after_the_publisher() {
+        use blf_core::{LinChecksum, LinFrame, LinSignal};
+
+        let signal = LinSignal {
+            name: "FrontLeft".to_string(),
+            start_bit: 0,
+            bit_length: 1,
+            publisher: Some("BCM".to_string()),
+            subscribers: vec![
+                "TCM".to_string(),
+                "Vector__XXX".to_string(),
+                "Gateway".to_string(),
+            ],
+            initial_value: None,
+            factor: 1.0,
+            offset: 0.0,
+            minimum: None,
+            maximum: None,
+            physical_ranges: Vec::new(),
+            encoding: None,
+            choices: Default::default(),
+            source: None,
+        };
+        let frame = LinFrame {
+            id: 0x10,
+            name: "DoorStatus".to_string(),
+            dlc: 8,
+            publisher: "BCM".to_string(),
+            checksum: LinChecksum::Enhanced,
+            signals: vec![signal],
+            source: None,
+        };
+
+        let details = lin_frame_details(&frame);
+        let publisher = details
+            .iter()
+            .position(|line| line == "DLC: 8  publisher: BCM")
+            .expect("publisher line");
+        assert_eq!(details[publisher + 1], "subscribers: TCM, Gateway");
+    }
+
+    #[test]
     fn truncates_without_splitting_utf8_or_wide_glyphs() {
         assert_eq!(truncate("abcdef", 0), "");
         assert_eq!(truncate("abcdef", 3), "...");
@@ -3310,6 +3806,11 @@ mod tests {
         assert_eq!(csi_event(b"6~"), InputEvent::PageDown);
         assert_eq!(csi_event(b"1~"), InputEvent::Home);
         assert_eq!(csi_event(b"4~"), InputEvent::End);
+        assert_eq!(csi_event(b"Z"), InputEvent::BackTab);
+        assert_eq!(
+            read_event_from(&mut "\t".as_bytes()).unwrap(),
+            Some(InputEvent::Tab)
+        );
         assert_eq!(csi_event(b"99~"), InputEvent::Esc);
     }
 
@@ -3542,6 +4043,9 @@ mod tests {
             "open or close this help",
             "jump by trace time",
             "next / previous database",
+            "focus the tree or object pane",
+            "switch pane focus",
+            "focus objects or report the selection",
             "open the selected message",
             "wheel to scroll",
         ] {

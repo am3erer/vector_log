@@ -85,24 +85,33 @@ signal decoding, and an ASCII signal curve. Database paths can also be bound
 while the viewer is running with `b`, using `can CHANNEL PATH` or
 `lin CHANNEL PATH`. Press `d` to open the database browser. Its layout follows
 the CANdb++-style workflow used by the companion `candb_tui` project: the left
-column selects a loaded database and object category, the center column lists
-messages/signals/frames, and the right column shows details for the selected
-object.
+column shows the bound database and its object categories, the center column
+lists messages/signals/frames, and the right column shows details for the
+selected object. One pane has focus at a time: `Left`/`Right`, `h`/`l` or
+`Tab`/`Shift-Tab` switch focus, and the arrow keys move inside the focused
+pane. The focused pane draws the strong selection marker and background; the
+other pane keeps its row visible with a dimmed `·` marker. The database name is
+a non-selectable header line in the tree pane, because `[`/`]` switch loaded
+databases. The detail column includes each DBC message's transmitter and the
+deduplicated receivers of its signals; LIN frames show the union of their
+signals' subscribers.
 
 Key controls are:
 
 ```text
-j/k or Up/Down    move through messages or signals
+j/k or Up/Down    move through messages, signals or database rows
 PageUp/PageDown   move one screen at a time
 Home/End          jump to the first or last item
 g                 jump by trace time, +offset or #position
 G                 jump to the last message
 ] / [             next / previous occurrence of the same frame id
-Enter             open the selected message
+Enter             open the selected message, or focus objects / report the
+                  selection in the database browser
 /                 filter messages, or search objects in the database browser
 b                 bind a DBC/LDF database
 d                 open the DBC/LDF browser
-Left/Right        change database category
+Left/Right, h/l   switch database-browser pane focus
+Tab, Shift-Tab    switch database-browser pane focus
 [/]               switch loaded database
 e                 export the filtered messages with decoded signals to CSV
 p                 open a curve for the selected numeric signal
