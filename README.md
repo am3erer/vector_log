@@ -109,36 +109,49 @@ while the viewer is running with `b`, using `can CHANNEL PATH` or
 the CANdb++-style workflow used by the companion `candb_tui` project: the left
 column shows the bound database and its object categories, the center column
 lists messages/signals/frames, and the right column shows details for the
-selected object. One pane has focus at a time: `Left`/`Right`, `h`/`l` or
-`Tab`/`Shift-Tab` switch focus, and the arrow keys move inside the focused
-pane. The focused pane draws the strong selection marker and background; the
-other pane keeps its row visible with a dimmed `·` marker. The database name is
-a non-selectable header line in the tree pane, because `[`/`]` switch loaded
-databases. The detail column groups each object into bold headings with
-indented items and dim notes, separated by a blank line, so message metadata,
-attribute blocks, signal lists and node relations stay readable instead of
-running together. It includes each DBC message's transmitter and the
-deduplicated receivers of its signals. A DBC signal shows its message's
-transmitter next to its deduplicated receivers; a LIN signal shows its
-publisher next to its deduplicated subscribers, and a LIN frame shows the union
-of its signals' subscribers. A DBC node groups its relations under the
-`messages sent`, `messages received`, `signals sent` and `signals received`
-headings; a LIN node groups the frames it publishes and the signals it
-subscribes to. Message, signal and node details carry an `attributes:` block:
-every assigned attribute is shown with its definition and default, followed by
-one compact `defaults:` line with the `BA_DEF_DEF_` defaults of that scope's
-definitions which the object does not assign. An attribute therefore keeps its
-definition's default until a `BA_` assignment overrides it. The Attributes
-category shows each definition's type, range or enum members, default and
-assignment count. Long detail lists stop after 24 entries and report the
-remaining count, because the detail column does not scroll.
+selected object. One pane has focus at a time and the browser has three focus
+stops: the tree, the object list and the details. `Left`/`Right` and `h`/`l`
+step towards the first or last stop, `Tab`/`Shift-Tab` cycle through them, and
+the arrow keys act on the focused pane. The focused pane draws the strong
+selection marker and background; the other pane keeps its row visible with a
+dimmed `·` marker. The details column wraps long lines to its width and scrolls:
+with the details focused, `j`/`k` and `Up`/`Down` scroll by one line,
+`PageUp`/`PageDown` by one screen, and `Home`/`End` jump to the first or last
+line. Its header reports the visible range as `Details  lines 1-18 of 41`, or
+just `lines 1-18 of 41` when the column is narrow, and the scroll starts over
+when another object is selected. The database name is a non-selectable header
+line in the tree pane, because `[`/`]` switch loaded databases. Long text never
+disappears from the viewer: the message preview, both message-detail columns,
+the database details and the help descriptions wrap at word boundaries, and
+inside a word wider than the pane, while counting wide CJK glyphs as two
+cells. Only the short labels of the tabular message list and of the tree and
+object columns end in `...`, because their text is shown next to them. The
+detail column groups each object into bold headings with indented items and dim
+notes, separated by a blank line, so message metadata, attribute blocks,
+signal lists and node relations stay readable instead of running together. It
+includes each DBC message's transmitter and the deduplicated receivers of its
+signals. A DBC signal shows its message's
+transmitter next to its deduplicated receivers; a LIN signal shows its publisher
+next to its deduplicated subscribers, and a LIN frame shows the union of its
+signals' subscribers. A DBC node groups its relations under the `messages sent`,
+`messages received`, `signals sent` and `signals received` headings; a LIN node
+groups the frames it publishes and the signals it subscribes to. Message, signal
+and node details carry an `attributes:` block: every assigned attribute is shown
+with its definition and default, followed by a `defaults:` list with the
+`BA_DEF_DEF_` defaults of that scope's definitions which the object does not
+assign. An attribute therefore keeps its definition's default until a `BA_`
+assignment overrides it. Assignments, defaults, receivers, subscribers and
+signal names each get their own line, so a long enum value or receiver list
+stays readable. The Attributes category shows each definition's type, range or
+enum members, default and assignment count. A detail list only stops after 500
+entries and reports the remaining count.
 
 Key controls are:
 
 ```text
-j/k or Up/Down    move through messages, signals or database rows
+j/k or Up/Down    move through messages, signals, database rows or detail lines
 PageUp/PageDown   move one screen at a time
-Home/End          jump to the first or last item
+Home/End          jump to the first or last item or detail line
 g                 jump by trace time, +offset or #position
 G                 jump to the last message
 ] / [             next / previous occurrence of the same frame id
@@ -147,8 +160,8 @@ Enter             open the selected message, or focus objects / report the
 /                 filter messages, or search objects in the database browser
 b                 bind a DBC/LDF database
 d                 open the DBC/LDF browser
-Left/Right, h/l   switch database-browser pane focus
-Tab, Shift-Tab    switch database-browser pane focus
+Left/Right, h/l   step between tree, object and details pane focus
+Tab, Shift-Tab    cycle tree, object and details pane focus
 [/]               switch loaded database
 e                 export the filtered messages with decoded signals to CSV
 p                 open a curve for the selected numeric signal
@@ -182,8 +195,9 @@ many is shown.
 
 `?` opens a help screen in every mode, grouping the bindings by mode
 (Messages, Detail, Curve and Databases) and finishing with the global keys. It
-closes with `?`, `q` or `Esc`. When the list does not fit, `j`/`k`, the arrow
-keys, PageUp/PageDown and Home/End scroll it, and the title shows which rows are
+closes with `?`, `q` or `Esc`. A description that does not fit wraps under its
+key instead of being cut. When the list does not fit, `j`/`k`, the arrow keys,
+PageUp/PageDown and Home/End scroll it, and the title shows which rows are
 visible. The bottom line shows the active prompt while typing a filter,
 binding, database filter or goto value, and the status message otherwise.
 
