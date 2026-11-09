@@ -165,6 +165,7 @@ Home/End          jump to the first or last item or detail line
 g                 jump by trace time, +offset or #position
 G                 jump to the last message
 T                 switch timestamps between trace clock and first frame
+s                 frame statistics: count and cycle time per frame id
 ] / [             next / previous occurrence of the same frame id
 Enter             open the selected message, or focus objects / report the
                   selection in the database browser
@@ -221,6 +222,13 @@ binding, database filter or goto value, and the status message otherwise.
 Opening a message shows its decoded signals on the right. The left column also
 reports the cycle timing of that frame id on the same bus and channel: average,
 minimum and maximum period, mean jitter, and how many frames the log holds.
+
+`s` opens the frame statistics view: one row per bus, channel and frame id of
+the visible messages, with the message count and the average, minimum and
+maximum cycle time plus the mean jitter. `s` cycles the sort order (count,
+frame id, jitter), `Enter` jumps back to the first message of the selected
+frame, and `Esc` returns to the list. A frame seen once has no period, so its
+timing columns show `-`.
 
 Pressing `e` writes `<trace>.signals.csv` next to the trace, with one row per
 filtered message and one column per decoded signal (up to 64 signal columns).

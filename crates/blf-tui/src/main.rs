@@ -31,6 +31,8 @@ const NARROW_DATABASE_WIDTH: usize = 100;
 const LIST_FIRST_ROW: u16 = HEADER_ROWS + 2;
 /// First detail row: the header block plus the detail section title.
 const DETAIL_FIRST_ROW: u16 = HEADER_ROWS + 1;
+/// First statistics row: the header block, the section title and the column rule.
+const STATS_FIRST_ROW: u16 = HEADER_ROWS + 3;
 /// Status for a trace-only action in a database-only session.
 const NO_TRACE_STATUS: &str = "No trace loaded";
 
@@ -140,6 +142,7 @@ enum Mode {
     Detail,
     Curve,
     Databases,
+    Statistics,
 }
 
 /// Which column of the database browser owns the keyboard focus.
@@ -357,6 +360,10 @@ struct App {
     timing: Option<TimingStats>,
     time_mode: TimeMode,
     time_base: u64,
+    stats: Vec<FrameStat>,
+    stats_selected: usize,
+    stats_offset: usize,
+    stats_sort: StatsSort,
     dirty: bool,
     selected: usize,
     list_offset: usize,
@@ -448,6 +455,10 @@ impl App {
             timing: None,
             time_mode: TimeMode::Absolute,
             time_base,
+            stats: Vec::new(),
+            stats_selected: 0,
+            stats_offset: 0,
+            stats_sort: StatsSort::Count,
             dirty: true,
             selected: 0,
             list_offset: 0,
@@ -562,6 +573,7 @@ impl App {
                 InputEvent::Char('b') => self.start_input(InputKind::Binding),
                 InputEvent::Char('p') => self.open_curve(),
                 InputEvent::Char('d') => self.enter_databases(),
+                InputEvent::Char('s') => self.open_statistics(),
                 InputEvent::Char('e') => self.export_csv(),
                 InputEvent::Char('T') => self.toggle_time_mode(),
                 InputEvent::Char('g') => self.start_input(InputKind::Goto),
@@ -588,6 +600,33 @@ impl App {
                 InputEvent::Esc | InputEvent::Left => self.mode = Mode::Messages,
                 InputEvent::Char('?') => self.open_help(),
                 InputEvent::Mouse(mouse) => self.handle_detail_mouse(mouse),
+                _ => {}
+            },
+            Mode::Statistics => match event {
+                InputEvent::Char('q') => return Ok(true),
+                InputEvent::Up | InputEvent::Char('k') => self.move_stats(-1),
+                InputEvent::Down | InputEvent::Char('j') => self.move_stats(1),
+                InputEvent::PageUp => self.move_stats(-self.page_step()),
+                InputEvent::PageDown => self.move_stats(self.page_step()),
+                InputEvent::Home => {
+                    self.stats_selected = 0;
+                    self.stats_offset = 0;
+                }
+                InputEvent::End => {
+                    self.stats_selected = self.stats.len().saturating_sub(1);
+                    self.keep_stats_visible();
+                }
+                InputEvent::Enter => self.jump_to_stat(),
+                InputEvent::Char('s') => {
+                    self.stats_sort = self.stats_sort.next();
+                    self.sort_stats();
+                    self.stats_selected = 0;
+                    self.stats_offset = 0;
+                    self.status = format!("Sorted by {}", self.stats_sort.label());
+                }
+                InputEvent::Esc | InputEvent::Left => self.mode = Mode::Messages,
+                InputEvent::Char('?') => self.open_help(),
+                InputEvent::Mouse(mouse) => self.handle_stats_mouse(mouse),
                 _ => {}
             },
             Mode::Databases => match event {
@@ -767,6 +806,92 @@ impl App {
         self.selected = 0;
         self.list_offset = 0;
         self.selected_signal = 0;
+    }
+
+    /// `s`: aggregate the visible messages by frame id.
+    fn open_statistics(&mut self) {
+        self.ensure_frame_index();
+        let mut stats = Vec::new();
+        if let Some(index) = &self.frame_index {
+            for (key, positions) in index {
+                let timestamps = positions
+                    .iter()
+                    .filter_map(|position| {
+                        let list_index = *self.filtered.get(*position)?;
+                        self.summaries.get(list_index)?.timestamp_ns
+                    })
+                    .collect::<Vec<_>>();
+                stats.push(FrameStat {
+                    key: *key,
+                    count: positions.len(),
+                    timing: timing_stats(&timestamps),
+                });
+            }
+        }
+        self.stats = stats;
+        self.sort_stats();
+        self.stats_selected = 0;
+        self.stats_offset = 0;
+        self.mode = Mode::Statistics;
+        self.status = format!("{} frames in the visible list", self.stats.len());
+    }
+
+    fn sort_stats(&mut self) {
+        sort_frame_stats(&mut self.stats, self.stats_sort);
+    }
+
+    fn stats_page_size(&self) -> usize {
+        list_page_size(self.viewport_height, 6)
+    }
+
+    fn move_stats(&mut self, delta: isize) {
+        self.stats_selected = move_index(self.stats_selected, self.stats.len(), delta);
+        self.keep_stats_visible();
+    }
+
+    fn keep_stats_visible(&mut self) {
+        let page = self.stats_page_size();
+        if page == 0 {
+            return;
+        }
+        if self.stats_selected < self.stats_offset {
+            self.stats_offset = self.stats_selected;
+        } else if self.stats_selected >= self.stats_offset + page {
+            self.stats_offset = self.stats_selected + 1 - page;
+        }
+    }
+
+    /// `Enter`: jump to the first occurrence of the selected frame.
+    fn jump_to_stat(&mut self) {
+        let Some(stat) = self.stats.get(self.stats_selected) else {
+            return;
+        };
+        let (key, count) = (stat.key, stat.count);
+        let Some(position) = self.filtered.iter().position(|list_index| {
+            let summary = &self.summaries[*list_index];
+            summary.bus == Some(key.0)
+                && summary.channel == Some(key.1)
+                && summary.frame_id == Some(key.2)
+        }) else {
+            self.status = "No visible message for this frame".to_string();
+            return;
+        };
+        self.selected = position;
+        self.selected_signal = 0;
+        self.mode = Mode::Messages;
+        self.keep_selection_visible();
+        self.status = format!("Frame 0x{:X}: {count} messages", key.2);
+    }
+
+    fn handle_stats_mouse(&mut self, mouse: MouseEvent) {
+        if mouse.wheel != 0 {
+            self.move_stats(-isize::from(mouse.wheel));
+        } else if mouse.button == 0 && !mouse.release && mouse.row >= STATS_FIRST_ROW {
+            let index = self.stats_offset + usize::from(mouse.row - STATS_FIRST_ROW);
+            if index < self.stats.len() {
+                self.stats_selected = index;
+            }
+        }
     }
 
     fn time_axis(&self) -> TimeAxis {
@@ -1008,6 +1133,7 @@ impl App {
                 DatabasePane::Tree | DatabasePane::Objects => self.database_page_size(),
             },
             Mode::Curve => 1,
+            Mode::Statistics => self.stats_page_size(),
         };
         rows as isize
     }
@@ -1740,11 +1866,12 @@ impl App {
                     self.clamp_database_detail_offset();
                     self.render_databases(&mut lines, width, height);
                 }
+                Mode::Statistics => self.render_statistics(&mut lines, width, height),
             }
         }
         lines.push(paint("─".repeat(width), ANSI_BRIGHT_CYAN));
         lines.push(paint_bold(
-            footer_line(self.input, &self.input_buffer, &self.status),
+            footer_line(self.input, &self.input_buffer, &self.status, self.mode),
             ANSI_BRIGHT_YELLOW,
         ));
         let mut output = String::from("\x1b[H");
@@ -1965,6 +2092,41 @@ impl App {
                 .lines()
                 .map(|line| paint(line, ANSI_BRIGHT_GREEN)),
         );
+    }
+
+    fn render_statistics(&self, lines: &mut Vec<String>, width: usize, height: usize) {
+        lines.push(paint_bold(
+            format!(
+                "Frame statistics  {} frames  {} messages  sorted by {}",
+                self.stats.len(),
+                self.filtered.len(),
+                self.stats_sort.label()
+            ),
+            ANSI_BRIGHT_CYAN,
+        ));
+        lines.push(paint(stat_header_row(width), ANSI_BRIGHT_CYAN));
+        lines.push(paint("─".repeat(width), ANSI_CYAN));
+        if self.stats.is_empty() {
+            lines.push(paint(
+                "No frames in the visible list (clear the filter with Esc)",
+                ANSI_BRIGHT_YELLOW,
+            ));
+            return;
+        }
+        let rows = height.saturating_sub(6);
+        for row in 0..rows {
+            let index = self.stats_offset + row;
+            let Some(stat) = self.stats.get(index) else {
+                break;
+            };
+            let text = stat_row(stat, width);
+            let selected = index == self.stats_selected;
+            lines.push(if selected {
+                paint_selected(pad_to_width(&text, width))
+            } else {
+                paint(text, ANSI_WHITE)
+            });
+        }
     }
 
     fn render_databases(&self, lines: &mut Vec<String>, width: usize, height: usize) {
@@ -3409,6 +3571,76 @@ fn hex_bytes(data: &[u8]) -> String {
         .join(" ")
 }
 
+/// Column widths of the frame statistics table; the right columns drop first
+/// when the terminal is narrow.
+/// Order the frame statistics rows; ties fall back to the frame id.
+fn sort_frame_stats(stats: &mut [FrameStat], sort: StatsSort) {
+    match sort {
+        StatsSort::Count => stats.sort_by(|left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then(left.key.2.cmp(&right.key.2))
+        }),
+        StatsSort::FrameId => stats.sort_by(|left, right| {
+            left.key
+                .2
+                .cmp(&right.key.2)
+                .then(left.key.1.cmp(&right.key.1))
+        }),
+        StatsSort::Jitter => stats.sort_by(|left, right| {
+            let jitter =
+                |stat: &FrameStat| stat.timing.as_ref().map_or(-1.0, |timing| timing.jitter_ms);
+            jitter(right)
+                .partial_cmp(&jitter(left))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(left.key.2.cmp(&right.key.2))
+        }),
+    }
+}
+
+fn stat_columns(width: usize) -> usize {
+    if width >= 72 {
+        4
+    } else if width >= 52 {
+        3
+    } else {
+        2
+    }
+}
+
+fn stat_header_row(width: usize) -> String {
+    let columns = match stat_columns(width) {
+        4 => "ID       BUS CH     N   AVG(ms)  MIN(ms)  MAX(ms)  JIT(ms)",
+        _ => "ID       BUS CH     N   AVG(ms)",
+    };
+    columns.to_string()
+}
+
+fn stat_row(stat: &FrameStat, width: usize) -> String {
+    let (bus, channel, frame_id) = stat.key;
+    let mut row = format!(
+        "{:<8} {:<3} {:>3} {:>6}",
+        format!("0x{frame_id:X}"),
+        bus.as_str(),
+        channel,
+        stat.count
+    );
+    if let Some(timing) = &stat.timing {
+        let _ = write!(row, " {:>8.3}", timing.avg_ms);
+        if stat_columns(width) >= 4 {
+            let _ = write!(
+                row,
+                " {:>8.3} {:>8.3} {:>8.3}",
+                timing.min_ms, timing.max_ms, timing.jitter_ms
+            );
+        }
+    } else {
+        row.push_str("        -");
+    }
+    row
+}
+
 fn display_filter(filter: &str) -> &str {
     if filter.is_empty() {
         "<empty>"
@@ -3511,6 +3743,40 @@ fn lin_status(state: blf_core::LinResponseState) -> &'static str {
         blf_core::LinResponseState::ChecksumError => "checksum_error",
         blf_core::LinResponseState::ParityError => "parity_error",
         blf_core::LinResponseState::Unsupported => "unsupported",
+    }
+}
+
+/// One row of the frame statistics view.
+#[derive(Debug, Clone)]
+struct FrameStat {
+    key: FrameKey,
+    count: usize,
+    timing: Option<TimingStats>,
+}
+
+/// Order of the frame statistics rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatsSort {
+    Count,
+    FrameId,
+    Jitter,
+}
+
+impl StatsSort {
+    fn next(self) -> Self {
+        match self {
+            Self::Count => Self::FrameId,
+            Self::FrameId => Self::Jitter,
+            Self::Jitter => Self::Count,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::FrameId => "frame id",
+            Self::Jitter => "jitter",
+        }
     }
 }
 
@@ -3651,9 +3917,10 @@ fn landed_status(reached_ns: u64, base_ns: u64, position: usize, total: usize) -
 }
 
 /// Bottom line: the active prompt while typing, otherwise the status message.
-fn footer_line(input: Option<InputKind>, buffer: &str, status: &str) -> String {
+fn footer_line(input: Option<InputKind>, buffer: &str, status: &str, mode: Mode) -> String {
     let Some(kind) = input else {
-        return status.to_string();
+        // The status comes first so a narrow terminal truncates the hints.
+        return format!("{status}   ·   {}", mode_hint(mode));
     };
     let prompt = match kind {
         InputKind::Filter => "/",
@@ -3706,6 +3973,20 @@ const fn binding(key: &'static str, description: &'static str) -> HelpEntry {
 }
 
 /// Every binding, grouped by mode, with the global keys last.
+/// One-line hint under the list, shown instead of the cheat-sheet only when
+/// the terminal has room for it (see `render`).
+fn mode_hint(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Messages => {
+            "j/k move · Enter detail · / filter · g goto · ] [ frame · s stats · T time · ? help"
+        }
+        Mode::Detail => "j/k signal · p curve · T time · Esc back · ? help",
+        Mode::Curve => "←/→ pan · +/- zoom · Home/End · Esc back · ? help",
+        Mode::Databases => "Tab panes · j/k move · Enter open · / search · [/] database · ? help",
+        Mode::Statistics => "j/k move · Enter jump to frame · s sort · Esc back · ? help",
+    }
+}
+
 const HELP_ENTRIES: &[HelpEntry] = &[
     heading("Messages (needs a trace)"),
     binding("j / Down", "next message"),
@@ -3717,6 +3998,7 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     binding("b", "bind a DBC or LDF database"),
     binding("p", "curve for the selected numeric signal"),
     binding("d", "open the database browser"),
+    binding("s", "frame statistics: count and cycle time per frame id"),
     binding("e", "export filtered messages to CSV"),
     binding("g", "jump by trace time, +offset or #position"),
     binding("G", "jump to the last message"),
@@ -3741,6 +4023,11 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     binding("Home / End", "first / last sample"),
     binding("Esc", "back to the message detail"),
     binding("q", "quit"),
+    heading("Frame statistics"),
+    binding("j / k", "move through the frames"),
+    binding("Enter", "jump to the first message of the frame"),
+    binding("s", "cycle the sort order: count, frame id, jitter"),
+    binding("Esc / Left", "back to the message list"),
     heading("Databases"),
     binding("j / Down", "next category, object or detail line"),
     binding("k / Up", "previous category, object or detail line"),
@@ -5921,6 +6208,70 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
         assert!(!summary_matches(&summary, "send_error"));
     }
 
+    fn frame_stat(id: u32, count: usize, jitter_ms: f64) -> FrameStat {
+        FrameStat {
+            key: (BusKind::Can, 1, id),
+            count,
+            timing: Some(TimingStats {
+                frames: count,
+                avg_ms: 10.0,
+                min_ms: 9.0,
+                max_ms: 11.0,
+                jitter_ms,
+            }),
+        }
+    }
+
+    #[test]
+    fn statistics_sort_orders_by_count_frame_id_or_jitter() {
+        let mut stats = vec![
+            frame_stat(0x300, 5, 0.5),
+            frame_stat(0x100, 20, 0.1),
+            frame_stat(0x200, 10, 2.0),
+        ];
+        sort_frame_stats(&mut stats, StatsSort::Count);
+        assert_eq!(
+            stats.iter().map(|stat| stat.count).collect::<Vec<_>>(),
+            vec![20, 10, 5]
+        );
+        sort_frame_stats(&mut stats, StatsSort::FrameId);
+        assert_eq!(
+            stats.iter().map(|stat| stat.key.2).collect::<Vec<_>>(),
+            vec![0x100, 0x200, 0x300]
+        );
+        sort_frame_stats(&mut stats, StatsSort::Jitter);
+        assert_eq!(
+            stats.iter().map(|stat| stat.key.2).collect::<Vec<_>>(),
+            vec![0x200, 0x300, 0x100]
+        );
+        assert_eq!(StatsSort::Count.next(), StatsSort::FrameId);
+        assert_eq!(StatsSort::Jitter.next(), StatsSort::Count);
+    }
+
+    #[test]
+    fn statistics_rows_drop_columns_on_a_narrow_terminal() {
+        let stat = frame_stat(0x344, 54, 0.012);
+        let wide = stat_row(&stat, 80);
+        assert!(wide.contains("0x344"));
+        assert!(wide.contains("10.000"));
+        assert!(wide.contains("0.012"));
+
+        let narrow = stat_row(&stat, 40);
+        assert!(narrow.contains("0x344"));
+        assert!(narrow.contains("10.000"));
+        assert!(!narrow.contains("0.012"));
+        assert!(stat_header_row(40).contains("AVG"));
+
+        let single = FrameStat {
+            key: (BusKind::Lin, 3, 0x2f),
+            count: 1,
+            timing: None,
+        };
+        let row = stat_row(&single, 80);
+        assert!(row.contains("lin"));
+        assert!(row.trim_end().ends_with('-'));
+    }
+
     #[test]
     fn time_axis_prints_the_trace_clock_or_an_offset() {
         let base = 1_672_542_331_984_470_000;
@@ -6000,21 +6351,37 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
     }
 
     #[test]
-    fn bottom_line_shows_only_the_prompt_or_the_status() {
-        assert_eq!(
-            footer_line(None, "", "At 5.025000s (+3.510000s from start) (118 / 219)"),
-            "At 5.025000s (+3.510000s from start) (118 / 219)"
+    fn bottom_line_shows_the_status_first_then_hints_or_the_prompt() {
+        let line = footer_line(
+            None,
+            "",
+            "At 5.025000s (+3.510000s from start) (118 / 219)",
+            Mode::Messages,
         );
-        let prompt = footer_line(Some(InputKind::Goto), "+5", "Ready");
+        // The status stays first so a narrow terminal truncates the hints.
+        assert!(line.starts_with("At 5.025000s (+3.510000s from start) (118 / 219)"));
+        assert!(line.contains("Enter detail"));
+
+        let prompt = footer_line(Some(InputKind::Goto), "+5", "Ready", Mode::Messages);
         assert!(prompt.starts_with("goto ("), "got {prompt}");
         assert!(prompt.contains("+5"));
-        // The old key cheat-sheet and the status no longer share the line.
+        // While typing, the prompt owns the line.
         assert!(!prompt.contains("Ready"));
-        assert!(!prompt.contains("[j/k]"));
+        assert!(!prompt.contains("Enter detail"));
         assert_eq!(
-            footer_line(Some(InputKind::Filter), "fd", ""),
+            footer_line(Some(InputKind::Filter), "fd", "", Mode::Messages),
             "/fd  [Enter] apply  [Esc] cancel"
         );
+        // Every mode has a hint of its own.
+        for mode in [
+            Mode::Messages,
+            Mode::Detail,
+            Mode::Curve,
+            Mode::Databases,
+            Mode::Statistics,
+        ] {
+            assert!(!mode_hint(mode).is_empty());
+        }
     }
 
     #[test]
