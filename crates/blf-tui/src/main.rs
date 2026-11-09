@@ -24,6 +24,9 @@ const MAX_CURVE_SAMPLES: usize = 200_000;
 /// this is far above any real database and only reports the remainder of an
 /// absurdly long list instead of building thousands of lines.
 const MAX_DETAIL_ENTRIES: usize = 500;
+/// Below this width the three database columns leave too few cells for the
+/// details, so a focused details pane takes the whole terminal width.
+const NARROW_DATABASE_WIDTH: usize = 100;
 /// First list row below the header block, section title and column rule.
 const LIST_FIRST_ROW: u16 = HEADER_ROWS + 2;
 /// First detail row: the header block plus the detail section title.
@@ -1123,6 +1126,16 @@ impl App {
         height.saturating_sub(7).max(1)
     }
 
+    /// Cells available to the details column: the third column, or the whole
+    /// terminal in the narrow layout.
+    fn database_detail_width(&self, width: usize) -> usize {
+        if details_take_full_width(width, self.database_pane) {
+            width
+        } else {
+            self.database_layout(width).2
+        }
+    }
+
     /// The selected object's detail lines wrapped to `width` cells. Each
     /// wrapped part keeps the style of the detail line it came from.
     fn database_detail_lines(&self, width: usize) -> Vec<(String, CellStyle)> {
@@ -1140,7 +1153,7 @@ impl App {
     /// Keep the details offset inside the wrapped content, so a resize or a
     /// shorter object cannot leave the column scrolled past its end.
     fn clamp_database_detail_offset(&mut self) {
-        let (_, _, width) = self.database_layout(self.viewport_width);
+        let width = self.database_detail_width(self.viewport_width);
         let total = self.database_detail_lines(width).len();
         let rows = self.database_body_rows(self.viewport_height);
         self.database_detail_offset = clamp_detail_offset(self.database_detail_offset, total, rows);
@@ -1148,7 +1161,7 @@ impl App {
 
     /// Scroll the details column by `delta` wrapped lines.
     fn scroll_database_details(&mut self, delta: isize) {
-        let (_, _, width) = self.database_layout(self.viewport_width);
+        let width = self.database_detail_width(self.viewport_width);
         let total = self.database_detail_lines(width).len();
         let rows = self.database_body_rows(self.viewport_height);
         self.database_detail_offset =
@@ -1560,6 +1573,14 @@ impl App {
     }
 
     fn handle_database_mouse(&mut self, mouse: MouseEvent) {
+        // The narrow layout shows only the details, so every wheel event scrolls
+        // them and a click keeps the pane focused.
+        if details_take_full_width(self.viewport_width, self.database_pane) {
+            if mouse.wheel != 0 {
+                self.scroll_database_details(-isize::from(mouse.wheel));
+            }
+            return;
+        }
         let (left, middle, _) = self.database_layout(self.viewport_width);
         let objects_start = left + 3;
         let details_start = objects_start + middle;
@@ -1854,6 +1875,30 @@ impl App {
         }
     }
 
+    /// The narrow layout: the details column alone, across the whole width,
+    /// with the same header, wrapped lines and scroll offset as the column.
+    fn render_database_details(&self, lines: &mut Vec<String>, width: usize, height: usize) {
+        let rows = self.database_body_rows(height);
+        let details = self.database_detail_lines(width);
+        let total = details.len();
+        let offset = clamp_detail_offset(self.database_detail_offset, total, rows);
+        let header = if total > 0 {
+            details_header_text(offset, rows, total, width)
+        } else {
+            "Details".to_string()
+        };
+        lines.push(paint_cell(header, CellStyle::PaneHeader));
+        lines.push(paint("─".repeat(width), ANSI_CYAN));
+        for row in 0..rows {
+            let (text, style) = details
+                .get(offset + row)
+                .map_or((String::new(), CellStyle::Normal), |(text, style)| {
+                    (text.clone(), *style)
+                });
+            lines.push(paint_cell(text, style));
+        }
+    }
+
     fn render_curve(&self, lines: &mut Vec<String>, width: usize, height: usize) {
         let Some(curve) = &self.curve else {
             lines.push("No curve selected".to_string());
@@ -1895,6 +1940,10 @@ impl App {
     }
 
     fn render_databases(&self, lines: &mut Vec<String>, width: usize, height: usize) {
+        if details_take_full_width(width, self.database_pane) {
+            self.render_database_details(lines, width, height);
+            return;
+        }
         let (left, middle, right) = self.database_layout(width);
         let objects = &self.db_objects;
         let categories = self.database_categories();
@@ -4005,12 +4054,44 @@ fn pad_to_width(value: &str, width: usize) -> String {
     padded
 }
 
+/// Characters a wrapped line may break in front of when it has no space left
+/// to break at: a specification, value or list member starts a new line
+/// instead of a word being split.
+const WRAP_BREAK_BEFORE: [char; 5] = ['(', '=', ',', '/', '-'];
+
+/// The last position in `line` where a continuation may start, with the width
+/// before it and whether the break consumes a space.
+///
+/// The space in front of an opening parenthesis wins, so a specification such
+/// as `(INT 2..50000, default 2)` moves to its own line instead of being cut
+/// into fragments; then any space, then a [`WRAP_BREAK_BEFORE`] character.
+fn last_wrap_break(line: &str) -> Option<(usize, usize, bool)> {
+    let mut space = None;
+    let mut specification = None;
+    let mut punctuation = None;
+    let mut before = 0;
+    let mut characters = line.char_indices().peekable();
+    while let Some((index, character)) = characters.next() {
+        if character == ' ' && index > 0 {
+            space = Some((index, before, true));
+            if characters.peek().is_some_and(|(_, next)| *next == '(') {
+                specification = Some((index, before, true));
+            }
+        } else if index > 0 && WRAP_BREAK_BEFORE.contains(&character) {
+            punctuation = Some((index, before, false));
+        }
+        before += char_width(character);
+    }
+    specification.or(space).or(punctuation)
+}
+
 /// Wrap `text` into lines of at most `width` display cells.
 ///
-/// Wide glyphs count as two cells, the break lands on a space when the current
-/// line has one, and a word longer than the width is split instead of dropped.
-/// Continuation lines repeat the leading indentation of `text`, so a wrapped
-/// detail item stays indented under its heading.
+/// Wide glyphs count as two cells. A line breaks after the space in front of an
+/// opening parenthesis, else after its last space, else in front of the last
+/// `(`, `=`, `,`, `/` or `-` it contains; a word wider than the whole line is
+/// split as a last resort. Continuation lines repeat the leading indentation of
+/// `text`, so a wrapped detail item stays indented under its heading.
 fn wrap(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let indent = text
@@ -4025,16 +4106,16 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     let mut line = String::new();
     let mut line_width = 0;
-    let mut last_space = None;
     for character in text[indent..].chars() {
         let cells = char_width(character);
         if !line.is_empty() && line_width + cells > limit {
-            match last_space.take() {
-                // Break at the last space and keep the rest of the line.
-                Some((index, before)) => {
+            match last_wrap_break(&line) {
+                // Break at the last space or key character and keep the rest.
+                Some((index, before, is_space)) => {
+                    let carry = if is_space { index + 1 } else { index };
                     lines.push(format!("{indent_text}{}", &line[..index]));
-                    line = line[index + 1..].to_string();
-                    line_width -= before + 1;
+                    line = line[carry..].to_string();
+                    line_width -= before + usize::from(is_space);
                 }
                 // A word longer than the line is split at the boundary.
                 None => {
@@ -4046,14 +4127,19 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
         }
         line.push(character);
         line_width += cells;
-        if character == ' ' {
-            last_space = Some((line.len() - 1, line_width - 1));
-        }
     }
     if !line.is_empty() || lines.is_empty() {
         lines.push(format!("{indent_text}{line}"));
     }
     lines
+}
+
+/// Whether the database browser drops the tree and object columns and shows
+/// the details across the whole width. Only a focused details pane does that,
+/// and only below [`NARROW_DATABASE_WIDTH`], so the three-column layout stays
+/// available for navigating and is untouched on wide terminals.
+fn details_take_full_width(width: usize, pane: DatabasePane) -> bool {
+    width < NARROW_DATABASE_WIDTH && pane == DatabasePane::Details
 }
 
 /// Clamp a detail-column line offset so the last page stays full instead of
@@ -5119,26 +5205,67 @@ BA_ "GenMsgSendType" BO_ 256 "Cyclic, Spontaneous, IfActive, OnChange, OnWrite, 
 CM_ BO_ 256 "A long comment that names every receiver and explains when the frame is sent on the bus.";
 "#;
 
+    /// A DBC shaped like the narrow-terminal report: an `EngineState` message
+    /// long enough to scroll and a key/value attribute with a specification.
+    const NARROW_DETAIL_DBC: &str = r#"
+VERSION "1.0"
+BU_: Engine
+
+BO_ 291 EngineState: 8 Engine
+ SG_ EngineSpeed : 0|16@1+ (0.25,0) [0|16383.75] "rpm" Engine
+ SG_ EngineTorque : 16|16@1+ (0.5,-1000) [-1000|16000] "Nm" Engine
+ SG_ CoolantTemperature : 32|8@1- (1,-40) [-40|215] "degC" Engine
+ SG_ OilPressure : 40|8@1+ (0.1,0) [0|25.5] "bar" Engine
+ SG_ ThrottlePosition : 48|8@1+ (0.4,0) [0|100] "%" Engine
+ SG_ EngineLoad : 56|8@1+ (0.4,0) [0|100] "%" Engine
+ SG_ IdleSpeed : 0|8@1+ (1,0) [0|255] "rpm" Engine
+ SG_ FuelRate : 8|8@1+ (0.1,0) [0|25.5] "l/h" Engine
+ SG_ BatteryVoltage : 16|8@1+ (0.1,0) [0|25.5] "V" Engine
+ SG_ OilTemperature : 24|8@1- (1,-40) [-40|215] "degC" Engine
+ SG_ IntakeAirTemperature : 32|8@1- (1,-40) [-40|215] "degC" Engine
+ SG_ ExhaustGasTemperature : 40|8@1- (1,-40) [-40|215] "degC" Engine
+ SG_ TurboBoost : 48|8@1+ (0.1,0) [0|25.5] "bar" Engine
+ SG_ EgrPosition : 56|8@1+ (0.4,0) [0|100] "%" Engine
+ SG_ RailPressure : 0|16@1+ (1,0) [0|65535] "bar" Engine
+ SG_ InjectionTiming : 16|8@1- (0.5,-64) [-64|63.5] "deg" Engine
+ SG_ FuelPressure : 24|16@1+ (0.1,0) [0|6553.5] "bar" Engine
+ SG_ AirMassFlow : 40|16@1+ (0.1,0) [0|6553.5] "g/s" Engine
+ SG_ LambdaValue : 56|8@1+ (0.01,0) [0|2.55] "" Engine
+ SG_ KnockRetard : 0|8@1- (0.5,-64) [-64|63.5] "deg" Engine
+
+BO_ 292 EngineOff: 8 Engine
+ SG_ EngineRunning : 0|1@1+ (1,0) [0|1] "" Engine
+
+BA_DEF_ BO_ "GenMsgCycleTime" INT 2 50000;
+BA_DEF_DEF_ "GenMsgCycleTime" 2;
+BA_ "GenMsgCycleTime" BO_ 291 100;
+CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
+"#;
+
     #[test]
     fn details_offset_keeps_up_with_a_resized_column() {
-        let mut app = test_database_app();
+        let mut app = test_database_app_for(NARROW_DETAIL_DBC);
         app.viewport_width = 80;
         app.viewport_height = 24;
         app.set_database_category(1);
         app.database_object_selected = 0;
         app.database_pane = DatabasePane::Details;
-        app.handle_event(InputEvent::End).unwrap();
-        let narrow = app.database_detail_offset;
-        assert!(narrow > 0);
-
-        // A wider terminal wraps the same details into fewer lines.
-        app.viewport_width = 200;
-        let (_, _, width) = app.database_layout(200);
-        let total = app.database_detail_lines(width).len();
         let rows = app.database_body_rows(24);
-        assert!(total.saturating_sub(rows) < narrow);
+        let narrow_width = app.database_detail_width(80);
+        let narrow_total = app.database_detail_lines(narrow_width).len();
+        app.handle_event(InputEvent::End).unwrap();
+        assert_eq!(app.database_detail_offset, narrow_total - rows);
+
+        // A wider terminal leaves the narrow layout for a wider third column.
+        app.viewport_width = 260;
+        let wide_width = app.database_detail_width(260);
+        assert!(wide_width > narrow_width);
+        let wide_total = app.database_detail_lines(wide_width).len();
+        assert!(wide_total <= narrow_total);
+        // An offset left past the end of the content is clamped back.
+        app.database_detail_offset = usize::MAX;
         app.clamp_database_detail_offset();
-        assert_eq!(app.database_detail_offset, total.saturating_sub(rows));
+        assert_eq!(app.database_detail_offset, wide_total.saturating_sub(rows));
     }
 
     #[test]
@@ -5150,6 +5277,35 @@ CM_ BO_ 256 "A long comment that names every receiver and explains when the fram
         assert_eq!(wrap("abcdefgh", 3), ["abc", "def", "gh"]);
         for line in wrap("alpha beta gamma delta", 7) {
             assert!(display_width(&line) <= 7, "line too wide: {line}");
+        }
+    }
+
+    #[test]
+    fn wrap_breaks_before_key_characters_when_no_space_fits() {
+        // A key = value stays whole and the specification starts a continuation,
+        // both when the whole line does not fit and when only the specification
+        // would have to be cut.
+        assert_eq!(
+            wrap("GenMsgCycleTime = 100 (INT 2..50000, default 2)", 25),
+            ["GenMsgCycleTime = 100", "(INT 2..50000, default 2)"]
+        );
+        assert_eq!(
+            wrap("GenMsgCycleTime = 100 (INT 2..50000, default 2)", 40),
+            ["GenMsgCycleTime = 100", "(INT 2..50000, default 2)"]
+        );
+        // Without a space the break lands in front of `,` instead of inside a
+        // word.
+        assert_eq!(
+            wrap("signal=Engine,Throttle,Brake", 14),
+            ["signal=Engine", ",Throttle", ",Brake"]
+        );
+        // `/` and `-` are break points too.
+        assert_eq!(wrap("left/right", 6), ["left", "/right"]);
+        assert_eq!(wrap("multi-word", 8), ["multi", "-word"]);
+        // Only a run without any break point is split inside the word.
+        assert_eq!(wrap("abcdefghij", 4), ["abcd", "efgh", "ij"]);
+        for line in wrap("GenMsgCycleTime = 100 (INT 2..50000, default 2)", 25) {
+            assert!(display_width(&line) <= 25, "line too wide: {line}");
         }
     }
 
@@ -5187,15 +5343,17 @@ CM_ BO_ 256 "A long comment that names every receiver and explains when the fram
 
     #[test]
     fn details_pane_cycles_and_scrolls_wrapped_lines() {
-        let mut app = test_database_app();
+        let mut app = test_database_app_for(NARROW_DETAIL_DBC);
         app.viewport_width = 80;
         app.viewport_height = 24;
         app.set_database_category(1);
         app.database_object_selected = 0;
-        let (_, _, width) = app.database_layout(80);
+        app.database_pane = DatabasePane::Details;
+        let width = app.database_detail_width(80);
         let total = app.database_detail_lines(width).len();
         let rows = app.database_body_rows(24);
         assert!(total > rows, "fixture details should overflow the pane");
+        app.database_pane = DatabasePane::Tree;
 
         // Tab cycles Tree -> Objects -> Details -> Tree, Shift-Tab reverses it.
         assert_eq!(app.database_pane, DatabasePane::Tree);
@@ -5240,7 +5398,7 @@ CM_ BO_ 256 "A long comment that names every receiver and explains when the fram
 
     #[test]
     fn details_scroll_resets_when_the_selected_object_changes() {
-        let mut app = test_database_app();
+        let mut app = test_database_app_for(NARROW_DETAIL_DBC);
         app.viewport_width = 80;
         app.viewport_height = 24;
         app.set_database_category(1);
@@ -5262,6 +5420,10 @@ CM_ BO_ 256 "A long comment that names every receiver and explains when the fram
         app.database_pane = DatabasePane::Details;
         app.handle_event(InputEvent::End).unwrap();
         assert!(app.database_detail_offset > 0);
+        // The tree and object panes come back when they own the focus, so the
+        // object row can be clicked from there.
+        app.handle_event(InputEvent::Left).unwrap();
+        assert_eq!(app.database_pane, DatabasePane::Objects);
         let left = app.database_left_width() as u16;
         app.handle_event(InputEvent::Mouse(MouseEvent {
             button: 0,
@@ -5277,24 +5439,29 @@ CM_ BO_ 256 "A long comment that names every receiver and explains when the fram
 
     #[test]
     fn details_header_reports_the_visible_line_range() {
-        let mut app = test_database_app();
+        let mut app = test_database_app_for(NARROW_DETAIL_DBC);
         app.viewport_width = 80;
         app.viewport_height = 24;
         app.set_database_category(1);
         app.database_object_selected = 0;
-        let (_, _, width) = app.database_layout(80);
+        app.database_pane = DatabasePane::Details;
+        let width = app.database_detail_width(80);
         let total = app.database_detail_lines(width).len();
         let rows = app.database_body_rows(24);
 
-        // 80 columns leave a narrow details column, so the range is shortened
-        // instead of being cut off.
+        // The narrow layout gives the details the whole width, so the full
+        // label fits the header.
         let mut lines = Vec::new();
         app.render_databases(&mut lines, 80, 24);
-        let header = details_header_cell(&lines[0]);
+        let header = strip_ansi(&lines[0]).trim_end().to_string();
         assert_eq!(header, details_header_text(0, rows, total, width));
-        assert_eq!(header, format!("lines 1-{} of {total}", rows.min(total)));
+        assert_eq!(
+            header,
+            format!("Details  lines 1-{} of {total}", rows.min(total))
+        );
 
-        // A wide column has room for the full label.
+        // A wide terminal keeps the three columns and the details header in
+        // the third cell.
         let (_, _, wide_width) = app.database_layout(160);
         let wide_total = app.database_detail_lines(wide_width).len();
         let mut lines = Vec::new();
@@ -5306,18 +5473,103 @@ CM_ BO_ 256 "A long comment that names every receiver and explains when the fram
         );
 
         // Scrolling to the end moves the reported range with it.
-        app.database_pane = DatabasePane::Details;
         app.handle_event(InputEvent::End).unwrap();
         let mut lines = Vec::new();
         app.render_databases(&mut lines, 80, 24);
-        let header = details_header_cell(&lines[0]);
+        let header = strip_ansi(&lines[0]).trim_end().to_string();
         assert_eq!(
             header,
             details_header_text(total - rows, rows, total, width)
         );
         assert_eq!(
             header,
-            format!("lines {}-{total} of {total}", total - rows + 1)
+            format!("Details  lines {}-{total} of {total}", total - rows + 1)
+        );
+    }
+
+    #[test]
+    fn narrow_layout_decision_uses_the_width_and_the_focused_pane() {
+        assert!(details_take_full_width(80, DatabasePane::Details));
+        assert!(details_take_full_width(99, DatabasePane::Details));
+        assert!(!details_take_full_width(100, DatabasePane::Details));
+        assert!(!details_take_full_width(160, DatabasePane::Details));
+        assert!(!details_take_full_width(80, DatabasePane::Tree));
+        assert!(!details_take_full_width(80, DatabasePane::Objects));
+    }
+
+    #[test]
+    fn narrow_layout_shows_the_details_at_full_width() {
+        let mut app = test_database_app_for(NARROW_DETAIL_DBC);
+        app.viewport_width = 80;
+        app.viewport_height = 24;
+        app.set_database_category(1);
+        app.database_object_selected = 0;
+
+        // The tree and object panes own the focus at first, so the three-column
+        // layout is drawn and the narrow details column shreds the values.
+        let mut lines = Vec::new();
+        app.render_databases(&mut lines, 80, 24);
+        assert!(lines.iter().any(|line| strip_ansi(line).contains(" │ ")));
+
+        // Focusing the details replaces the other columns with a full-width
+        // view: the short values stay on one line.
+        app.database_pane = DatabasePane::Details;
+        let mut lines = Vec::new();
+        app.render_databases(&mut lines, 80, 24);
+        let text = lines
+            .iter()
+            .map(|line| strip_ansi(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!text.contains(" │ "), "columns should collapse: {text}");
+        assert!(text.contains("name: EngineState"), "missing name: {text}");
+        assert!(text.contains("transmitter: Engine"), "missing transmitter");
+        assert!(
+            text.contains("GenMsgCycleTime = 100 (INT 2..50000, default 2)"),
+            "attribute line split: {text}"
+        );
+        let header = strip_ansi(&lines[0]).trim_end().to_string();
+        assert!(header.starts_with("Details  lines 1-"), "header: {header}");
+
+        // Scrolling still works and the header follows it.
+        app.handle_event(InputEvent::End).unwrap();
+        let offset = app.database_detail_offset;
+        assert!(offset > 0);
+        let mut lines = Vec::new();
+        app.render_databases(&mut lines, 80, 24);
+        let header = strip_ansi(&lines[0]).trim_end().to_string();
+        assert!(
+            header.starts_with(&format!("Details  lines {}-", offset + 1)),
+            "header: {header}"
+        );
+
+        // Leaving the details brings the three-column layout back.
+        app.handle_event(InputEvent::Left).unwrap();
+        assert_eq!(app.database_pane, DatabasePane::Objects);
+        let mut lines = Vec::new();
+        app.render_databases(&mut lines, 80, 24);
+        assert!(lines.iter().any(|line| strip_ansi(line).contains(" │ ")));
+    }
+
+    #[test]
+    fn wide_layout_keeps_the_three_columns() {
+        let mut app = test_database_app_for(NARROW_DETAIL_DBC);
+        app.viewport_width = 120;
+        app.viewport_height = 24;
+        app.set_database_category(1);
+        app.database_object_selected = 0;
+        app.database_pane = DatabasePane::Details;
+        let (_, _, width) = app.database_layout(120);
+        assert_eq!(app.database_detail_width(120), width);
+
+        let mut lines = Vec::new();
+        app.render_databases(&mut lines, 120, 24);
+        let header = strip_ansi(&lines[0]);
+        assert!(header.contains("Database tree"), "header: {header}");
+        assert!(header.contains(" │ "), "header: {header}");
+        assert!(
+            lines.iter().any(|line| strip_ansi(line).contains(" │ ")),
+            "three-column body expected"
         );
     }
 

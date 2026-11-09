@@ -119,32 +119,42 @@ with the details focused, `j`/`k` and `Up`/`Down` scroll by one line,
 `PageUp`/`PageDown` by one screen, and `Home`/`End` jump to the first or last
 line. Its header reports the visible range as `Details  lines 1-18 of 41`, or
 just `lines 1-18 of 41` when the column is narrow, and the scroll starts over
-when another object is selected. The database name is a non-selectable header
-line in the tree pane, because `[`/`]` switch loaded databases. Long text never
-disappears from the viewer: the message preview, both message-detail columns,
-the database details and the help descriptions wrap at word boundaries, and
-inside a word wider than the pane, while counting wide CJK glyphs as two
-cells. Only the short labels of the tabular message list and of the tree and
-object columns end in `...`, because their text is shown next to them. The
-detail column groups each object into bold headings with indented items and dim
-notes, separated by a blank line, so message metadata, attribute blocks,
-signal lists and node relations stay readable instead of running together. It
-includes each DBC message's transmitter and the deduplicated receivers of its
-signals. A DBC signal shows its message's
-transmitter next to its deduplicated receivers; a LIN signal shows its publisher
-next to its deduplicated subscribers, and a LIN frame shows the union of its
-signals' subscribers. A DBC node groups its relations under the `messages sent`,
+when another object is selected. Below 100 columns the three columns do not
+leave enough room for that, so a focused details pane drops the tree and object
+columns and uses the whole terminal width: `name: EngineState`,
+`transmitter: Engine` and `GenMsgCycleTime = 100` then stay on one line.
+`Left`/`Right`, `h`/`l` or `Tab`/`Shift-Tab` bring the three-column layout back
+by focusing the tree or the object list, and at 100 columns and above the
+layout is always the three-column one. The database name is a non-selectable
+header line in the tree pane, because `[`/`]` switch loaded databases. Long text
+never disappears from the viewer: the message preview, both message-detail
+columns, the database details and the help descriptions wrap while counting wide
+CJK glyphs as two cells. A line breaks after its last space when it has one,
+otherwise in front of the last `(`, `=`, `,`, `/` or `-` it contains, so a
+value, a list member or an attribute specification starts a new line instead
+of a word being split; only a run without any break point is split inside
+the word. Only the short labels of the tabular message list and of the tree
+and object columns end in `...`, because their text is shown next to them.
+The detail column groups each object into bold headings with indented items
+and dim notes, separated by a blank line, so message metadata, attribute
+blocks, signal lists and node relations stay readable instead of running
+together. It includes each DBC message's transmitter and the deduplicated
+receivers of its signals. A DBC signal shows its message's transmitter next to
+its deduplicated receivers; a LIN signal shows its publisher next to its
+deduplicated subscribers, and a LIN frame shows the union of its signals'
+subscribers. A DBC node groups its relations under the `messages sent`,
 `messages received`, `signals sent` and `signals received` headings; a LIN node
-groups the frames it publishes and the signals it subscribes to. Message, signal
-and node details carry an `attributes:` block: every assigned attribute is shown
-with its definition and default, followed by a `defaults:` list with the
-`BA_DEF_DEF_` defaults of that scope's definitions which the object does not
-assign. An attribute therefore keeps its definition's default until a `BA_`
-assignment overrides it. Assignments, defaults, receivers, subscribers and
-signal names each get their own line, so a long enum value or receiver list
-stays readable. The Attributes category shows each definition's type, range or
-enum members, default and assignment count. A detail list only stops after 500
-entries and reports the remaining count.
+groups the frames it publishes and the signals it subscribes to. Message,
+signal and node details carry an
+`attributes:` block: every assigned attribute is shown with its definition and
+default, followed by a `defaults:` list with the `BA_DEF_DEF_` defaults of that
+scope's definitions which the object does not assign. An attribute therefore
+keeps its definition's default until a `BA_` assignment overrides it.
+Assignments, defaults, receivers, subscribers and signal names each get their
+own line, so a long enum value or receiver list stays readable. The Attributes
+category shows each definition's type, range or enum members, default and
+assignment count. A detail list only stops after 500 entries and reports the
+remaining count.
 
 Key controls are:
 
@@ -161,7 +171,8 @@ Enter             open the selected message, or focus objects / report the
 b                 bind a DBC/LDF database
 d                 open the DBC/LDF browser
 Left/Right, h/l   step between tree, object and details pane focus
-Tab, Shift-Tab    cycle tree, object and details pane focus
+Tab, Shift-Tab    cycle tree, object and details pane focus (below 100 columns
+                  the focused details use the whole width)
 [/]               switch loaded database
 e                 export the filtered messages with decoded signals to CSV
 p                 open a curve for the selected numeric signal
