@@ -232,7 +232,8 @@ start open, `10..` leaves the end open, and a single value selects that instant.
 A `+` prefix counts from the first message of the trace, as in `g`, so
 `+10..+15` reads "ten to fifteen seconds into the log". The range composes with
 the `/` filter and with the frame statistics, the header shows the active range,
-and `t` with an empty range (`t`, Enter) clears it. As in `g`, a message without
+and `t` with an empty range (`t`, Enter) clears it. `Esc` in the message list
+clears the text filter and the time range together. As in `g`, a message without
 a timestamp cannot be placed in time and is excluded while a range is active.
 
 The curve plots one signal by default. From the detail pane, `a` adds the
@@ -242,7 +243,8 @@ the legend prints its sample count and value range. Series are normalised by
 their own range, so signals with unrelated units can be compared, and the
 legend is where the real values are read. `x` drops the most recently added
 series; the window pans with Left/Right, zooms with `+`/`-`, and Home/End jump
-to either end.
+to either end. A curve plots at most six signals, and it honours the active time
+range, so `t +10..+15` followed by `p` plots only that window.
 
 `s` opens the frame statistics view: one row per bus, channel and frame id of
 the visible messages, with the message count and the average, minimum and

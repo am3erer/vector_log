@@ -1549,6 +1549,10 @@ impl App {
             self.status = NO_TRACE_STATUS.to_string();
             return;
         };
+        if self.filtered.is_empty() {
+            self.status = "Nothing to export: the list is empty".to_string();
+            return;
+        }
         let path = export_path(&trace.path);
         match self.write_csv(&path) {
             Ok((rows, signals)) => {
@@ -1677,14 +1681,17 @@ impl App {
             &row.name,
             &self.objects[summary.object_index],
         );
-        if append
-            && self
-                .curve
-                .as_ref()
-                .is_some_and(|curve| curve.series.iter().any(|series| series.title == title))
-        {
-            self.status = format!("{title} is already plotted");
-            return;
+        if append {
+            if let Some(curve) = &self.curve {
+                if curve.series.len() >= CURVE_SYMBOLS.len() {
+                    self.status = format!("A curve shows at most {} signals", CURVE_SYMBOLS.len());
+                    return;
+                }
+                if curve.series.iter().any(|series| series.title == title) {
+                    self.status = format!("{title} is already plotted");
+                    return;
+                }
+            }
         }
         let Some(trace) = &self.trace else {
             return;
@@ -1704,6 +1711,9 @@ impl App {
                 Ok(sample) => {
                     if error.is_none() {
                         error = sample.error.clone();
+                    }
+                    if !in_time_range(Some(sample.timestamp_ns), self.time_range) {
+                        continue;
                     }
                     let Some(value) = sample.physical_value else {
                         continue;
@@ -1739,7 +1749,8 @@ impl App {
             symbol: CURVE_SYMBOLS[index],
             color: CURVE_COLORS[index],
         });
-        if !append {
+        // The first series always seeds the window, also when it arrives by `a`.
+        if !append || curve.series.len() == 1 {
             if let Some(bounds) = curve_bounds(curve) {
                 curve.window_start = bounds.0;
                 curve.window_end = bounds.1;
@@ -4285,7 +4296,7 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     binding("G", "jump to the last message"),
     binding("T", "switch timestamps between trace clock and first frame"),
     binding("] / [", "next / previous occurrence of the frame id"),
-    binding("Esc", "clear the message filter"),
+    binding("Esc", "clear the message filter and the time range"),
     binding("q", "quit"),
     heading("Detail (needs a trace)"),
     binding("j / Down", "next signal"),
@@ -6953,6 +6964,32 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
         let lines = plot_series(&curve, (0, 200), 30, 8);
         let painted = lines.iter().filter(|line| line.contains('*')).count();
         assert!(painted > 2, "expected a painted span, got {painted} rows");
+    }
+
+    #[test]
+    fn curve_bounds_are_never_empty() {
+        // A single sample still yields a window, so the plot is not blank.
+        let curve = CurveData {
+            series: vec![CurveSeries {
+                title: "Speed".to_string(),
+                samples: vec![(100, 1.0)],
+                error: None,
+                truncated: false,
+                symbol: '*',
+                color: ANSI_BRIGHT_GREEN,
+            }],
+            window_start: 0,
+            window_end: 0,
+        };
+        assert_eq!(curve_bounds(&curve), Some((100, 101)));
+        assert_eq!(
+            curve_bounds(&CurveData {
+                series: Vec::new(),
+                window_start: 0,
+                window_end: 0,
+            }),
+            None
+        );
     }
 
     #[test]
