@@ -228,6 +228,7 @@ enum InputKind {
     Binding,
     DatabaseFilter,
     Goto,
+    TimeRange,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -360,6 +361,7 @@ struct App {
     timing: Option<TimingStats>,
     time_mode: TimeMode,
     time_base: u64,
+    time_range: Option<(u64, u64)>,
     stats: Vec<FrameStat>,
     stats_selected: usize,
     stats_offset: usize,
@@ -455,6 +457,7 @@ impl App {
             timing: None,
             time_mode: TimeMode::Absolute,
             time_base,
+            time_range: None,
             stats: Vec::new(),
             stats_selected: 0,
             stats_offset: 0,
@@ -495,15 +498,24 @@ impl App {
     /// First header line: the trace, or its absence, plus the active mode.
     fn title_line(&self) -> String {
         match &self.trace {
-            Some(trace) => format!(
-                " vector-log-tui  {}  objects={}/{}  skipped={}  mode={:?}  time={}",
-                trace.path.display(),
-                self.filtered.len(),
-                self.summaries.len(),
-                trace.skipped_objects,
-                self.mode,
-                self.time_mode.label()
-            ),
+            Some(trace) => {
+                let range = self.time_range.map_or_else(String::new, |(start, end)| {
+                    format!(
+                        "  range={}..{}",
+                        self.time_axis().format(Some(start)),
+                        self.time_axis().format(Some(end))
+                    )
+                });
+                format!(
+                    " vector-log-tui  {}  objects={}/{}  skipped={}  mode={:?}  time={}{range}",
+                    trace.path.display(),
+                    self.filtered.len(),
+                    self.summaries.len(),
+                    trace.skipped_objects,
+                    self.mode,
+                    self.time_mode.label()
+                )
+            }
             None => format!(
                 " vector-log-tui  (no trace)  databases={}  mode={:?}",
                 self.bindings.len(),
@@ -574,6 +586,7 @@ impl App {
                 InputEvent::Char('p') => self.open_curve(),
                 InputEvent::Char('d') => self.enter_databases(),
                 InputEvent::Char('s') => self.open_statistics(),
+                InputEvent::Char('t') => self.start_input(InputKind::TimeRange),
                 InputEvent::Char('e') => self.export_csv(),
                 InputEvent::Char('T') => self.toggle_time_mode(),
                 InputEvent::Char('g') => self.start_input(InputKind::Goto),
@@ -706,6 +719,23 @@ impl App {
                                 self.input_buffer = value;
                             }
                         }
+                        InputKind::TimeRange => match parse_time_range(&value, self.time_base) {
+                            Ok(range) => {
+                                self.time_range = range;
+                                self.selected = 0;
+                                self.list_offset = 0;
+                                self.rebuild_filtered();
+                                self.status = match range {
+                                    Some(_) => format!("Range: {}", display_filter(value.trim())),
+                                    None => "Range cleared".to_string(),
+                                };
+                            }
+                            Err(error) => {
+                                self.status = error;
+                                self.input = Some(InputKind::TimeRange);
+                                self.input_buffer = value;
+                            }
+                        },
                         InputKind::Goto => {
                             if let Err(error) = self.goto_input(&value) {
                                 self.status = error;
@@ -1140,6 +1170,7 @@ impl App {
 
     fn clear_filter(&mut self) {
         self.filter.clear();
+        self.time_range = None;
         self.selected = 0;
         self.list_offset = 0;
         self.rebuild_filtered();
@@ -1417,13 +1448,17 @@ impl App {
     /// Recompute the filter once per filter change instead of once per frame.
     fn rebuild_filtered(&mut self) {
         let filter = self.filter.to_ascii_lowercase();
-        let filtered = if filter.is_empty() {
+        let range = self.time_range;
+        let filtered = if filter.is_empty() && range.is_none() {
             (0..self.summaries.len()).collect()
         } else {
             let mut buffer = String::with_capacity(128);
             let mut indices = Vec::new();
             for (index, summary) in self.summaries.iter().enumerate() {
-                if summary_matches_in(summary, &filter, &mut buffer) {
+                if !in_time_range(summary.timestamp_ns, range) {
+                    continue;
+                }
+                if filter.is_empty() || summary_matches_in(summary, &filter, &mut buffer) {
                     indices.push(index);
                 }
             }
@@ -3827,6 +3862,62 @@ impl TimeAxis {
     }
 }
 
+/// Whether a message timestamp falls inside the active range.
+///
+/// A message without a timestamp cannot be placed in time, so an active range
+/// excludes it.
+fn in_time_range(timestamp: Option<u64>, range: Option<(u64, u64)>) -> bool {
+    match (timestamp, range) {
+        (_, None) => true,
+        (None, Some(_)) => false,
+        (Some(timestamp), Some((start, end))) => timestamp >= start && timestamp < end,
+    }
+}
+
+/// Parse a `t` prompt: `10..15`, `..15`, `10..` or a single instant.
+///
+/// A leading `+` counts from the first message of the trace, matching the `g`
+/// prompt; a bare number is the trace clock. Values are seconds.
+fn parse_time_range(value: &str, base: u64) -> Result<Option<(u64, u64)>, String> {
+    let text = value.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let instant = |text: &str| -> Result<u64, String> {
+        let text = text.trim();
+        let (relative, number) = match text.strip_prefix('+') {
+            Some(rest) => (true, rest),
+            None => (false, text),
+        };
+        let seconds = parse_seconds(number, "Time")?;
+        let nanos = seconds_to_ns(seconds).ok_or("Time must be finite")?;
+        Ok(if relative {
+            base.saturating_add(nanos)
+        } else {
+            nanos
+        })
+    };
+    if let Some((start, end)) = text.split_once("..") {
+        let start = if start.trim().is_empty() {
+            0
+        } else {
+            instant(start)?
+        };
+        let end = if end.trim().is_empty() {
+            u64::MAX
+        } else {
+            instant(end)?
+        };
+        if end <= start {
+            return Err("The range end must be after its start".to_string());
+        }
+        return Ok(Some((start, end)));
+    }
+    let at = instant(text)?;
+    // A single instant selects the messages at that timestamp.
+    Ok(Some((at, at.saturating_add(1))))
+}
+
 /// A `g` prompt value: a time on the trace clock, a time relative to the
 /// first message of the visible list, or a 1-based position in that list.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -3927,6 +4018,7 @@ fn footer_line(input: Option<InputKind>, buffer: &str, status: &str, mode: Mode)
         InputKind::Binding => "bind (can|lin CHANNEL PATH): ",
         InputKind::DatabaseFilter => "db /",
         InputKind::Goto => "goto (10.5 | +10 | #1234): ",
+        InputKind::TimeRange => "range (10..15 | ..15 | +10..+15): ",
     };
     format!("{prompt}{buffer}  [Enter] apply  [Esc] cancel")
 }
@@ -3978,7 +4070,7 @@ const fn binding(key: &'static str, description: &'static str) -> HelpEntry {
 fn mode_hint(mode: Mode) -> &'static str {
     match mode {
         Mode::Messages => {
-            "j/k move · Enter detail · / filter · g goto · ] [ frame · s stats · T time · ? help"
+            "j/k move · Enter detail · / filter · t range · g goto · s stats · T time · ? help"
         }
         Mode::Detail => "j/k signal · p curve · T time · Esc back · ? help",
         Mode::Curve => "←/→ pan · +/- zoom · Home/End · Esc back · ? help",
@@ -3995,6 +4087,7 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     binding("Home / End", "first / last message"),
     binding("Enter", "open the selected message"),
     binding("/", "filter messages"),
+    binding("t", "limit to a time range, empty clears"),
     binding("b", "bind a DBC or LDF database"),
     binding("p", "curve for the selected numeric signal"),
     binding("d", "open the database browser"),
@@ -6270,6 +6363,52 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
         let row = stat_row(&single, 80);
         assert!(row.contains("lin"));
         assert!(row.trim_end().ends_with('-'));
+    }
+
+    #[test]
+    fn time_range_parsing_handles_open_ends_offsets_and_errors() {
+        let base = 1_000_000_000;
+        assert_eq!(parse_time_range("", base).unwrap(), None);
+        assert_eq!(
+            parse_time_range("1..2", base).unwrap(),
+            Some((1_000_000_000, 2_000_000_000))
+        );
+        assert_eq!(
+            parse_time_range("..2", base).unwrap(),
+            Some((0, 2_000_000_000))
+        );
+        assert_eq!(
+            parse_time_range("1..", base).unwrap(),
+            Some((1_000_000_000, u64::MAX))
+        );
+        // A leading `+` counts from the first message of the trace.
+        assert_eq!(
+            parse_time_range("+1..+2", base).unwrap(),
+            Some((2_000_000_000, 3_000_000_000))
+        );
+        // A single instant selects exactly that timestamp.
+        assert_eq!(
+            parse_time_range("5", base).unwrap(),
+            Some((5_000_000_000, 5_000_000_001))
+        );
+        assert!(parse_time_range("5..5", base).is_err());
+        assert!(parse_time_range("3..1", base).is_err());
+        assert!(parse_time_range("a..b", base).is_err());
+    }
+
+    #[test]
+    fn time_range_excludes_messages_outside_it() {
+        let range = Some((1_000_000_000, 2_000_000_000));
+        assert!(in_time_range(Some(1_000_000_000), range));
+        assert!(in_time_range(Some(1_999_999_999), range));
+        // The end is exclusive.
+        assert!(!in_time_range(Some(2_000_000_000), range));
+        assert!(!in_time_range(Some(999_999_999), range));
+        // A message without a timestamp cannot be placed in time.
+        assert!(!in_time_range(None, range));
+        // Without a range everything passes.
+        assert!(in_time_range(None, None));
+        assert!(in_time_range(Some(5), None));
     }
 
     #[test]

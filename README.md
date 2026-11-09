@@ -166,6 +166,7 @@ g                 jump by trace time, +offset or #position
 G                 jump to the last message
 T                 switch timestamps between trace clock and first frame
 s                 frame statistics: count and cycle time per frame id
+t                 limit to a time range: 10..15, ..15, +10..+15 (empty clears)
 ] / [             next / previous occurrence of the same frame id
 Enter             open the selected message, or focus objects / report the
                   selection in the database browser
@@ -222,6 +223,15 @@ binding, database filter or goto value, and the status message otherwise.
 Opening a message shows its decoded signals on the right. The left column also
 reports the cycle timing of that frame id on the same bus and channel: average,
 minimum and maximum period, mean jitter, and how many frames the log holds.
+
+`t` limits the list to a time range. The two ends are seconds: `10..15`
+selects the messages between 10 s and 15 s on the trace clock, `..15` leaves the
+start open, `10..` leaves the end open, and a single value selects that instant.
+A `+` prefix counts from the first message of the trace, as in `g`, so
+`+10..+15` reads "ten to fifteen seconds into the log". The range composes with
+the `/` filter and with the frame statistics, the header shows the active range,
+and `t` with an empty range (`t`, Enter) clears it. As in `g`, a message without
+a timestamp cannot be placed in time and is excluded while a range is active.
 
 `s` opens the frame statistics view: one row per bus, channel and frame id of
 the visible messages, with the message count and the average, minimum and
