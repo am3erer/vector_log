@@ -127,14 +127,37 @@ struct TimingStats {
 }
 
 #[derive(Debug, Clone)]
-struct CurveData {
+struct CurveSeries {
     title: String,
     samples: Vec<(u64, f64)>,
     error: Option<String>,
     truncated: bool,
-    window_start: usize,
-    window_len: usize,
+    symbol: char,
+    color: &'static str,
 }
+
+struct CurveData {
+    series: Vec<CurveSeries>,
+    /// Visible time window; `end` is exclusive.
+    window_start: u64,
+    window_end: u64,
+}
+
+/// Symbols and colours handed to the series of a curve, in plot order.
+const CURVE_SYMBOLS: [char; 6] = ['*', 'o', '+', 'x', '#', '@'];
+const CURVE_COLORS: [&str; 6] = [
+    ANSI_BRIGHT_GREEN,
+    ANSI_MAGENTA,
+    ANSI_BRIGHT_YELLOW,
+    ANSI_CYAN,
+    ANSI_WHITE,
+    ANSI_RED,
+];
+
+/// Smallest window the zoom keeps, so a curve cannot collapse to nothing.
+const MIN_CURVE_WINDOW_NS: u64 = 1_000_000;
+/// Legend rows the curve view prints before summarising the rest.
+const MAX_CURVE_LEGEND: usize = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -607,6 +630,7 @@ impl App {
                 InputEvent::Home => self.select_first_signal(),
                 InputEvent::End => self.select_last_signal(),
                 InputEvent::Char('p') => self.open_curve(),
+                InputEvent::Char('a') => self.add_curve_series(),
                 InputEvent::Char('T') => self.toggle_time_mode(),
                 InputEvent::Char('b') => self.start_input(InputKind::Binding),
                 InputEvent::Char('e') => self.export_csv(),
@@ -686,6 +710,7 @@ impl App {
                 InputEvent::PageDown | InputEvent::Char('-') => self.curve_zoom(2.0),
                 InputEvent::Home => self.curve_home(),
                 InputEvent::End => self.curve_end(),
+                InputEvent::Char('x') => self.remove_curve_series(),
                 InputEvent::Char('?') => self.open_help(),
                 InputEvent::Mouse(mouse) => self.handle_curve_mouse(mouse),
                 _ => {}
@@ -1613,7 +1638,17 @@ impl App {
             .unwrap_or_default()
     }
 
+    /// `p`: plot the selected signal on its own.
     fn open_curve(&mut self) {
+        self.show_curve(false);
+    }
+
+    /// `a`: add the selected signal to the curve that is already plotted.
+    fn add_curve_series(&mut self) {
+        self.show_curve(true);
+    }
+
+    fn show_curve(&mut self, append: bool) {
         if self.trace.is_none() {
             self.status = NO_TRACE_STATUS.to_string();
             return;
@@ -1637,93 +1672,154 @@ impl App {
             self.status = format!("{} is not decodable: select a decoded signal", row.name);
             return;
         }
-        let signal_name = qualified_signal_name(
+        let title = qualified_signal_name(
             binding.database(),
             &row.name,
             &self.objects[summary.object_index],
         );
+        if append
+            && self
+                .curve
+                .as_ref()
+                .is_some_and(|curve| curve.series.iter().any(|series| series.title == title))
+        {
+            self.status = format!("{title} is already plotted");
+            return;
+        }
         let Some(trace) = &self.trace else {
             return;
         };
-        let query = match trace
-            .reader
-            .signal_query(binding, signal_name.clone(), false)
-        {
+        let query = match trace.reader.signal_query(binding, title.clone(), false) {
             Ok(query) => query,
             Err(error) => {
                 self.status = format!("start signal query: {error}");
                 return;
             }
         };
-        let mut curve_samples = Vec::new();
-        let mut decode_error: Option<String> = None;
+        let mut samples = Vec::new();
+        let mut error: Option<String> = None;
         let mut truncated = false;
         for item in query {
             match item {
                 Ok(sample) => {
-                    if decode_error.is_none() {
-                        decode_error = sample.error.clone();
+                    if error.is_none() {
+                        error = sample.error.clone();
                     }
                     let Some(value) = sample.physical_value else {
                         continue;
                     };
-                    if curve_samples.len() >= MAX_CURVE_SAMPLES {
+                    if samples.len() >= MAX_CURVE_SAMPLES {
                         truncated = true;
                         break;
                     }
-                    curve_samples.push((sample.timestamp_ns, value));
+                    samples.push((sample.timestamp_ns, value));
                 }
-                Err(error) => {
-                    decode_error = Some(error.to_string());
+                Err(query_error) => {
+                    error = Some(query_error.to_string());
                     break;
                 }
             }
         }
-        self.curve = Some(CurveData {
-            title: signal_name,
-            window_len: curve_samples.len().max(1),
-            samples: curve_samples,
-            error: decode_error,
+        if self.curve.is_none() {
+            self.curve = Some(CurveData {
+                series: Vec::new(),
+                window_start: 0,
+                window_end: 0,
+            });
+        }
+        let Some(curve) = &mut self.curve else {
+            return;
+        };
+        let index = curve.series.len() % CURVE_SYMBOLS.len();
+        curve.series.push(CurveSeries {
+            title: title.clone(),
+            samples,
+            error,
             truncated,
-            window_start: 0,
+            symbol: CURVE_SYMBOLS[index],
+            color: CURVE_COLORS[index],
         });
+        if !append {
+            if let Some(bounds) = curve_bounds(curve) {
+                curve.window_start = bounds.0;
+                curve.window_end = bounds.1;
+            }
+        }
         self.mode = Mode::Curve;
+        self.status = format!("Plotted {title}");
+    }
+
+    /// `x` in the curve view: drop the series that was added last.
+    fn remove_curve_series(&mut self) {
+        let Some(curve) = &mut self.curve else {
+            return;
+        };
+        if curve.series.pop().is_some() {
+            if curve.series.is_empty() {
+                self.curve = None;
+                self.mode = Mode::Detail;
+                self.status = "Curve closed".to_string();
+            } else {
+                self.status = "Removed the last signal".to_string();
+            }
+        }
     }
 
     fn curve_pan(&mut self, direction: isize) {
-        let Some(curve) = &mut self.curve else {
+        let Some(curve) = &self.curve else {
             return;
         };
-        let step = (curve.window_len / 5).max(1) as isize;
-        let max_start = curve.samples.len().saturating_sub(curve.window_len) as isize;
-        curve.window_start =
-            (curve.window_start as isize + direction * step).clamp(0, max_start) as usize;
+        let Some(bounds) = curve_bounds(curve) else {
+            return;
+        };
+        let window = (curve.window_start, curve.window_end);
+        let (start, end) = pan_window(window, direction, bounds);
+        if let Some(curve) = &mut self.curve {
+            curve.window_start = start;
+            curve.window_end = end;
+        }
     }
 
     fn curve_zoom(&mut self, factor: f64) {
-        let Some(curve) = &mut self.curve else {
+        let Some(curve) = &self.curve else {
             return;
         };
-        let old_len = curve.window_len.max(1);
-        let max_len = curve.samples.len().max(1);
-        let min_len = max_len.min(2);
-        let new_len = ((old_len as f64 * factor).round() as usize).clamp(min_len, max_len);
-        let center = curve.window_start + old_len / 2;
-        curve.window_len = new_len;
-        curve.window_start = center
-            .saturating_sub(new_len / 2)
-            .min(curve.samples.len().saturating_sub(new_len));
+        let Some(bounds) = curve_bounds(curve) else {
+            return;
+        };
+        let window = (curve.window_start, curve.window_end);
+        let (start, end) = zoom_window(window, factor, bounds);
+        if let Some(curve) = &mut self.curve {
+            curve.window_start = start;
+            curve.window_end = end;
+        }
     }
 
     fn curve_home(&mut self) {
+        let Some(curve) = &self.curve else {
+            return;
+        };
+        let Some(bounds) = curve_bounds(curve) else {
+            return;
+        };
+        let width = curve.window_end.saturating_sub(curve.window_start);
         if let Some(curve) = &mut self.curve {
-            curve.window_start = 0;
+            curve.window_start = bounds.0;
+            curve.window_end = bounds.0.saturating_add(width).min(bounds.1);
         }
     }
 
     fn curve_end(&mut self) {
+        let Some(curve) = &self.curve else {
+            return;
+        };
+        let Some(bounds) = curve_bounds(curve) else {
+            return;
+        };
+        let width = curve.window_end.saturating_sub(curve.window_start);
         if let Some(curve) = &mut self.curve {
-            curve.window_start = curve.samples.len().saturating_sub(curve.window_len);
+            curve.window_end = bounds.1;
+            curve.window_start = bounds.1.saturating_sub(width).max(bounds.0);
         }
     }
 
@@ -2094,20 +2190,17 @@ impl App {
             lines.push("No curve selected".to_string());
             return;
         };
-        let start = curve.window_start.min(curve.samples.len());
-        let end = start
-            .saturating_add(curve.window_len)
-            .min(curve.samples.len());
-        let visible = &curve.samples[start..end];
+        let axis = self.time_axis();
+        let window = (curve.window_start, curve.window_end);
+        let truncated = curve.series.iter().any(|series| series.truncated);
         lines.push(paint_bold(
             format!(
-                "Curve: {}  samples={}/{}  window={}-{}{}",
-                curve.title,
-                visible.len(),
-                curve.samples.len(),
-                start,
-                end,
-                if curve.truncated {
+                "Curve: {} signal{}  window={}..{}{}  [a] add  [x] remove",
+                curve.series.len(),
+                if curve.series.len() == 1 { "" } else { "s" },
+                axis.format(Some(window.0)),
+                axis.format(Some(window.1)),
+                if truncated {
                     "  (first samples only)"
                 } else {
                     ""
@@ -2115,18 +2208,37 @@ impl App {
             ),
             ANSI_BRIGHT_CYAN,
         ));
-        if let Some(error) = &curve.error {
-            lines.push(paint(format!("decode note: {error}"), ANSI_RED));
+        let mut legend = 0;
+        for series in &curve.series {
+            if legend >= MAX_CURVE_LEGEND {
+                lines.push(paint(
+                    format!("  … {} more", curve.series.len() - legend),
+                    ANSI_WHITE,
+                ));
+                break;
+            }
+            lines.push(paint(
+                format!(
+                    "  {} {}  {} samples  {}",
+                    series.symbol,
+                    series.title,
+                    series.samples.len(),
+                    series_range_label(series)
+                ),
+                series.color,
+            ));
+            if let Some(error) = &series.error {
+                lines.push(paint(format!("    note: {error}"), ANSI_RED));
+            }
+            legend += 1;
         }
-        if visible.is_empty() {
+        if curve.series.iter().all(|series| series.samples.is_empty()) {
             lines.push(paint("No numeric samples available", ANSI_BRIGHT_YELLOW));
             return;
         }
-        lines.extend(
-            ascii_curve(visible, width.saturating_sub(2), height.saturating_sub(6))
-                .lines()
-                .map(|line| paint(line, ANSI_BRIGHT_GREEN)),
-        );
+        lines.push(String::new());
+        let rows = height.saturating_sub(3 + legend);
+        lines.extend(plot_series(curve, window, width.saturating_sub(1), rows));
     }
 
     fn render_statistics(&self, lines: &mut Vec<String>, width: usize, height: usize) {
@@ -3515,50 +3627,58 @@ fn row_display(row: &SignalRow) -> String {
     value
 }
 
-fn ascii_curve(samples: &[(u64, f64)], width: usize, height: usize) -> String {
-    let plot_width = width.saturating_sub(10).max(1);
-    let plot_height = height.saturating_sub(2).max(1);
-    let mut columns_low = vec![usize::MAX; plot_width];
-    let mut columns_high = vec![0_usize; plot_width];
-    let first = samples.first().map_or(0, |sample| sample.0);
-    let last = samples
-        .last()
-        .map_or(first + 1, |sample| sample.0.max(first + 1));
-    let min = samples
-        .iter()
-        .map(|(_, value)| *value)
-        .fold(f64::INFINITY, f64::min);
-    let max = samples
-        .iter()
-        .map(|(_, value)| *value)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let range = (max - min).max(f64::EPSILON);
-    for &(timestamp, value) in samples {
-        let x = (((timestamp.saturating_sub(first)) as f64 / (last - first) as f64)
-            * (plot_width - 1) as f64)
-            .round() as usize;
-        let y = (((max - value) / range) * (plot_height - 1) as f64).round() as usize;
-        let x = x.min(plot_width - 1);
-        let y = y.min(plot_height - 1);
-        columns_low[x] = columns_low[x].min(y);
-        columns_high[x] = columns_high[x].max(y);
-    }
-    let mut lines = Vec::new();
-    for row in 0..plot_height {
-        let mut line = format!(
-            "{max:>8.3} ",
-            max = max - range * row as f64 / plot_height as f64
-        );
-        for column in 0..plot_width {
-            let drawn = columns_low[column] != usize::MAX
-                && columns_low[column] <= row
-                && row <= columns_high[column];
-            line.push(if drawn { '*' } else { ' ' });
+/// Time span covered by every sample of every series.
+fn curve_bounds(curve: &CurveData) -> Option<(u64, u64)> {
+    let mut start = u64::MAX;
+    let mut end = 0_u64;
+    for series in &curve.series {
+        for (timestamp, _) in &series.samples {
+            start = start.min(*timestamp);
+            end = end.max(timestamp.saturating_add(1));
         }
-        lines.push(line);
     }
-    lines.push(format!("{min:>8.3} {}", "-".repeat(plot_width)));
-    lines.join("\n")
+    (start != u64::MAX && end > start).then_some((start, end))
+}
+
+/// Shift the window by a fifth of its width, staying inside `bounds`.
+fn pan_window(window: (u64, u64), direction: isize, bounds: (u64, u64)) -> (u64, u64) {
+    let width = window.1.saturating_sub(window.0).max(1);
+    let step = (width / 5).max(1) as i128 * direction as i128;
+    let max_start = bounds.1.saturating_sub(width);
+    let start = (window.0 as i128 + step).clamp(bounds.0 as i128, max_start as i128) as u64;
+    (start, start.saturating_add(width))
+}
+
+/// Scale the window around its centre, clamped to the data and to a minimum width.
+fn zoom_window(window: (u64, u64), factor: f64, bounds: (u64, u64)) -> (u64, u64) {
+    let width = window.1.saturating_sub(window.0).max(1);
+    let data_width = bounds.1.saturating_sub(bounds.0).max(1);
+    // The floor is the smallest useful window, never wider than the data itself.
+    let lower = MIN_CURVE_WINDOW_NS.min(data_width).max(1);
+    let wanted = (width as f64 * factor)
+        .round()
+        .clamp(lower as f64, data_width as f64) as u64;
+    let centre = window.0.saturating_add(width / 2);
+    let start = centre
+        .saturating_sub(wanted / 2)
+        .min(bounds.1.saturating_sub(wanted))
+        .max(bounds.0);
+    (start, start.saturating_add(wanted).min(bounds.1))
+}
+
+/// Value span of one series, printed in the legend.
+fn series_range_label(series: &CurveSeries) -> String {
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for (_, value) in &series.samples {
+        min = min.min(*value);
+        max = max.max(*value);
+    }
+    if min.is_finite() && max.is_finite() {
+        format!("{min:.3}..{max:.3}")
+    } else {
+        "-".to_string()
+    }
 }
 
 fn timing_stats(timestamps: &[u64]) -> Option<TimingStats> {
@@ -3590,6 +3710,73 @@ fn timing_stats(timestamps: &[u64]) -> Option<TimingStats> {
         max_ms: max / 1_000_000.0,
         jitter_ms: jitter / 1_000_000.0,
     })
+}
+
+/// Draw every series into a shared time window.
+///
+/// Each series is normalised by its own value range so unrelated scales can be
+/// compared; the legend carries the real ranges. A series keeps one symbol, and
+/// the later series wins a cell two of them share.
+fn plot_series(curve: &CurveData, window: (u64, u64), width: usize, height: usize) -> Vec<String> {
+    let plot_width = width.max(1);
+    let plot_height = height.max(1);
+    let span = window.1.saturating_sub(window.0).max(1) as f64;
+    let mut grid = vec![vec![None::<usize>; plot_width]; plot_height];
+    for (index, series) in curve.series.iter().enumerate() {
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+        for (_, value) in &series.samples {
+            min = min.min(*value);
+            max = max.max(*value);
+        }
+        if !min.is_finite() || !max.is_finite() {
+            continue;
+        }
+        let range = (max - min).max(f64::EPSILON);
+        for (timestamp, value) in &series.samples {
+            if *timestamp < window.0 || *timestamp >= window.1 {
+                continue;
+            }
+            let column =
+                (((timestamp - window.0) as f64 / span) * (plot_width - 1) as f64).round() as usize;
+            let row = (((max - value) / range) * (plot_height - 1) as f64).round() as usize;
+            if let Some(cell) = grid
+                .get_mut(row.min(plot_height - 1))
+                .and_then(|row| row.get_mut(column.min(plot_width - 1)))
+            {
+                *cell = Some(index);
+            }
+        }
+    }
+    let mut lines = Vec::with_capacity(plot_height);
+    for row in grid {
+        let mut line = String::new();
+        let mut current: Option<usize> = None;
+        for cell in row {
+            match cell {
+                Some(index) => {
+                    if current != Some(index) {
+                        line.push_str(ANSI_RESET);
+                        line.push_str(curve.series[index].color);
+                        current = Some(index);
+                    }
+                    line.push(curve.series[index].symbol);
+                }
+                None => {
+                    if current.is_some() {
+                        line.push_str(ANSI_RESET);
+                        current = None;
+                    }
+                    line.push(' ');
+                }
+            }
+        }
+        if current.is_some() {
+            line.push_str(ANSI_RESET);
+        }
+        lines.push(line);
+    }
+    lines
 }
 
 fn format_timestamp(timestamp: Option<u64>) -> String {
@@ -4073,7 +4260,7 @@ fn mode_hint(mode: Mode) -> &'static str {
             "j/k move · Enter detail · / filter · t range · g goto · s stats · T time · ? help"
         }
         Mode::Detail => "j/k signal · p curve · T time · Esc back · ? help",
-        Mode::Curve => "←/→ pan · +/- zoom · Home/End · Esc back · ? help",
+        Mode::Curve => "←/→ pan · +/- zoom · x remove signal · Esc back · ? help",
         Mode::Databases => "Tab panes · j/k move · Enter open · / search · [/] database · ? help",
         Mode::Statistics => "j/k move · Enter jump to frame · s sort · Esc back · ? help",
     }
@@ -4090,6 +4277,7 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     binding("t", "limit to a time range, empty clears"),
     binding("b", "bind a DBC or LDF database"),
     binding("p", "curve for the selected numeric signal"),
+    binding("a", "add the selected signal to the plotted curve"),
     binding("d", "open the database browser"),
     binding("s", "frame statistics: count and cycle time per frame id"),
     binding("e", "export filtered messages to CSV"),
@@ -5078,11 +5266,48 @@ Schedule_tables {
     }
 
     #[test]
-    fn curve_keeps_extrema_visible() {
-        let chart = ascii_curve(&[(0, -10.0), (1, 50.0), (2, 10.0)], 30, 8);
-        assert!(chart.contains("50.000"));
-        assert!(chart.contains("-10.000"));
-        assert!(chart.contains('*'));
+    fn curve_legend_names_the_value_range() {
+        let series = CurveSeries {
+            title: "Speed".to_string(),
+            samples: vec![(0, -10.0), (1, 50.0), (2, 10.0)],
+            error: None,
+            truncated: false,
+            symbol: '*',
+            color: ANSI_BRIGHT_GREEN,
+        };
+        let label = series_range_label(&series);
+        assert!(label.contains("-10.000"), "got {label}");
+        assert!(label.contains("50.000"), "got {label}");
+    }
+
+    #[test]
+    fn curve_plots_every_series_with_its_own_symbol() {
+        let curve = CurveData {
+            series: vec![
+                CurveSeries {
+                    title: "Speed".to_string(),
+                    samples: (0..10).map(|index| (index, index as f64)).collect(),
+                    error: None,
+                    truncated: false,
+                    symbol: '*',
+                    color: ANSI_BRIGHT_GREEN,
+                },
+                CurveSeries {
+                    title: "Gear".to_string(),
+                    samples: (0..10).map(|index| (index, 9.0 - index as f64)).collect(),
+                    error: None,
+                    truncated: false,
+                    symbol: 'o',
+                    color: ANSI_MAGENTA,
+                },
+            ],
+            window_start: 0,
+            window_end: 10,
+        };
+        let lines = plot_series(&curve, (0, 10), 20, 6);
+        let painted = lines.join("\n");
+        assert!(painted.contains(CURVE_SYMBOLS[0]), "first series missing");
+        assert!(painted.contains(CURVE_SYMBOLS[1]), "second series missing");
     }
 
     #[test]
@@ -6711,31 +6936,43 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
     #[test]
     fn curve_columns_span_the_vertical_range() {
         // Dense samples in one column must paint a vertical span, not one dot.
-        let samples = (0..200)
-            .map(|index| (index as u64, (index % 7) as f64))
-            .collect::<Vec<_>>();
-        let chart = ascii_curve(&samples, 30, 8);
-        assert!(chart.contains('*'));
-        let painted = chart.lines().filter(|line| line.contains('*')).count();
+        let curve = CurveData {
+            series: vec![CurveSeries {
+                title: "Speed".to_string(),
+                samples: (0..200)
+                    .map(|index| (index as u64, (index % 7) as f64))
+                    .collect(),
+                error: None,
+                truncated: false,
+                symbol: '*',
+                color: ANSI_BRIGHT_GREEN,
+            }],
+            window_start: 0,
+            window_end: 200,
+        };
+        let lines = plot_series(&curve, (0, 200), 30, 8);
+        let painted = lines.iter().filter(|line| line.contains('*')).count();
         assert!(painted > 2, "expected a painted span, got {painted} rows");
     }
 
     #[test]
-    fn curve_window_bounds_are_stable() {
-        let mut curve = CurveData {
-            title: "Speed".to_string(),
-            samples: (0..100).map(|index| (index, index as f64)).collect(),
-            error: None,
-            truncated: false,
-            window_start: 0,
-            window_len: 100,
-        };
-        let max_start = curve.samples.len().saturating_sub(curve.window_len);
-        assert_eq!(max_start, 0);
-        curve.window_len = 20;
-        curve.window_start = 80;
-        assert_eq!(curve.window_start + curve.window_len, 100);
-        curve.window_start = curve.window_start.saturating_add(20).min(max_start);
-        assert_eq!(curve.window_start, 0);
+    fn curve_window_stays_inside_the_data() {
+        // Bounds and windows are nanoseconds, as everywhere else in the viewer.
+        const S: u64 = 1_000_000_000;
+        let bounds = (0, 100 * S);
+        // Panning keeps the window width and stops at the edges.
+        assert_eq!(pan_window((0, 20 * S), 1, bounds), (4 * S, 24 * S));
+        assert_eq!(pan_window((0, 20 * S), -1, bounds), (0, 20 * S));
+        assert_eq!(pan_window((80 * S, 100 * S), 1, bounds), (80 * S, 100 * S));
+        // Zooming shrinks around the centre and never leaves the data.
+        assert_eq!(zoom_window((0, 100 * S), 0.5, bounds), (25 * S, 75 * S));
+        assert_eq!(zoom_window((0, 100 * S), 2.0, bounds), (0, 100 * S));
+        let (start, end) = zoom_window((40 * S, 60 * S), 0.5, bounds);
+        assert_eq!(end - start, 10 * S);
+        assert!(start >= bounds.0 && end <= bounds.1);
+        // Zooming out never exceeds the data, and the window never collapses.
+        let (start, end) = zoom_window((50 * S, 50 * S + MIN_CURVE_WINDOW_NS), 0.01, (0, 5 * S));
+        assert!(end > start);
+        assert!(end - start >= MIN_CURVE_WINDOW_NS.min(5 * S));
     }
 }

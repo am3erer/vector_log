@@ -179,6 +179,8 @@ Tab, Shift-Tab    cycle tree, object and details pane focus (below 100 columns
 [/]               switch loaded database
 e                 export the filtered messages with decoded signals to CSV
 p                 open a curve for the selected numeric signal
+a                 add the selected signal to the curve being plotted
+x                 (curve view) drop the most recently added signal
 ?                 open the key help screen
 Esc/Left          go back
 q                 quit
@@ -232,6 +234,15 @@ A `+` prefix counts from the first message of the trace, as in `g`, so
 the `/` filter and with the frame statistics, the header shows the active range,
 and `t` with an empty range (`t`, Enter) clears it. As in `g`, a message without
 a timestamp cannot be placed in time and is excluded while a range is active.
+
+The curve plots one signal by default. From the detail pane, `a` adds the
+selected signal to the same plot, so several signals share one time window;
+each series keeps its own symbol (`*`, `o`, `+`, `x`, `#`) and colour, and
+the legend prints its sample count and value range. Series are normalised by
+their own range, so signals with unrelated units can be compared, and the
+legend is where the real values are read. `x` drops the most recently added
+series; the window pans with Left/Right, zooms with `+`/`-`, and Home/End jump
+to either end.
 
 `s` opens the frame statistics view: one row per bus, channel and frame id of
 the visible messages, with the message count and the average, minimum and
