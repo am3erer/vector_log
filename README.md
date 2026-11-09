@@ -164,6 +164,7 @@ PageUp/PageDown   move one screen at a time
 Home/End          jump to the first or last item or detail line
 g                 jump by trace time, +offset or #position
 G                 jump to the last message
+T                 switch timestamps between trace clock and first frame
 ] / [             next / previous occurrence of the same frame id
 Enter             open the selected message, or focus objects / report the
                   selection in the database browser
@@ -193,6 +194,11 @@ that act on the trace (`e`, `g`, `G`, `p` and `Esc` from the browser) report
 +10           10 s after the first message of the visible list
 #1234         position 1234 in the visible list
 ```
+
+Timestamps print on the trace clock by default. `T` switches the list, the
+preview and the detail pane to offsets after the first message (`+0.015530s`)
+and back; the header shows which form is active, and the CSV export always
+keeps the trace clock.
 
 The bare form uses the timestamps the message list displays, so a time copied
 from a row lands where it says; `@10.000770` is accepted as an explicit alias.

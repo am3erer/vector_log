@@ -355,6 +355,8 @@ struct App {
     db_objects: Vec<DbObject>,
     frame_index: Option<HashMap<FrameKey, Vec<usize>>>,
     timing: Option<TimingStats>,
+    time_mode: TimeMode,
+    time_base: u64,
     dirty: bool,
     selected: usize,
     list_offset: usize,
@@ -427,6 +429,10 @@ impl App {
             .map(|(object_index, object)| summary_for(object_index, object))
             .collect::<Vec<_>>();
         let filtered = (0..summaries.len()).collect::<Vec<_>>();
+        let time_base = summaries
+            .iter()
+            .find_map(|summary| summary.timestamp_ns)
+            .unwrap_or_default();
         let mut app = Self {
             trace,
             objects,
@@ -440,6 +446,8 @@ impl App {
             db_objects: Vec::new(),
             frame_index: None,
             timing: None,
+            time_mode: TimeMode::Absolute,
+            time_base,
             dirty: true,
             selected: 0,
             list_offset: 0,
@@ -477,12 +485,13 @@ impl App {
     fn title_line(&self) -> String {
         match &self.trace {
             Some(trace) => format!(
-                " vector-log-tui  {}  objects={}/{}  skipped={}  mode={:?}",
+                " vector-log-tui  {}  objects={}/{}  skipped={}  mode={:?}  time={}",
                 trace.path.display(),
                 self.filtered.len(),
                 self.summaries.len(),
                 trace.skipped_objects,
-                self.mode
+                self.mode,
+                self.time_mode.label()
             ),
             None => format!(
                 " vector-log-tui  (no trace)  databases={}  mode={:?}",
@@ -554,6 +563,7 @@ impl App {
                 InputEvent::Char('p') => self.open_curve(),
                 InputEvent::Char('d') => self.enter_databases(),
                 InputEvent::Char('e') => self.export_csv(),
+                InputEvent::Char('T') => self.toggle_time_mode(),
                 InputEvent::Char('g') => self.start_input(InputKind::Goto),
                 InputEvent::Char('G') => self.jump_to_end(),
                 InputEvent::Char(']') => self.step_frame(1),
@@ -572,6 +582,7 @@ impl App {
                 InputEvent::Home => self.select_first_signal(),
                 InputEvent::End => self.select_last_signal(),
                 InputEvent::Char('p') => self.open_curve(),
+                InputEvent::Char('T') => self.toggle_time_mode(),
                 InputEvent::Char('b') => self.start_input(InputKind::Binding),
                 InputEvent::Char('e') => self.export_csv(),
                 InputEvent::Esc | InputEvent::Left => self.mode = Mode::Messages,
@@ -756,6 +767,23 @@ impl App {
         self.selected = 0;
         self.list_offset = 0;
         self.selected_signal = 0;
+    }
+
+    fn time_axis(&self) -> TimeAxis {
+        TimeAxis {
+            mode: self.time_mode,
+            base: self.time_base,
+        }
+    }
+
+    /// `T`: print timestamps on the trace clock or after the first message.
+    fn toggle_time_mode(&mut self) {
+        self.time_mode = self.time_mode.toggled();
+        self.status = format!(
+            "Times: {} (first frame at {:.6}s)",
+            self.time_mode.label(),
+            self.time_base as f64 / 1_000_000_000.0
+        );
     }
 
     /// `g`: jump to a trace-clock time, a `+` offset or a `#` position.
@@ -1780,7 +1808,7 @@ impl App {
         let available = height.saturating_sub(7);
         let preview = self
             .selected_summary()
-            .map(|summary| summary_detail_lines(summary, self.selected_object()))
+            .map(|summary| summary_detail_lines(summary, self.selected_object(), self.time_axis()))
             .unwrap_or_else(|| vec!["No matching messages".to_string()]);
         let preview = preview
             .iter()
@@ -1797,7 +1825,7 @@ impl App {
                     format!(
                         "{}{}",
                         if selected { "▶ " } else { "  " },
-                        summary_line(summary)
+                        summary_line(summary, self.time_axis())
                     )
                 })
                 .unwrap_or_default();
@@ -1820,7 +1848,7 @@ impl App {
         };
         let split = (width * 43 / 100).max(24).min(width.saturating_sub(3));
         let right_width = width.saturating_sub(split + 3);
-        let mut left = summary_detail_lines(summary, self.selected_object());
+        let mut left = summary_detail_lines(summary, self.selected_object(), self.time_axis());
         left.extend(timing_lines(self.timing.clone()));
         let left = left
             .iter()
@@ -3105,9 +3133,13 @@ fn qualified_signal_name(database: &Database, signal: &str, object: &Object) -> 
     )
 }
 
-fn summary_detail_lines(summary: &MessageSummary, object: Option<&Object>) -> Vec<String> {
+fn summary_detail_lines(
+    summary: &MessageSummary,
+    object: Option<&Object>,
+    axis: TimeAxis,
+) -> Vec<String> {
     let mut lines = Vec::new();
-    lines.push(format!("time: {}", format_timestamp(summary.timestamp_ns)));
+    lines.push(format!("time: {}", axis.format(summary.timestamp_ns)));
     lines.push(format!(
         "class: {}  status: {}",
         summary.class_name, summary.status
@@ -3237,8 +3269,8 @@ fn timing_lines(stats: Option<TimingStats>) -> Vec<String> {
     ]
 }
 
-fn summary_line(summary: &MessageSummary) -> String {
-    let time = format_timestamp(summary.timestamp_ns);
+fn summary_line(summary: &MessageSummary, axis: TimeAxis) -> String {
+    let time = axis.format(summary.timestamp_ns);
     let bus = summary.bus.map_or("--", BusKind::as_str);
     let channel = summary
         .channel
@@ -3482,6 +3514,53 @@ fn lin_status(state: blf_core::LinResponseState) -> &'static str {
     }
 }
 
+/// How the message list prints a timestamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeMode {
+    /// The trace clock, as recorded in the file.
+    Absolute,
+    /// Seconds after the first message of the trace.
+    Relative,
+}
+
+impl TimeMode {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Absolute => Self::Relative,
+            Self::Relative => Self::Absolute,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Absolute => "absolute",
+            Self::Relative => "relative",
+        }
+    }
+}
+
+/// A timestamp printer: `base` is the first message of the trace.
+#[derive(Debug, Clone, Copy)]
+struct TimeAxis {
+    mode: TimeMode,
+    base: u64,
+}
+
+impl TimeAxis {
+    fn format(self, timestamp: Option<u64>) -> String {
+        let Some(timestamp) = timestamp else {
+            return "-".to_string();
+        };
+        match self.mode {
+            TimeMode::Absolute => format!("{:.6}s", timestamp as f64 / 1_000_000_000.0),
+            TimeMode::Relative => {
+                let offset = timestamp.saturating_sub(self.base) as f64 / 1_000_000_000.0;
+                format!("+{offset:.6}s")
+            }
+        }
+    }
+}
+
 /// A `g` prompt value: a time on the trace clock, a time relative to the
 /// first message of the visible list, or a 1-based position in that list.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -3641,6 +3720,7 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     binding("e", "export filtered messages to CSV"),
     binding("g", "jump by trace time, +offset or #position"),
     binding("G", "jump to the last message"),
+    binding("T", "switch timestamps between trace clock and first frame"),
     binding("] / [", "next / previous occurrence of the frame id"),
     binding("Esc", "clear the message filter"),
     binding("q", "quit"),
@@ -5787,7 +5867,13 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
             payload: vec![0xAB; 64],
             status: "ok",
         };
-        let line = summary_line(&summary);
+        let line = summary_line(
+            &summary,
+            TimeAxis {
+                mode: TimeMode::Absolute,
+                base: 0,
+            },
+        );
         assert!(display_width(&line) <= 120);
         assert!(line.ends_with("..."));
     }
@@ -5833,6 +5919,33 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
         assert!(summary_matches(&summary, "header_only"));
         assert!(summary_matches(&summary, "lin 3"));
         assert!(!summary_matches(&summary, "send_error"));
+    }
+
+    #[test]
+    fn time_axis_prints_the_trace_clock_or_an_offset() {
+        let base = 1_672_542_331_984_470_000;
+        let absolute = TimeAxis {
+            mode: TimeMode::Absolute,
+            base,
+        };
+        assert_eq!(
+            absolute.format(Some(1_672_542_332_000_000_000)),
+            "1672542332.000000s"
+        );
+        assert_eq!(absolute.format(None), "-");
+
+        let relative = TimeAxis {
+            mode: TimeMode::Relative,
+            base,
+        };
+        assert_eq!(
+            relative.format(Some(1_672_542_332_000_000_000)),
+            "+0.015530s"
+        );
+        // A clock before the first frame never prints a negative offset.
+        assert_eq!(relative.format(Some(0)), "+0.000000s");
+        assert_eq!(TimeMode::Absolute.toggled(), TimeMode::Relative);
+        assert_eq!(TimeMode::Relative.toggled(), TimeMode::Absolute);
     }
 
     #[test]
