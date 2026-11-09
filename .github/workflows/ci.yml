@@ -23,6 +23,11 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # `blf-py` links PyO3, so this job needs a Python the crate supports: the
+      # runner's default can be newer than PyO3's maximum supported version.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
@@ -42,14 +47,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Build the extension into a virtual environment
+      - name: Build and test the extension
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install maturin pytest numpy
           python -m venv .venv
           . .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install maturin pytest numpy
           maturin develop --release
-      - name: Test the Python API
-        run: |
-          . .venv/bin/activate
           python -m pytest tests/test_python_api.py -q
