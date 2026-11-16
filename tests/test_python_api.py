@@ -6,6 +6,8 @@ import pytest
 from vector_log.blf_rs.classes import SignalSample, object_from_data
 from vector_log.blf_rs import (
     DatabaseParseError,
+    dissect_ethernet_frame,
+    dissect_ethernet_payload,
     DbcDatabase,
     File,
     LdfDatabase,
@@ -207,6 +209,46 @@ def _lin_message(channel, frame_id, timestamp, data):
     output += _u32(0)
     assert len(output) == 56
     return bytes(output)
+
+
+def _ethernet_frame_object(source, destination, ether_type, payload, timestamp, channel=2, vlan=None):
+    """Build one BLF EthernetFrame object, laid out as the reader expects."""
+    tpid = 0x8100 if vlan else 0
+    tci = ((vlan & 0x0FFF) | 0x2000) if vlan else 0
+    body = bytes.fromhex(source) + _u16(channel) + bytes.fromhex(destination)
+    body += _u16(0) + _u16(ether_type) + _u16(tpid) + _u16(tci)
+    body += _u16(len(payload)) + _u64(0) + payload
+    size = 32 + len(body)
+    size += (-size) % 4
+    header = struct.pack("<IHHIIIHHQ", 0x4A424F4C, 32, 1, size, 71, 2, 0, 0, timestamp)
+    return header + body + b"\0" * ((-32 - len(body)) % 4)
+
+
+def _write_ethernet_blf(path):
+    arp = bytes.fromhex("0001080006040001" "020000000001" "0a000001" "000000000000" "0a000002")
+    someip = bytes.fromhex("1234567800000010" "abcd0001" "01010000" "deadbeef")
+    ipv4 = bytearray(bytes.fromhex("450000340000400040110000c0a80101c0a80102"))
+    checksum = 0
+    for index in range(0, len(ipv4), 2):
+        checksum += (ipv4[index] << 8) | ipv4[index + 1]
+    while checksum >> 16:
+        checksum = (checksum & 0xFFFF) + (checksum >> 16)
+    ipv4[10:12] = (0xFFFF - checksum).to_bytes(2, "big")
+    ipv4 = bytes(ipv4)
+    udp = bytes.fromhex("04d2771a00200000") + someip
+    inner = b"".join(
+        (
+            _ethernet_frame_object("020000000001", "ffffffffffff", 0x0806, arp, 10_000_000, vlan=10),
+            _ethernet_frame_object("020000000001", "020000000002", 0x0800, ipv4 + udp, 20_000_000),
+        )
+    )
+    container_size = 32 + len(inner)
+    container = struct.pack(
+        "<IHHIIHHIII", 0x4A424F4C, 16, 1, container_size, 10, 0, 0, 0, len(inner), 0
+    )
+    container += inner
+    container += b"\0" * (container_size % 4)
+    path.write_bytes(_file_statistics(len(inner), 2) + container)
 
 
 def _write_blf(path):
@@ -1457,3 +1499,63 @@ def test_filter_value_helpers_accept_names_and_numeric_ids():
 
     values = _filter_values(["CanMessage", 1])
     assert _matches_object_type(obj, values)
+
+def test_ethernet_frames_are_dissected_through_the_reader(tmp_path):
+    path = tmp_path / "ethernet.blf"
+    _write_ethernet_blf(path)
+    with open(str(path)) as reader:
+        objects = list(reader)
+
+    arp = objects[0].ethernet
+    assert arp["protocol"] == "ARP"
+    assert arp["etherType"] == 0x0806
+    assert arp["vlanIds"] == [10]
+    assert arp["layers"] == ["ethernet", "vlan", "arp"]
+    assert arp["fields"]["arp.senderIp"] == "10.0.0.1"
+    assert arp["fields"]["vlan.vlanId"] == "10"
+
+    udp = objects[1].ethernet
+    assert udp["protocol"] == "SOME/IP", udp["summary"]
+    assert udp["fields"]["ipv4.source"] == "192.168.1.1"
+    assert udp["fields"]["udp.destinationPort"] == "30490"
+    assert udp["fields"]["someip.serviceId"] == "0x1234"
+    assert "someip" in udp["layers"]
+
+    # Non-Ethernet objects have no dissection.
+    can = object_from_data(
+        {"class": "CanMessage", "className": "CanMessage", "objectType": 1, "id": 1, "data": b"\x01"}
+    )
+    assert can.ethernet is None
+
+
+def test_ethernet_payload_is_not_the_whole_object(tmp_path):
+    """Structured objects must report their protocol payload, not the object."""
+    path = tmp_path / "ethernet.blf"
+    _write_ethernet_blf(path)
+    with open(str(path)) as reader:
+        objects = list(reader)
+
+    arp = objects[0]
+    assert arp.fields["payLoadLength"] == 28
+    assert len(arp.payload) == 28
+    assert arp.payload == arp.fields["payLoad"]
+
+    csv_line = objects_to_csv([arp]).splitlines()[1]
+    assert csv_line.endswith(arp.fields["payLoad"].hex(" "))
+
+
+def test_ethernet_helpers_decode_raw_bytes():
+    frame = bytes.fromhex(
+        "ffffffffffff" "020000000001" "0806"
+        "0001080006040001" "020000000001" "0a000001"
+        "000000000000" "0a000002"
+    )
+    dissection = dissect_ethernet_frame(frame)
+    assert dissection["protocol"] == "ARP"
+    assert dissection["summary"].endswith("ARP 10.0.0.1 > 10.0.0.2")
+    assert dissection["fields"]["arp.opcode"] == "request"
+
+    payload = bytes.fromhex("4500001c0001000040110000" "0a000001" "0a000002")
+    icmp = dissect_ethernet_payload(payload, 0x0800, b"\x02\0\0\0\0\x01", b"\x02\0\0\0\0\x02")
+    assert icmp["layers"][:2] == ["ethernet", "ipv4"]
+    assert icmp["fields"]["ipv4.source"] == "10.0.0.1"

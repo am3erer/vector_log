@@ -76,12 +76,32 @@ struct Trace {
     skipped_objects: u64,
 }
 
+/// What the Ethernet dissector found in one frame.
+#[derive(Debug, Clone)]
+struct EthernetInfo {
+    /// Link-layer and protocol summary, such as
+    /// `02:.. > FF:.. VLAN 10 ARP 10.0.0.1 > 10.0.0.2`.
+    summary: String,
+    /// The same summary without the leading addresses, for the list column.
+    short: String,
+    /// Highest protocol reached, such as `SOME/IP`.
+    protocol: &'static str,
+    ether_type: u16,
+    /// Lowercased `layer.name=value` pairs for the message filter.
+    search_text: String,
+    /// Layers and fields for the detail pane, in dissection order.
+    fields: Vec<(String, String, String)>,
+}
+
 #[derive(Debug, Clone)]
 struct MessageSummary {
     object_index: usize,
     timestamp_ns: Option<u64>,
     timestamp_source: Option<&'static str>,
     bus: Option<BusKind>,
+    /// Bus name for the list column; Ethernet and events are not `BusKind`s.
+    bus_label: &'static str,
+    ethernet: Option<EthernetInfo>,
     channel: Option<u16>,
     frame_id: Option<u32>,
     object_type_raw: u32,
@@ -1596,21 +1616,27 @@ impl App {
             let decoded = self.decoded_rows(summary);
             let mut fields = vec![
                 format_timestamp(summary.timestamp_ns),
-                summary
-                    .bus
-                    .map_or(String::new(), |bus| bus.as_str().to_string()),
+                summary.bus_label.to_string(),
                 summary
                     .channel
                     .map_or_else(String::new, |value| value.to_string()),
-                summary
-                    .frame_id
-                    .map_or_else(String::new, |value| format!("0x{value:X}")),
+                match (&summary.ethernet, summary.frame_id) {
+                    (Some(info), _) => format!("0x{:04X}", info.ether_type),
+                    (None, Some(value)) => format!("0x{value:X}"),
+                    (None, None) => String::new(),
+                },
                 summary.direction.unwrap_or_default().to_string(),
                 summary
                     .dlc
                     .map_or_else(String::new, |value| value.to_string()),
-                hex_bytes(&summary.payload),
-                summary.status.to_string(),
+                match &summary.ethernet {
+                    Some(info) => info.summary.clone(),
+                    None => hex_bytes(&summary.payload),
+                },
+                match &summary.ethernet {
+                    Some(info) => info.protocol.to_string(),
+                    None => summary.status.to_string(),
+                },
             ];
             for column in &columns {
                 let value = decoded
@@ -3324,11 +3350,24 @@ fn summary_for(object_index: usize, object: &Object) -> MessageSummary {
         | Object::CanFdMessage64(_) => "ok",
         _ => "event",
     };
+    let ethernet = ethernet_info(object);
+    let direction = direction.or_else(|| ethernet_direction(object));
+    let (bus_label, channel, frame_id) = match (&ethernet, bus) {
+        (Some(info), _) => (
+            "eth",
+            ethernet_channel(object),
+            Some(u32::from(info.ether_type)),
+        ),
+        (None, Some(bus)) => (bus.as_str(), channel, frame_id),
+        (None, None) => ("-", channel, frame_id),
+    };
     MessageSummary {
         object_index,
         timestamp_ns: object_timestamp_ns(object),
         timestamp_source: object_timestamp_source(object),
         bus,
+        bus_label,
+        ethernet,
         channel,
         frame_id,
         object_type_raw: object.object_type_raw(),
@@ -3473,22 +3512,44 @@ fn summary_detail_lines(
     }
     lines.push(format!(
         "bus/channel: {}/{}",
-        summary.bus.map_or("-", BusKind::as_str),
+        summary.bus_label,
         summary
             .channel
             .map_or_else(|| "-".to_string(), |value| value.to_string())
     ));
-    lines.push(format!(
-        "id: {}  direction: {}  dlc: {}",
-        summary
-            .frame_id
-            .map_or_else(|| "-".to_string(), |id| format!("0x{id:X}")),
-        summary.direction.unwrap_or("-"),
-        summary
-            .dlc
-            .map_or_else(|| "-".to_string(), |value| value.to_string())
-    ));
-    lines.push(format!("data: {}", hex_bytes(&summary.payload)));
+    match &summary.ethernet {
+        Some(info) => {
+            lines.push(format!(
+                "id: 0x{:04X}  protocol: {}  direction: {}",
+                info.ether_type,
+                info.protocol,
+                summary.direction.unwrap_or("-")
+            ));
+            lines.push("ethernet:".to_string());
+            lines.push(format!("  {}", info.summary));
+            let mut layer = "";
+            for (field_layer, name, value) in &info.fields {
+                if field_layer != layer {
+                    layer = field_layer;
+                    lines.push(format!("  [{layer}]"));
+                }
+                lines.push(format!("    {name} = {value}"));
+            }
+        }
+        None => {
+            lines.push(format!(
+                "id: {}  direction: {}  dlc: {}",
+                summary
+                    .frame_id
+                    .map_or_else(|| "-".to_string(), |id| format!("0x{id:X}")),
+                summary.direction.unwrap_or("-"),
+                summary
+                    .dlc
+                    .map_or_else(|| "-".to_string(), |value| value.to_string())
+            ));
+            lines.push(format!("data: {}", hex_bytes(&summary.payload)));
+        }
+    }
     if let Some(object) = object {
         let fields = object_fields(object);
         if !fields.is_empty() {
@@ -3589,17 +3650,97 @@ fn timing_lines(stats: Option<TimingStats>) -> Vec<String> {
     ]
 }
 
+/// Dissect the object when it is an Ethernet frame; `None` for every other type.
+fn ethernet_info(object: &Object) -> Option<EthernetInfo> {
+    let dissection = blf_core::dissect_object(object)?;
+    let fields = dissection
+        .fields
+        .iter()
+        .map(|field| {
+            (
+                field.layer.to_string(),
+                field.name.clone(),
+                field.value.clone(),
+            )
+        })
+        .collect();
+    let search_text = dissection.field_text().to_ascii_lowercase();
+    let short = dissection
+        .summary
+        .split_whitespace()
+        .skip(3)
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(EthernetInfo {
+        summary: dissection.summary,
+        short,
+        protocol: dissection.protocol,
+        ether_type: dissection.ether_type,
+        search_text,
+        fields,
+    })
+}
+
+/// The direction an Ethernet object reports, with the CAN encoding.
+fn ethernet_direction(object: &Object) -> Option<&'static str> {
+    let Object::Structured(value) = object else {
+        return None;
+    };
+    for (field, value) in &value.fields {
+        if field != "dir" {
+            continue;
+        }
+        let number = match value {
+            FieldValue::U8(number) => *number,
+            FieldValue::U16(number) => u8::try_from(*number).ok()?,
+            _ => continue,
+        };
+        return Some(can_direction(number));
+    }
+    None
+}
+
+/// The channel an Ethernet object reports, if the object carries one.
+fn ethernet_channel(object: &Object) -> Option<u16> {
+    let Object::Structured(value) = object else {
+        return None;
+    };
+    for name in ["channel", "hardwareChannel"] {
+        for (field, value) in &value.fields {
+            if field != name {
+                continue;
+            }
+            let number = match value {
+                FieldValue::U8(number) => u64::from(*number),
+                FieldValue::U16(number) => u64::from(*number),
+                FieldValue::U32(number) => u64::from(*number),
+                FieldValue::U64(number) => *number,
+                _ => continue,
+            };
+            if let Ok(channel) = u16::try_from(number) {
+                return Some(channel);
+            }
+        }
+    }
+    None
+}
+
 fn summary_line(summary: &MessageSummary, axis: TimeAxis) -> String {
     let time = axis.format(summary.timestamp_ns);
-    let bus = summary.bus.map_or("--", BusKind::as_str);
+    let bus = summary.bus_label;
     let channel = summary
         .channel
         .map_or_else(|| "-".to_string(), |value| value.to_string());
-    let id = summary
-        .frame_id
-        .map_or_else(|| "------".to_string(), |value| format!("0x{value:03X}"));
+    let id = match (&summary.ethernet, summary.frame_id) {
+        (Some(info), _) => format!("0x{:04X}", info.ether_type),
+        (None, Some(value)) => format!("0x{value:03X}"),
+        (None, None) => "------".to_string(),
+    };
     let direction = summary.direction.unwrap_or("-");
-    let payload = hex_bytes(&summary.payload);
+    let payload = match &summary.ethernet {
+        Some(info) => info.short.clone(),
+        None => hex_bytes(&summary.payload),
+    };
     let text = format!("{time:>12} {bus:<3} {channel:>3} {id:>6} {direction:<3} {payload}");
     if display_width(&text) > 120 {
         return truncate(&text, 120);
@@ -3907,6 +4048,12 @@ fn summary_matches_in(summary: &MessageSummary, filter: &str, buffer: &mut Strin
     }
     buffer.push_str(summary.direction.unwrap_or("-"));
     buffer.push(' ');
+    if let Some(info) = &summary.ethernet {
+        buffer.push_str(info.protocol);
+        buffer.push(' ');
+        buffer.push_str(&info.search_text);
+        buffer.push(' ');
+    }
     buffer.push_str(summary.status);
     buffer.push(' ');
     push_decimal(buffer, u64::from(summary.object_type_raw));
@@ -6322,6 +6469,8 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
             timestamp_ns: Some(1_000_000_000),
             timestamp_source: None,
             bus: Some(BusKind::Can),
+            bus_label: "can",
+            ethernet: None,
             channel: Some(1),
             frame_id: Some(0x123),
             object_type_raw: 1,
@@ -6474,6 +6623,8 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
             timestamp_ns: Some(1),
             timestamp_source: None,
             bus: Some(BusKind::Can),
+            bus_label: "can",
+            ethernet: None,
             channel: Some(1),
             frame_id: Some(0x344),
             object_type_raw: 1,
@@ -6505,6 +6656,8 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
             timestamp_ns: Some(0),
             timestamp_source: None,
             bus: Some(bus),
+            bus_label: bus.as_str(),
+            ethernet: None,
             channel: Some(channel),
             frame_id: Some(frame_id),
             object_type_raw: 101,
@@ -6875,6 +7028,116 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
         assert_eq!(first_index_at_or_after([], 0), None);
     }
 
+    fn ethernet_object() -> Object {
+        use blf_core::{
+            ObjectHeader, ObjectHeaderBase, ObjectType, RawObjectHeader, StructuredObject,
+        };
+        let mut payload = vec![
+            0x45, 0x00, 0x00, 0x1C, 0x00, 0x01, 0x00, 0x00, 0x40, 0x11, 0x00, 0x00, 0xC0, 0xA8,
+            0x01, 0x01, 0xC0, 0xA8, 0x01, 0x02,
+        ];
+        // UDP header plus a four-byte body.
+        payload.extend_from_slice(&[0x04, 0xD2, 0x1F, 0x90, 0x00, 0x0C, 0x00, 0x00, 0, 0, 0, 0]);
+        Object::Structured(StructuredObject {
+            object_type: ObjectType::EthernetFrame,
+            header: RawObjectHeader::Object(ObjectHeader {
+                base: ObjectHeaderBase {
+                    signature: blf_core::OBJECT_SIGNATURE,
+                    header_size: 32,
+                    header_version: 1,
+                    object_size: 0,
+                    object_type: ObjectType::EthernetFrame,
+                    raw_object_type: ObjectType::EthernetFrame as u32,
+                },
+                object_flags: 2,
+                client_index: 0,
+                object_version: 0,
+                object_time_stamp: 1_000,
+            }),
+            class_name: "EthernetFrame".to_string(),
+            fields: vec![
+                (
+                    "sourceAddress".to_string(),
+                    blf_core::FieldValue::Bytes(vec![2, 0, 0, 0, 0, 1]),
+                ),
+                (
+                    "destinationAddress".to_string(),
+                    blf_core::FieldValue::Bytes(vec![2, 0, 0, 0, 0, 2]),
+                ),
+                ("channel".to_string(), blf_core::FieldValue::U16(2)),
+                ("dir".to_string(), blf_core::FieldValue::U16(0)),
+                ("type".to_string(), blf_core::FieldValue::U16(0x0800)),
+                ("tpid".to_string(), blf_core::FieldValue::U16(0)),
+                ("tci".to_string(), blf_core::FieldValue::U16(0)),
+                (
+                    "payLoadLength".to_string(),
+                    blf_core::FieldValue::U16(payload.len() as u16),
+                ),
+                ("payLoad".to_string(), blf_core::FieldValue::Bytes(payload)),
+            ],
+            extensions: Vec::new(),
+            data: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn ethernet_frames_show_the_protocol_and_are_searchable() {
+        let summary = summary_for(0, &ethernet_object());
+        assert_eq!(summary.bus_label, "eth");
+        assert_eq!(summary.frame_id, Some(0x0800));
+        assert_eq!(summary.channel, Some(2));
+        assert_eq!(summary.direction, Some("Rx"));
+        let info = summary.ethernet.as_ref().expect("dissected frame");
+        assert_eq!(info.protocol, "UDP");
+
+        let line = summary_line(
+            &summary,
+            TimeAxis {
+                mode: TimeMode::Absolute,
+                base: 0,
+            },
+        );
+        assert!(line.contains("eth"), "{line}");
+        assert!(line.contains("0x0800"), "{line}");
+        assert!(line.contains("UDP"), "{line}");
+
+        // Fields from every layer join the message filter.
+        let mut buffer = String::new();
+        assert!(summary_matches_in(&summary, "192.168.1.2", &mut buffer));
+        assert!(summary_matches_in(&summary, "1234", &mut buffer));
+        assert!(summary_matches_in(&summary, "udp", &mut buffer));
+        assert!(!summary_matches_in(&summary, "0x0806", &mut buffer));
+    }
+
+    #[test]
+    fn ethernet_detail_lists_every_layer() {
+        let object = ethernet_object();
+        let summary = summary_for(0, &object);
+        let lines = summary_detail_lines(
+            &summary,
+            Some(&object),
+            TimeAxis {
+                mode: TimeMode::Absolute,
+                base: 0,
+            },
+        );
+        assert!(
+            lines.iter().any(|line| line.starts_with("id: 0x0800")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("[ipv4]")),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|line| line.contains("[udp]")), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("source = 192.168.1.1")),
+            "{lines:?}"
+        );
+    }
+
     #[test]
     fn frame_labels_name_bus_channel_and_id() {
         let summary = MessageSummary {
@@ -6882,6 +7145,8 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
             timestamp_ns: Some(0),
             timestamp_source: None,
             bus: Some(BusKind::Can),
+            bus_label: "can",
+            ethernet: None,
             channel: Some(1),
             frame_id: Some(0x344),
             object_type_raw: 1,

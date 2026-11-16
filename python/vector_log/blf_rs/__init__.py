@@ -69,6 +69,8 @@ SignalQueryError = _core.SignalQueryError
 DatabaseParseError = _core.DatabaseParseError
 DbcDatabase = _core.DbcDatabase
 LdfDatabase = _core.LdfDatabase
+dissect_ethernet_frame = _core.dissect_ethernet_frame
+dissect_ethernet_payload = _core.dissect_ethernet_payload
 
 
 class SignalQuery:
@@ -525,6 +527,8 @@ __all__ = [
     "DatabaseParseError",
     "DbcDatabase",
     "LdfDatabase",
+    "dissect_ethernet_frame",
+    "dissect_ethernet_payload",
     "SignalQuery",
     "objects_to_numpy",
     "objects_to_arrow",

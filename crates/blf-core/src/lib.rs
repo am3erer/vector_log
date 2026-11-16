@@ -2,6 +2,7 @@ mod can;
 mod database;
 mod dbc;
 mod error;
+mod ethernet;
 mod ldf;
 mod lin;
 mod query;
@@ -22,6 +23,10 @@ pub use database::{
     LinScheduleEntry, LinSignal, LinSignalRef, MultiplexRole, SignalType, SourceSpan, ValueTable,
 };
 pub use error::{BlfError, Result};
+pub use ethernet::{
+    dissect, dissect_frame, dissect_object, ether_type_name, ip_protocol_name, EthernetDissection,
+    EthernetField, EthernetHeader,
+};
 pub use ldf::{
     decode_lin_frame, decode_lin_object, decode_lin_signal, protected_identifier,
     validate_lin_checksum, validate_lin_identifier, DecodedLinSignal, LdfParseError,
@@ -44,6 +49,64 @@ pub use types::{
 /// retained so callers can report an unknown direction without losing data.
 pub fn can_flags_direction(flags: u8) -> u8 {
     flags & 0x0f
+}
+
+/// Field names that hold the protocol payload of a structured object, with the
+/// field that bounds them.  The order matters: the first field present wins.
+const STRUCTURED_PAYLOAD_FIELDS: &[(&str, Option<&str>)] = &[
+    ("dataBytes", Some("dataCount")),
+    ("payLoad", Some("payLoadLength")),
+    ("pktData", Some("pktDataLength")),
+    ("frameData", Some("frameLength")),
+    ("msg", Some("msgLen")),
+    ("firstData", Some("firstDataLen")),
+    ("a429Data", None),
+    ("regData", Some("regDataLen")),
+    ("text", Some("textLength")),
+    ("data", None),
+];
+
+/// Extract the protocol payload of a structured object.
+///
+/// `StructuredObject::data` holds the *whole* object, so callers that want the
+/// bytes inside a frame (Ethernet, WLAN, AFDX, MOST, ...) must use the named
+/// field instead.  Returns `None` when no payload field is present.
+pub fn structured_payload(object: &StructuredObject) -> Option<Vec<u8>> {
+    for (name, length_name) in STRUCTURED_PAYLOAD_FIELDS {
+        let Some((_, value)) = object.fields.iter().find(|(field, _)| field == name) else {
+            continue;
+        };
+        let FieldValue::Bytes(bytes) = value else {
+            continue;
+        };
+        let mut payload = bytes.clone();
+        if let Some(length_name) = length_name {
+            if let Some((_, length)) = object.fields.iter().find(|(field, _)| field == length_name)
+            {
+                if let Some(length) = field_as_usize(length) {
+                    if length <= payload.len() {
+                        payload.truncate(length);
+                    }
+                }
+            }
+        }
+        return Some(payload);
+    }
+    None
+}
+
+fn field_as_usize(value: &FieldValue) -> Option<usize> {
+    let number = match value {
+        FieldValue::U8(value) => u64::from(*value),
+        FieldValue::U16(value) => u64::from(*value),
+        FieldValue::U32(value) => u64::from(*value),
+        FieldValue::U64(value) => *value,
+        FieldValue::I16(value) => u64::try_from(*value).ok()?,
+        FieldValue::I32(value) => u64::try_from(*value).ok()?,
+        FieldValue::I64(value) => u64::try_from(*value).ok()?,
+        _ => return None,
+    };
+    usize::try_from(number).ok()
 }
 
 /// Convert a BLF object timestamp to nanoseconds using the object flags.

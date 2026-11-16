@@ -1580,8 +1580,13 @@ fn object_to_dict(py: Python<'_>, object: &blf_core::Object) -> PyResult<PyObjec
             dict.set_item("class", &value.class_name)?;
             dict.set_item("className", &value.class_name)?;
             dict.set_item("data", PyBytes::new(py, &value.data))?;
-            let header_size = raw_header_size(&value.header);
-            dict.set_item("payload", PyBytes::new(py, &value.data[header_size..]))?;
+            // The protocol payload lives in a named field; `data` is the whole
+            // object, so the header-size slice is only a fallback.
+            let payload = blf_core::structured_payload(value).unwrap_or_else(|| {
+                let header_size = raw_header_size(&value.header);
+                value.data[header_size..].to_vec()
+            });
+            dict.set_item("payload", PyBytes::new(py, &payload))?;
             dict.set_item("extensions", PyBytes::new(py, &value.extensions))?;
             let fields = PyDict::new(py);
             for (name, field) in &value.fields {
@@ -1939,9 +1944,72 @@ fn field_value_to_py(py: Python<'_>, value: &blf_core::FieldValue) -> PyResult<P
     Ok(object.unbind())
 }
 
+/// Build the Python view of one Ethernet dissection.
+fn dissection_to_py(
+    py: Python<'_>,
+    dissection: &blf_core::EthernetDissection,
+) -> PyResult<PyObject> {
+    let dict = PyDict::new(py);
+    dict.set_item("summary", &dissection.summary)?;
+    dict.set_item("protocol", dissection.protocol)?;
+    dict.set_item("etherType", dissection.ether_type)?;
+    dict.set_item("vlanIds", dissection.vlan_ids.clone())?;
+    dict.set_item("destination", &dissection.destination)?;
+    dict.set_item("source", &dissection.source)?;
+    dict.set_item("layers", dissection.layers.clone())?;
+    let fields = PyDict::new(py);
+    for field in &dissection.fields {
+        fields.set_item(format!("{}.{}", field.layer, field.name), &field.value)?;
+    }
+    dict.set_item("fields", fields)?;
+    dict.set_item("text", dissection.field_text())?;
+    Ok(dict.into_any().unbind())
+}
+
+fn mac_array(value: &[u8]) -> [u8; 6] {
+    let mut mac = [0_u8; 6];
+    let length = value.len().min(6);
+    mac[..length].copy_from_slice(&value[..length]);
+    mac
+}
+
+/// Dissect a complete Ethernet II frame, VLAN tags included.
+#[pyfunction]
+fn dissect_ethernet_frame(py: Python<'_>, frame: Vec<u8>) -> PyResult<Option<PyObject>> {
+    match blf_core::dissect_frame(&frame) {
+        Some(dissection) => Ok(Some(dissection_to_py(py, &dissection)?)),
+        None => Ok(None),
+    }
+}
+
+/// Dissect the upper-layer payload of a BLF `EthernetFrame`, whose L2 header
+/// BLF stores as separate fields.
+#[pyfunction]
+#[pyo3(signature = (payload, ether_type, source, destination, vlan_tci=None))]
+fn dissect_ethernet_payload(
+    py: Python<'_>,
+    payload: Vec<u8>,
+    ether_type: u16,
+    source: Vec<u8>,
+    destination: Vec<u8>,
+    vlan_tci: Option<Vec<u16>>,
+) -> PyResult<PyObject> {
+    let vlan = vlan_tci.unwrap_or_default();
+    let dissection = blf_core::dissect(blf_core::EthernetHeader {
+        destination: mac_array(&destination),
+        source: mac_array(&source),
+        ether_type,
+        vlan_tci: &vlan,
+        payload: &payload,
+    });
+    dissection_to_py(py, &dissection)
+}
+
 #[pymodule]
 fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(open, module)?)?;
+    module.add_function(wrap_pyfunction!(dissect_ethernet_frame, module)?)?;
+    module.add_function(wrap_pyfunction!(dissect_ethernet_payload, module)?)?;
     module.add_class::<PyFile>()?;
     module.add_class::<PyDbcDatabase>()?;
     module.add_class::<PyLdfDatabase>()?;

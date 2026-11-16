@@ -19,6 +19,10 @@ diagnostic objects, including:
 - CAN, CAN FD, CAN error, and CAN FD error frames.
 - LIN message, error, sleep, wakeup, and scheduler event objects.
 - FlexRay, MOST, Ethernet, AFDX, A429, WLAN, J1708, and K-Line objects.
+- Ethernet frames are dissected beyond the link layer: VLAN/priority tags,
+  ARP, IPv4/IPv6, ICMP/ICMPv6, TCP, UDP, and the automotive payloads SOME/IP,
+  DoIP, DHCP, DNS, PTP, and LLDP. Every layer keeps named fields
+  (`layer.name`), so a frame can be filtered, exported, or inspected per layer.
 - Environment variables and system variables.
 - Serial events, test structures, diagnostic objects, and Function Bus objects.
 - Marker, trigger, data-lost, watermark, attribute, and distributed-object
@@ -155,6 +159,12 @@ own line, so a long enum value or receiver list stays readable. The Attributes
 category shows each definition's type, range or enum members, default and
 assignment count. A detail list only stops after 500 entries and reports the
 remaining count.
+
+Ethernet frames appear with `eth` in the bus column, their EtherType as the frame
+id, and a protocol summary in the payload column (`VLAN 10 ARP 10.0.0.1 >
+10.0.0.2`). The detail pane lists every layer from Ethernet down to the
+application protocol, and `/` matches any parsed field, such as an IP address,
+port, or SOME/IP service id.
 
 Key controls are:
 

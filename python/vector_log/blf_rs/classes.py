@@ -1,6 +1,8 @@
 import re
 from enum import IntEnum
 
+from . import _core
+
 
 class ObjectType(IntEnum):
     UNKNOWN = 0
@@ -370,8 +372,9 @@ class _Object(_AttributeMapping):
         """
         if "payload" in self._data:
             return self._data["payload"]
+        # A structured object stores the complete object bytes in ``data``, so
+        # the protocol payload must come from its own field first.
         candidates = (
-            ("data", None),
             ("dataBytes", "dataCount"),
             ("payLoad", "payLoadLength"),
             ("pktData", "pktDataLength"),
@@ -382,6 +385,8 @@ class _Object(_AttributeMapping):
             ("regData", "regDataLen"),
             ("text", "textLength"),
         )
+        if not isinstance(self, StructuredObject):
+            candidates = (("data", None),) + candidates
         value = None
         length = None
         for name, length_name in candidates:
@@ -399,6 +404,33 @@ class _Object(_AttributeMapping):
         if isinstance(length, int) and 0 <= length <= len(value):
             return value[:length]
         return value
+
+    @property
+    def ethernet(self):
+        """Dissected Ethernet frame, or ``None`` for other objects.
+
+        The result is a mapping with ``summary``, ``protocol``, ``etherType``,
+        ``vlanIds``, ``layers``, ``fields`` (``layer.name`` keys) and ``text``.
+        ``EthernetFrame`` keeps its link-layer header in dedicated BLF fields,
+        while the ``Ex``/``Forwarded`` variants carry the complete frame.
+        """
+        class_name = str(self._data.get("class_name") or self._data.get("className") or "")
+        if class_name == "EthernetFrame":
+            vlan = []
+            if int(self._data.get("tpid") or 0) in (0x8100, 0x88A8, 0x9100):
+                vlan.append(int(self._data.get("tci") or 0))
+            return _core.dissect_ethernet_payload(
+                bytes(self._data.get("payLoad") or b""),
+                int(self._data.get("type") or 0),
+                bytes(self._data.get("sourceAddress") or b""),
+                bytes(self._data.get("destinationAddress") or b""),
+                vlan,
+            )
+        if class_name in _ETHERNET_FRAME_CLASSES:
+            data = self._data.get("frameData")
+            if isinstance(data, bytes):
+                return _core.dissect_ethernet_frame(data)
+        return None
 
     @property
     def payload_length(self):
@@ -491,6 +523,16 @@ class RawObject(_Object):
     """An unknown BLF object retaining its original bytes."""
 
     pass
+
+
+_ETHERNET_FRAME_CLASSES = frozenset(
+    {
+        "EthernetFrameEx",
+        "EthernetFrameForwarded",
+        "EthernetErrorEx",
+        "EthernetErrorForwarded",
+    }
+)
 
 
 class StructuredObject(_Object):
