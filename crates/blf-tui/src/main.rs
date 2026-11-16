@@ -76,21 +76,45 @@ struct Trace {
     skipped_objects: u64,
 }
 
+/// Interned text shared by every frame that carries the same content.
+///
+/// A capture repeats a handful of flows thousands of times, so the summary and
+/// the searchable text are stored once and referenced by index. That keeps a
+/// large Ethernet trace affordable: the per-frame cost is a few integers.
+#[derive(Debug, Default)]
+struct TextPool {
+    texts: Vec<Box<str>>,
+    index: HashMap<Box<str>, u32>,
+}
+
+impl TextPool {
+    fn intern(&mut self, text: &str) -> u32 {
+        if let Some(id) = self.index.get(text) {
+            return *id;
+        }
+        let id = u32::try_from(self.texts.len()).unwrap_or(u32::MAX);
+        let owned: Box<str> = text.into();
+        self.texts.push(owned.clone());
+        self.index.insert(owned, id);
+        id
+    }
+
+    fn get(&self, id: u32) -> &str {
+        self.texts.get(id as usize).map_or("", |text| text)
+    }
+}
+
 /// What the Ethernet dissector found in one frame.
 #[derive(Debug, Clone)]
 struct EthernetInfo {
-    /// Link-layer and protocol summary, such as
+    /// Interned summary, such as
     /// `02:.. > FF:.. VLAN 10 ARP 10.0.0.1 > 10.0.0.2`.
-    summary: String,
-    /// The same summary without the leading addresses, for the list column.
-    short: String,
+    summary: u32,
+    /// Interned compact search text: layer names followed by their values.
+    search: u32,
     /// Highest protocol reached, such as `SOME/IP`.
     protocol: &'static str,
     ether_type: u16,
-    /// Lowercased `layer.name=value` pairs for the message filter.
-    search_text: String,
-    /// Layers and fields for the detail pane, in dissection order.
-    fields: Vec<(String, String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -122,7 +146,45 @@ struct SignalRow {
 }
 
 /// Identifies one frame id on one bus and channel.
-type FrameKey = (BusKind, u16, u32);
+///
+/// Ethernet has no CAN-style frame identifier, so it is grouped by its
+/// EtherType, which is what a TSN trace is usually analysed by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum FrameKey {
+    Bus(BusKind, u16, u32),
+    Ethernet(u16, u16),
+}
+
+impl FrameKey {
+    /// Ordering key used by the statistics sorts.
+    fn sort_id(self) -> u32 {
+        match self {
+            Self::Bus(_, _, frame_id) => frame_id,
+            Self::Ethernet(_, ether_type) => u32::from(ether_type),
+        }
+    }
+
+    fn channel(self) -> u16 {
+        match self {
+            Self::Bus(_, channel, _) | Self::Ethernet(channel, _) => channel,
+        }
+    }
+}
+
+/// The statistics and step key of one message.
+fn frame_key(summary: &MessageSummary) -> Option<FrameKey> {
+    if let Some(info) = &summary.ethernet {
+        return Some(FrameKey::Ethernet(
+            summary.channel.unwrap_or(0),
+            info.ether_type,
+        ));
+    }
+    Some(FrameKey::Bus(
+        summary.bus?,
+        summary.channel?,
+        summary.frame_id?,
+    ))
+}
 
 /// Outcome of a `]`/`[` step, resolved before mutating any state.
 enum FrameStep {
@@ -431,6 +493,8 @@ struct App {
     /// Decoded UDS messages, keyed by the object index of every frame that
     /// belongs to them. Filled once while the trace is loaded.
     uds: HashMap<usize, UdsFrame>,
+    /// Interned Ethernet summaries and search texts.
+    pool: TextPool,
 }
 
 /// State of the `?` help overlay; closing restores the previous status.
@@ -478,10 +542,11 @@ impl App {
         objects: Vec<Object>,
         specs: Vec<(BusKind, u16, PathBuf)>,
     ) -> Result<Self, String> {
+        let mut pool = TextPool::default();
         let summaries = objects
             .iter()
             .enumerate()
-            .map(|(object_index, object)| summary_for(object_index, object))
+            .map(|(object_index, object)| summary_for(object_index, object, &mut pool))
             .collect::<Vec<_>>();
         let filtered = (0..summaries.len()).collect::<Vec<_>>();
         let uds = reassemble_trace(&objects, &summaries);
@@ -494,6 +559,7 @@ impl App {
             objects,
             summaries,
             uds,
+            pool,
             bindings: Vec::new(),
             mode: Mode::Messages,
             input: None,
@@ -947,12 +1013,11 @@ impl App {
             return;
         };
         let (key, count) = (stat.key, stat.count);
-        let Some(position) = self.filtered.iter().position(|list_index| {
-            let summary = &self.summaries[*list_index];
-            summary.bus == Some(key.0)
-                && summary.channel == Some(key.1)
-                && summary.frame_id == Some(key.2)
-        }) else {
+        let Some(position) = self
+            .filtered
+            .iter()
+            .position(|list_index| frame_key(&self.summaries[*list_index]) == Some(key))
+        else {
             self.status = "No visible message for this frame".to_string();
             return;
         };
@@ -960,7 +1025,7 @@ impl App {
         self.selected_signal = 0;
         self.mode = Mode::Messages;
         self.keep_selection_visible();
-        self.status = format!("Frame 0x{:X}: {count} messages", key.2);
+        self.status = format!("Frame 0x{:X}: {count} messages", key.sort_id());
     }
 
     fn handle_stats_mouse(&mut self, mouse: MouseEvent) {
@@ -1119,8 +1184,7 @@ impl App {
     }
 
     fn selected_frame_key(&self) -> Option<FrameKey> {
-        let summary = self.selected_summary()?;
-        Some((summary.bus?, summary.channel?, summary.frame_id?))
+        frame_key(self.selected_summary()?)
     }
 
     /// Map each frame id of the visible list to its positions in that list,
@@ -1134,15 +1198,10 @@ impl App {
             let Some(summary) = self.summaries.get(*list_index) else {
                 continue;
             };
-            let (Some(bus), Some(channel), Some(frame_id)) =
-                (summary.bus, summary.channel, summary.frame_id)
-            else {
+            let Some(key) = frame_key(summary) else {
                 continue;
             };
-            index
-                .entry((bus, channel, frame_id))
-                .or_default()
-                .push(position);
+            index.entry(key).or_default().push(position);
         }
         self.frame_index = Some(index);
     }
@@ -1477,7 +1536,7 @@ impl App {
     /// Cycle timing for the frame id of `summary`, read from the frame index
     /// so opening a detail page does not rescan the whole trace.
     fn frame_timing(&mut self, summary: &MessageSummary) -> Option<TimingStats> {
-        let key = (summary.bus?, summary.channel?, summary.frame_id?);
+        let key = frame_key(summary)?;
         self.ensure_frame_index();
         let positions = self.frame_index.as_ref()?.get(&key)?;
         let timestamps = positions
@@ -1508,7 +1567,9 @@ impl App {
                 if !in_time_range(summary.timestamp_ns, range) {
                     continue;
                 }
-                if filter.is_empty() || summary_matches_in(summary, &filter, &mut buffer) {
+                if filter.is_empty()
+                    || summary_matches_in(summary, &filter, &mut buffer, &self.pool)
+                {
                     indices.push(index);
                 }
             }
@@ -1635,7 +1696,7 @@ impl App {
                     .dlc
                     .map_or_else(String::new, |value| value.to_string()),
                 match &summary.ethernet {
-                    Some(info) => info.summary.clone(),
+                    Some(info) => self.pool.get(info.summary).to_string(),
                     None => hex_bytes(&summary.payload),
                 },
                 match &summary.ethernet {
@@ -2115,6 +2176,7 @@ impl App {
                     self.selected_object(),
                     self.time_axis(),
                     self.uds.get(&index),
+                    &self.pool,
                 )
             })
             .unwrap_or_else(|| vec!["No matching messages".to_string()]);
@@ -2133,7 +2195,7 @@ impl App {
                     format!(
                         "{}{}",
                         if selected { "▶ " } else { "  " },
-                        summary_line(summary, self.time_axis())
+                        summary_line(summary, self.time_axis(), &self.pool)
                     )
                 })
                 .unwrap_or_default();
@@ -2161,6 +2223,7 @@ impl App {
             self.selected_object(),
             self.time_axis(),
             self.uds.get(&summary.object_index),
+            &self.pool,
         );
         left.extend(timing_lines(self.timing.clone()));
         let left = left
@@ -3313,7 +3376,7 @@ fn source_suffix(source: Option<blf_core::SourceSpan>) -> String {
     })
 }
 
-fn summary_for(object_index: usize, object: &Object) -> MessageSummary {
+fn summary_for(object_index: usize, object: &Object, pool: &mut TextPool) -> MessageSummary {
     let (bus, channel, frame_id, direction, dlc, payload) = match object {
         Object::CanMessage(value) => (
             Some(BusKind::Can),
@@ -3368,14 +3431,11 @@ fn summary_for(object_index: usize, object: &Object) -> MessageSummary {
         | Object::CanFdMessage64(_) => "ok",
         _ => "event",
     };
-    let ethernet = ethernet_info(object);
-    let direction = direction.or_else(|| ethernet_direction(object));
+    let ethernet = ethernet_info(object, pool);
+    let (hint_channel, hint_direction) = structured_frame_hints(object);
+    let direction = direction.or(hint_direction);
     let (bus_label, channel, frame_id) = match (&ethernet, bus) {
-        (Some(info), _) => (
-            "eth",
-            ethernet_channel(object),
-            Some(u32::from(info.ether_type)),
-        ),
+        (Some(info), _) => ("eth", hint_channel, Some(u32::from(info.ether_type))),
         (None, Some(bus)) => (bus.as_str(), channel, frame_id),
         (None, None) => ("-", channel, frame_id),
     };
@@ -3515,6 +3575,7 @@ fn summary_detail_lines(
     object: Option<&Object>,
     axis: TimeAxis,
     uds: Option<&UdsFrame>,
+    pool: &TextPool,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push(format!("time: {}", axis.format(summary.timestamp_ns)));
@@ -3545,14 +3606,18 @@ fn summary_detail_lines(
                 summary.direction.unwrap_or("-")
             ));
             lines.push("ethernet:".to_string());
-            lines.push(format!("  {}", info.summary));
-            let mut layer = "";
-            for (field_layer, name, value) in &info.fields {
-                if field_layer != layer {
-                    layer = field_layer;
-                    lines.push(format!("  [{layer}]"));
+            lines.push(format!("  {}", pool.get(info.summary)));
+            // Fields are not cached for the whole trace, so dissect the frame
+            // that is actually on screen.
+            if let Some(dissection) = object.and_then(blf_core::dissect_object) {
+                let mut layer = "";
+                for field in &dissection.fields {
+                    if field.layer != layer {
+                        layer = field.layer;
+                        lines.push(format!("  [{layer}]"));
+                    }
+                    lines.push(format!("    {} = {}", field.name, field.value));
                 }
-                lines.push(format!("    {name} = {value}"));
             }
         }
         None => {
@@ -3825,81 +3890,63 @@ fn lin_frame_id(object: &blf_core::LinObject) -> Option<u32> {
 }
 
 /// Dissect the object when it is an Ethernet frame; `None` for every other type.
-fn ethernet_info(object: &Object) -> Option<EthernetInfo> {
-    let dissection = blf_core::dissect_object(object)?;
-    let fields = dissection
-        .fields
-        .iter()
-        .map(|field| {
-            (
-                field.layer.to_string(),
-                field.name.clone(),
-                field.value.clone(),
-            )
-        })
-        .collect();
-    let search_text = dissection.field_text().to_ascii_lowercase();
-    let short = dissection
-        .summary
-        .split_whitespace()
-        .skip(3)
-        .collect::<Vec<_>>()
-        .join(" ");
+///
+/// Only the summary and the search text are kept; the detail pane dissects the
+/// object again when it is opened, so a trace with many frames stays small.
+fn ethernet_info(object: &Object, pool: &mut TextPool) -> Option<EthernetInfo> {
+    let dissection = blf_core::dissect_object_summary(object)?;
     Some(EthernetInfo {
-        summary: dissection.summary,
-        short,
+        summary: pool.intern(&dissection.summary),
+        search: pool.intern(dissection.search_text()),
         protocol: dissection.protocol,
         ether_type: dissection.ether_type,
-        search_text,
-        fields,
     })
 }
 
-/// The direction an Ethernet object reports, with the CAN encoding.
-fn ethernet_direction(object: &Object) -> Option<&'static str> {
+/// The channel and direction a structured frame reports.
+///
+/// One pass over the field list, because a trace can hold millions of frames.
+fn structured_frame_hints(object: &Object) -> (Option<u16>, Option<&'static str>) {
     let Object::Structured(value) = object else {
-        return None;
+        return (None, None);
     };
+    let mut channel = None;
+    let mut direction = None;
     for (field, value) in &value.fields {
-        if field != "dir" {
-            continue;
-        }
-        let number = match value {
-            FieldValue::U8(number) => *number,
-            FieldValue::U16(number) => u8::try_from(*number).ok()?,
-            _ => continue,
-        };
-        return Some(can_direction(number));
-    }
-    None
-}
-
-/// The channel an Ethernet object reports, if the object carries one.
-fn ethernet_channel(object: &Object) -> Option<u16> {
-    let Object::Structured(value) = object else {
-        return None;
-    };
-    for name in ["channel", "hardwareChannel"] {
-        for (field, value) in &value.fields {
-            if field != name {
-                continue;
+        match field.as_str() {
+            "channel" | "hardwareChannel" if channel.is_none() => {
+                channel = match value {
+                    FieldValue::U8(number) => Some(u16::from(*number)),
+                    FieldValue::U16(number) => Some(*number),
+                    FieldValue::U32(number) => u16::try_from(*number).ok(),
+                    FieldValue::U64(number) => u16::try_from(*number).ok(),
+                    _ => None,
+                };
             }
-            let number = match value {
-                FieldValue::U8(number) => u64::from(*number),
-                FieldValue::U16(number) => u64::from(*number),
-                FieldValue::U32(number) => u64::from(*number),
-                FieldValue::U64(number) => *number,
-                _ => continue,
-            };
-            if let Ok(channel) = u16::try_from(number) {
-                return Some(channel);
+            "dir" if direction.is_none() => {
+                direction = match value {
+                    FieldValue::U8(number) => Some(can_direction(*number)),
+                    FieldValue::U16(number) => u8::try_from(*number).ok().map(can_direction),
+                    _ => None,
+                };
             }
+            _ => {}
         }
     }
-    None
+    (channel, direction)
 }
 
-fn summary_line(summary: &MessageSummary, axis: TimeAxis) -> String {
+/// Drop the leading `source > destination` pair; the row shows addresses in
+/// its own columns, so repeating them here wastes width.
+fn short_summary(summary: &str) -> String {
+    summary
+        .split_whitespace()
+        .skip(3)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn summary_line(summary: &MessageSummary, axis: TimeAxis, pool: &TextPool) -> String {
     let time = axis.format(summary.timestamp_ns);
     let bus = summary.bus_label;
     let channel = summary
@@ -3912,7 +3959,7 @@ fn summary_line(summary: &MessageSummary, axis: TimeAxis) -> String {
     };
     let direction = summary.direction.unwrap_or("-");
     let payload = match &summary.ethernet {
-        Some(info) => info.short.clone(),
+        Some(info) => short_summary(pool.get(info.summary)),
         None => hex_bytes(&summary.payload),
     };
     let text = format!("{time:>12} {bus:<3} {channel:>3} {id:>6} {direction:<3} {payload}");
@@ -4128,13 +4175,13 @@ fn sort_frame_stats(stats: &mut [FrameStat], sort: StatsSort) {
             right
                 .count
                 .cmp(&left.count)
-                .then(left.key.2.cmp(&right.key.2))
+                .then(left.key.sort_id().cmp(&right.key.sort_id()))
         }),
         StatsSort::FrameId => stats.sort_by(|left, right| {
             left.key
-                .2
-                .cmp(&right.key.2)
-                .then(left.key.1.cmp(&right.key.1))
+                .sort_id()
+                .cmp(&right.key.sort_id())
+                .then(left.key.channel().cmp(&right.key.channel()))
         }),
         StatsSort::Jitter => stats.sort_by(|left, right| {
             let jitter =
@@ -4142,7 +4189,7 @@ fn sort_frame_stats(stats: &mut [FrameStat], sort: StatsSort) {
             jitter(right)
                 .partial_cmp(&jitter(left))
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then(left.key.2.cmp(&right.key.2))
+                .then(left.key.sort_id().cmp(&right.key.sort_id()))
         }),
     }
 }
@@ -4166,11 +4213,14 @@ fn stat_header_row(width: usize) -> String {
 }
 
 fn stat_row(stat: &FrameStat, width: usize) -> String {
-    let (bus, channel, frame_id) = stat.key;
+    let (id, bus, channel) = match stat.key {
+        FrameKey::Bus(bus, channel, frame_id) => (frame_id, bus.as_str(), channel),
+        FrameKey::Ethernet(channel, ether_type) => (u32::from(ether_type), "eth", channel),
+    };
     let mut row = format!(
         "{:<8} {:<3} {:>3} {:>6}",
-        format!("0x{frame_id:X}"),
-        bus.as_str(),
+        format!("0x{id:X}"),
+        bus,
         channel,
         stat.count
     );
@@ -4202,7 +4252,12 @@ fn display_filter(filter: &str) -> &str {
 /// The haystack is rebuilt in a reusable buffer: formatting a fresh `String`
 /// per message costs about 0.5 us per item, which is a visible pause when a
 /// million-message trace is filtered.
-fn summary_matches_in(summary: &MessageSummary, filter: &str, buffer: &mut String) -> bool {
+fn summary_matches_in(
+    summary: &MessageSummary,
+    filter: &str,
+    buffer: &mut String,
+    pool: &TextPool,
+) -> bool {
     buffer.clear();
     buffer.push_str(summary.class_name);
     buffer.push(' ');
@@ -4225,7 +4280,7 @@ fn summary_matches_in(summary: &MessageSummary, filter: &str, buffer: &mut Strin
     if let Some(info) = &summary.ethernet {
         buffer.push_str(info.protocol);
         buffer.push(' ');
-        buffer.push_str(&info.search_text);
+        buffer.push_str(pool.get(info.search));
         buffer.push(' ');
     }
     buffer.push_str(summary.status);
@@ -4284,7 +4339,8 @@ fn push_hex_byte(buffer: &mut String, byte: u8) {
 
 #[cfg(test)]
 fn summary_matches(summary: &MessageSummary, filter: &str) -> bool {
-    summary_matches_in(summary, filter, &mut String::with_capacity(128))
+    let pool = TextPool::default();
+    summary_matches_in(summary, filter, &mut String::with_capacity(128), &pool)
 }
 
 fn lin_status(state: blf_core::LinResponseState) -> &'static str {
@@ -6808,12 +6864,14 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
             payload: vec![0xAB; 64],
             status: "ok",
         };
+        let pool = TextPool::default();
         let line = summary_line(
             &summary,
             TimeAxis {
                 mode: TimeMode::Absolute,
                 base: 0,
             },
+            &pool,
         );
         assert!(display_width(&line) <= 120);
         assert!(line.ends_with("..."));
@@ -6866,7 +6924,7 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
 
     fn frame_stat(id: u32, count: usize, jitter_ms: f64) -> FrameStat {
         FrameStat {
-            key: (BusKind::Can, 1, id),
+            key: FrameKey::Bus(BusKind::Can, 1, id),
             count,
             timing: Some(TimingStats {
                 frames: count,
@@ -6892,12 +6950,18 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
         );
         sort_frame_stats(&mut stats, StatsSort::FrameId);
         assert_eq!(
-            stats.iter().map(|stat| stat.key.2).collect::<Vec<_>>(),
+            stats
+                .iter()
+                .map(|stat| stat.key.sort_id())
+                .collect::<Vec<_>>(),
             vec![0x100, 0x200, 0x300]
         );
         sort_frame_stats(&mut stats, StatsSort::Jitter);
         assert_eq!(
-            stats.iter().map(|stat| stat.key.2).collect::<Vec<_>>(),
+            stats
+                .iter()
+                .map(|stat| stat.key.sort_id())
+                .collect::<Vec<_>>(),
             vec![0x200, 0x300, 0x100]
         );
         assert_eq!(StatsSort::Count.next(), StatsSort::FrameId);
@@ -6919,7 +6983,7 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
         assert!(stat_header_row(40).contains("AVG"));
 
         let single = FrameStat {
-            key: (BusKind::Lin, 3, 0x2f),
+            key: FrameKey::Bus(BusKind::Lin, 3, 0x2f),
             count: 1,
             timing: None,
         };
@@ -7256,7 +7320,8 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
 
     #[test]
     fn ethernet_frames_show_the_protocol_and_are_searchable() {
-        let summary = summary_for(0, &ethernet_object());
+        let mut pool = TextPool::default();
+        let summary = summary_for(0, &ethernet_object(), &mut pool);
         assert_eq!(summary.bus_label, "eth");
         assert_eq!(summary.frame_id, Some(0x0800));
         assert_eq!(summary.channel, Some(2));
@@ -7270,17 +7335,24 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
                 mode: TimeMode::Absolute,
                 base: 0,
             },
+            &pool,
         );
         assert!(line.contains("eth"), "{line}");
         assert!(line.contains("0x0800"), "{line}");
         assert!(line.contains("UDP"), "{line}");
 
-        // Fields from every layer join the message filter.
+        // Values from every layer join the message filter, one interned string
+        // per distinct flow.
         let mut buffer = String::new();
-        assert!(summary_matches_in(&summary, "192.168.1.2", &mut buffer));
-        assert!(summary_matches_in(&summary, "1234", &mut buffer));
-        assert!(summary_matches_in(&summary, "udp", &mut buffer));
-        assert!(!summary_matches_in(&summary, "0x0806", &mut buffer));
+        assert!(summary_matches_in(
+            &summary,
+            "192.168.1.2",
+            &mut buffer,
+            &pool
+        ));
+        assert!(summary_matches_in(&summary, "1234", &mut buffer, &pool));
+        assert!(summary_matches_in(&summary, "udp", &mut buffer, &pool));
+        assert!(!summary_matches_in(&summary, "0x0806", &mut buffer, &pool));
     }
 
     fn can_message(id: u32, data: &[u8], timestamp: u64) -> Object {
@@ -7356,10 +7428,11 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
             3,
         );
         let objects = vec![first, second, third];
+        let mut pool = TextPool::default();
         let summaries: Vec<MessageSummary> = objects
             .iter()
             .enumerate()
-            .map(|(index, object)| summary_for(index, object))
+            .map(|(index, object)| summary_for(index, object, &mut pool))
             .collect();
         let uds = reassemble_trace(&objects, &summaries);
         for index in 0..3 {
@@ -7424,10 +7497,11 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
         let first = lin_message(0x3D, &[0x0A, 0x10, 0x08, 0x62, 0xF1, 0x90, 0x11, 0x22], 1);
         let second = lin_message(0x3D, &[0x0A, 0x21, 0x33, 0x44, 0x55, 0, 0, 0], 2);
         let objects = vec![first, second];
+        let mut pool = TextPool::default();
         let summaries: Vec<MessageSummary> = objects
             .iter()
             .enumerate()
-            .map(|(index, object)| summary_for(index, object))
+            .map(|(index, object)| summary_for(index, object, &mut pool))
             .collect();
         let uds = reassemble_trace(&objects, &summaries);
         for index in 0..2 {
@@ -7458,9 +7532,44 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
     }
 
     #[test]
+    fn ethernet_frames_are_grouped_by_ether_type_in_statistics() {
+        let mut pool = TextPool::default();
+        let objects = vec![ethernet_object(), ethernet_object()];
+        let mut app = App::new(None, objects.clone(), Vec::new()).expect("build app");
+        app.summaries = objects
+            .iter()
+            .enumerate()
+            .map(|(index, object)| {
+                let mut summary = summary_for(index, object, &mut pool);
+                // Two frames a millisecond apart give the row a period.
+                summary.timestamp_ns = Some(1_000_000 + index as u64 * 1_000_000);
+                summary
+            })
+            .collect();
+        app.filtered = (0..app.summaries.len()).collect();
+        app.open_statistics();
+        assert_eq!(app.stats.len(), 1);
+        let stat = &app.stats[0];
+        assert_eq!(stat.count, 2);
+        assert_eq!(stat.key, FrameKey::Ethernet(2, 0x0800));
+        assert!(
+            stat.timing.is_some(),
+            "two frames are enough for a period estimate"
+        );
+        let row = stat_row(stat, 100);
+        assert!(row.contains("0x800"), "{row}");
+        assert!(row.contains("eth"), "{row}");
+        // Jumping from the row selects the first matching frame.
+        app.jump_to_stat();
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.mode, Mode::Messages);
+    }
+
+    #[test]
     fn ethernet_detail_lists_every_layer() {
         let object = ethernet_object();
-        let summary = summary_for(0, &object);
+        let mut pool = TextPool::default();
+        let summary = summary_for(0, &object, &mut pool);
         let lines = summary_detail_lines(
             &summary,
             Some(&object),
@@ -7469,6 +7578,7 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
                 base: 0,
             },
             None,
+            &pool,
         );
         assert!(
             lines.iter().any(|line| line.starts_with("id: 0x0800")),

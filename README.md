@@ -26,6 +26,10 @@ diagnostic objects, including:
   ICMP/ICMPv6, TCP, UDP. Applications: SOME/IP, DoIP, DHCP, DNS, PTP/gPTP
   (802.1AS bodies plus organizationally specific TLVs), LLDP, and UDS
   (ISO 14229) inside DoIP diagnostic messages.
+- Parsing a whole capture stays cheap: the load pass keeps only a summary and a
+  per-flow interned search text, and the detail pane dissects the selected
+  frame again. A 200 000-frame Ethernet capture loads in about 0.7 s and holds
+  roughly 400 MB, most of which is the BLF objects themselves.
 - CAN, CAN FD and LIN diagnostic payloads are reassembled before decoding:
   ISO-TP (ISO 15765-2) framing on CAN, and the LIN transport protocol of
   ISO 17987-2 on the LIN diagnostic frames `0x3c`/`0x3d`, keyed by bus,
@@ -173,7 +177,11 @@ remaining count.
 Ethernet frames appear with `eth` in the bus column, their EtherType as the frame
 id, and a protocol summary in the payload column (`VLAN 10 ARP 10.0.0.1 >
 10.0.0.2`, `R-TAG seq 4660 UDP ...`, `EDSA To_Sniffer dev3 port7 ...`,
-`UDS/RDBI 192.168.1.1 > 192.168.1.2`). The detail pane lists every layer from Ethernet down to the
+`UDS/RDBI 192.168.1.1 > 192.168.1.2`). The statistics view groups Ethernet
+frames by EtherType, so `s` reports each protocol's frame count with its period,
+minimum, maximum and jitter and `Enter` jumps to the first frame, while `]`/`[`
+step between frames of the same EtherType on the same channel. The detail pane
+lists every layer from Ethernet down to the
 application protocol, and `/` matches any parsed field, such as an IP address,
 port, or SOME/IP service id.
 

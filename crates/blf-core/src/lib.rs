@@ -26,8 +26,9 @@ pub use database::{
 };
 pub use error::{BlfError, Result};
 pub use ethernet::{
-    dissect, dissect_frame, dissect_object, ether_type_name, ip_protocol_name, EthernetDissection,
-    EthernetField, EthernetHeader,
+    dissect, dissect_frame, dissect_frame_summary, dissect_object, dissect_object_summary,
+    dissect_summary, ether_type_name, ip_protocol_name, EthernetDissection, EthernetField,
+    EthernetHeader,
 };
 pub use ldf::{
     decode_lin_frame, decode_lin_object, decode_lin_signal, protected_identifier,

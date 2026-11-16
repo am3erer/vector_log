@@ -41,9 +41,23 @@ pub struct EthernetDissection {
     link_text: String,
     /// Protocol text that follows the protocol name in `summary`.
     detail: String,
+    /// Compact searchable text: layer names followed by their values.
+    search: String,
+    /// Layers already written to `search`, so each one appears once.
+    search_layers: Vec<&'static str>,
+    /// Only record `fields` when a caller is going to show them.
+    keep_fields: bool,
 }
 
 impl EthernetDissection {
+    /// Compact searchable text: each layer name once, then the values.
+    ///
+    /// It holds the same information as [`Self::field_text`] without repeating
+    /// the field names, which keeps a whole trace affordable to hold in memory.
+    pub fn search_text(&self) -> &str {
+        &self.search
+    }
+
     /// Flatten the fields to `layer.name=value` pairs for search and export.
     pub fn field_text(&self) -> String {
         self.fields
@@ -54,11 +68,23 @@ impl EthernetDissection {
     }
 
     fn describe(&mut self, layer: &'static str, name: impl Into<String>, value: impl Into<String>) {
-        self.fields.push(EthernetField {
-            layer,
-            name: name.into(),
-            value: value.into(),
-        });
+        let value = value.into();
+        if !self.search_layers.contains(&layer) {
+            self.search_layers.push(layer);
+            if !self.search.is_empty() {
+                self.search.push(' ');
+            }
+            self.search.push_str(layer);
+        }
+        self.search.push(' ');
+        self.search.push_str(&value);
+        if self.keep_fields {
+            self.fields.push(EthernetField {
+                layer,
+                name: name.into(),
+                value,
+            });
+        }
     }
 }
 
@@ -77,6 +103,15 @@ pub struct EthernetHeader<'a> {
 
 /// Dissect a complete Ethernet II frame, VLAN tags included.
 pub fn dissect_frame(frame: &[u8]) -> Option<EthernetDissection> {
+    dissect_frame_with(frame, true)
+}
+
+/// Dissect a complete frame for a list row: summary and search text only.
+pub fn dissect_frame_summary(frame: &[u8]) -> Option<EthernetDissection> {
+    dissect_frame_with(frame, false)
+}
+
+fn dissect_frame_with(frame: &[u8], keep_fields: bool) -> Option<EthernetDissection> {
     if frame.len() < 14 {
         return None;
     }
@@ -85,13 +120,16 @@ pub fn dissect_frame(frame: &[u8]) -> Option<EthernetDissection> {
     let mut source = [0_u8; 6];
     source.copy_from_slice(&frame[6..12]);
     let ether_type = u16::from_be_bytes([frame[12], frame[13]]);
-    Some(dissect(EthernetHeader {
-        destination,
-        source,
-        ether_type,
-        vlan_tci: &[],
-        payload: frame.get(14..).unwrap_or_default(),
-    }))
+    Some(dissect_with(
+        EthernetHeader {
+            destination,
+            source,
+            ether_type,
+            vlan_tci: &[],
+            payload: frame.get(14..).unwrap_or_default(),
+        },
+        keep_fields,
+    ))
 }
 
 /// EtherTypes that carry another tag instead of an upper-layer payload.
@@ -262,12 +300,27 @@ fn edsa_code_name(code: u8) -> &'static str {
 
 /// Dissect the pieces BLF keeps separately from the upper-layer payload.
 pub fn dissect(header: EthernetHeader<'_>) -> EthernetDissection {
+    dissect_with(header, true)
+}
+
+/// Dissect for a list row: no per-field vector, only summary and search text.
+///
+/// Loading a trace needs a summary for every frame but fields for none, so this
+/// keeps a large Ethernet capture cheap to hold.
+pub fn dissect_summary(header: EthernetHeader<'_>) -> EthernetDissection {
+    dissect_with(header, false)
+}
+
+fn dissect_with(header: EthernetHeader<'_>, keep_fields: bool) -> EthernetDissection {
     let destination = format_mac(&header.destination);
     let source = format_mac(&header.source);
     let mut dissection = EthernetDissection {
         layers: vec!["ethernet"],
         summary: String::new(),
         link_text: String::new(),
+        search: String::new(),
+        search_layers: Vec::new(),
+        keep_fields,
         detail: String::new(),
         fields: Vec::new(),
         ether_type: header.ether_type,
@@ -335,13 +388,22 @@ pub fn dissect(header: EthernetHeader<'_>) -> EthernetDissection {
 
 /// Dissect a structured BLF object when it carries an Ethernet frame.
 pub fn dissect_object(object: &Object) -> Option<EthernetDissection> {
+    dissect_object_with(object, true)
+}
+
+/// Dissect an object for a list row: summary and search text only.
+pub fn dissect_object_summary(object: &Object) -> Option<EthernetDissection> {
+    dissect_object_with(object, false)
+}
+
+fn dissect_object_with(object: &Object, keep_fields: bool) -> Option<EthernetDissection> {
     let Object::Structured(value) = object else {
         return None;
     };
-    dissect_structured(value)
+    dissect_structured(value, keep_fields)
 }
 
-fn dissect_structured(object: &StructuredObject) -> Option<EthernetDissection> {
+fn dissect_structured(object: &StructuredObject, keep_fields: bool) -> Option<EthernetDissection> {
     match object.object_type {
         ObjectType::EthernetFrame => {
             let destination = field_bytes(&object.fields, "destinationAddress")?;
@@ -358,20 +420,23 @@ fn dissect_structured(object: &StructuredObject) -> Option<EthernetDissection> {
             header.copy_from_slice(&destination[..destination.len().min(6)]);
             let mut source_header = [0_u8; 6];
             source_header.copy_from_slice(&source[..source.len().min(6)]);
-            Some(dissect(EthernetHeader {
-                destination: header,
-                source: source_header,
-                ether_type,
-                vlan_tci: &vlan,
-                payload: &payload,
-            }))
+            Some(dissect_with(
+                EthernetHeader {
+                    destination: header,
+                    source: source_header,
+                    ether_type,
+                    vlan_tci: &vlan,
+                    payload: &payload,
+                },
+                keep_fields,
+            ))
         }
         ObjectType::EthernetFrameEx
         | ObjectType::EthernetFrameForwarded
         | ObjectType::EthernetErrorEx
         | ObjectType::EthernetErrorForwarded => {
             let data = field_bytes(&object.fields, "frameData")?;
-            dissect_frame(&data)
+            dissect_frame_with(&data, keep_fields)
         }
         _ => None,
     }
