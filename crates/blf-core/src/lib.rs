@@ -8,6 +8,7 @@ mod lin;
 mod query;
 mod reader;
 mod sample;
+mod transport;
 mod types;
 mod uds;
 
@@ -37,6 +38,10 @@ pub use lin::{classify_lin_object, LinObservation, LinResponseState};
 pub use query::{QueryError, SignalQuery};
 pub use reader::{parse_file_statistics, File, ReaderOptions};
 pub use sample::{DecodeStatus, SampleContext, SampleValue, SignalSample};
+pub use transport::{
+    classify_can, classify_lin, Reassembler, Reassembly, SessionKey, Transport, TransportFrame,
+    LIN_MASTER_REQUEST, LIN_SLAVE_RESPONSE,
+};
 pub use types::{
     AppText, CanErrorFrame, CanErrorFrameExt, CanFdErrorFrame64, CanFdExtFrameData, CanFdMessage,
     CanFdMessage64, CanMessage, CanMessage2, FieldValue, FileStatistics, LinObject, Object,

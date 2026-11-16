@@ -26,9 +26,13 @@ diagnostic objects, including:
   ICMP/ICMPv6, TCP, UDP. Applications: SOME/IP, DoIP, DHCP, DNS, PTP/gPTP
   (802.1AS bodies plus organizationally specific TLVs), LLDP, and UDS
   (ISO 14229) inside DoIP diagnostic messages.
-- CAN and CAN FD payloads are checked for ISO-TP framing (ISO 15765-2), so a
-  single-frame UDS request or response is shown by service, sub-function,
-  data identifier and negative response code instead of raw bytes.
+- CAN, CAN FD and LIN diagnostic payloads are reassembled before decoding:
+  ISO-TP (ISO 15765-2) framing on CAN, and the LIN transport protocol of
+  ISO 17987-2 on the LIN diagnostic frames `0x3c`/`0x3d`, keyed by bus,
+  channel, frame identifier, direction and LIN node address. Segmented UDS
+  requests and responses therefore appear as one message with its service,
+  sub-function, data identifier, negative response code and full payload;
+  `Reassembler` exposes the same state machine to Python.
 - Environment variables and system variables.
 - Serial events, test structures, diagnostic objects, and Function Bus objects.
 - Marker, trigger, data-lost, watermark, attribute, and distributed-object

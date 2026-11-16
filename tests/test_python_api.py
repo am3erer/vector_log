@@ -6,6 +6,7 @@ import pytest
 from vector_log.blf_rs.classes import SignalSample, object_from_data
 from vector_log.blf_rs import (
     DatabaseParseError,
+    Reassembler,
     decode_isotp,
     decode_uds,
     dissect_ethernet_frame,
@@ -1611,3 +1612,41 @@ def test_ethernet_vlan_stack_edsa_rtag_and_gptp():
     assert dissection["fields"]["edsa.sourceDevice"] == "3"
     assert dissection["fields"]["edsa.sourcePort"] == "7"
     assert dissection["fields"]["edsa.vlanId"] == "20"
+
+def test_reassembler_joins_can_and_lin_multi_frame_messages():
+    reassembler = Reassembler()
+    message = bytes([0x62, 0xF1, 0x90]) + bytes(range(17))
+
+    first = reassembler.push_can(1, 0x7E8, 1, bytes([0x10, len(message)]) + message[0:6])
+    assert first["state"] == "incomplete"
+    assert first["expected"] == 20
+    assert first["received"] == 6
+
+    second = reassembler.push_can(1, 0x7E8, 1, bytes([0x21]) + message[6:13])
+    assert second["state"] == "incomplete"
+
+    third = reassembler.push_can(1, 0x7E8, 1, bytes([0x22]) + message[13:20])
+    assert third["state"] == "complete"
+    assert third["frames"] == 3
+    assert third["payload"] == message
+    assert third["summary"].startswith("ReadDataByIdentifier")
+
+    # LIN: FF and CF on the slave response frame, six payload octets per frame.
+    lin_message = bytes([0x62, 0xF1, 0x90, 0x11, 0x22, 0x33, 0x44, 0x55])
+    lin = Reassembler()
+    span = lin.push_lin(1, 0x3D, bytes([0x0A, 0x10, 0x08]) + lin_message[0:5])
+    assert span["state"] == "incomplete"
+    assert span["expected"] == 8
+    done = lin.push_lin(1, 0x3D, bytes([0x0A, 0x21]) + lin_message[5:8])
+    assert done["state"] == "complete"
+    assert done["frames"] == 2
+    assert done["payload"] == lin_message
+
+
+def test_reassembler_reports_a_sequence_gap():
+    reassembler = Reassembler()
+    reassembler.push_can(1, 0x7E8, 1, bytes([0x10, 0x0A, 0x62, 0xF1]))
+    outcome = reassembler.push_can(1, 0x7E8, 1, bytes([0x25, 0x90, 0x00]))
+    assert outcome["state"] == "desync"
+    assert outcome["expectedSequence"] == 1
+    assert outcome["actualSequence"] == 5

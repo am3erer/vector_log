@@ -2069,6 +2069,96 @@ fn decode_isotp(py: Python<'_>, payload: Vec<u8>) -> PyResult<Option<PyObject>> 
     Ok(Some(dict.into_any().unbind()))
 }
 
+/// Stateful reassembler for CAN ISO-TP and LIN transport frames.
+///
+/// ``push_can`` takes a CAN payload, ``push_lin`` a LIN diagnostic payload;
+/// both return a mapping describing what the frame completed.
+#[pyclass]
+struct Reassembler {
+    inner: blf_core::Reassembler,
+}
+
+#[pymethods]
+impl Reassembler {
+    #[new]
+    fn new() -> Self {
+        Self {
+            inner: blf_core::Reassembler::new(),
+        }
+    }
+
+    /// Drop every pending session.
+    fn reset(&mut self) {
+        self.inner.clear();
+    }
+
+    /// Feed one CAN or CAN FD payload.
+    #[pyo3(signature = (channel, frame_id, direction, payload))]
+    fn push_can<'py>(
+        &mut self,
+        py: Python<'py>,
+        channel: u16,
+        frame_id: u32,
+        direction: u8,
+        payload: Vec<u8>,
+    ) -> PyResult<Option<PyObject>> {
+        let Some(frame) = blf_core::classify_can(&payload) else {
+            return Ok(None);
+        };
+        let key = blf_core::SessionKey::new(blf_core::Transport::Can, channel, frame_id, direction);
+        reassembly_to_py(py, self.inner.push(key, frame))
+    }
+
+    /// Feed one LIN diagnostic payload (node address first, then the PCI).
+    #[pyo3(signature = (channel, frame_id, payload))]
+    fn push_lin<'py>(
+        &mut self,
+        py: Python<'py>,
+        channel: u16,
+        frame_id: u32,
+        payload: Vec<u8>,
+    ) -> PyResult<Option<PyObject>> {
+        let Some((node, frame)) = blf_core::classify_lin(&payload) else {
+            return Ok(None);
+        };
+        let direction = u8::from(frame_id == blf_core::LIN_SLAVE_RESPONSE);
+        let key = blf_core::SessionKey::new(blf_core::Transport::Lin, channel, frame_id, direction)
+            .with_node(node);
+        reassembly_to_py(py, self.inner.push(key, frame))
+    }
+}
+
+fn reassembly_to_py(py: Python<'_>, outcome: blf_core::Reassembly) -> PyResult<Option<PyObject>> {
+    let dict = PyDict::new(py);
+    match outcome {
+        blf_core::Reassembly::Complete { payload, frames } => {
+            dict.set_item("state", "complete")?;
+            dict.set_item("payload", PyBytes::new(py, &payload))?;
+            dict.set_item("frames", frames)?;
+            if let Some(message) = blf_core::decode_uds(&payload) {
+                dict.set_item("summary", message.summary())?;
+            }
+        }
+        blf_core::Reassembly::Incomplete { expected, received } => {
+            dict.set_item("state", "incomplete")?;
+            dict.set_item("expected", expected)?;
+            dict.set_item("received", received)?;
+        }
+        blf_core::Reassembly::Control => {
+            dict.set_item("state", "control")?;
+        }
+        blf_core::Reassembly::Desync {
+            expected_sequence,
+            actual_sequence,
+        } => {
+            dict.set_item("state", "desync")?;
+            dict.set_item("expectedSequence", expected_sequence)?;
+            dict.set_item("actualSequence", actual_sequence)?;
+        }
+    }
+    Ok(Some(dict.into_any().unbind()))
+}
+
 #[pymodule]
 fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(open, module)?)?;
@@ -2080,6 +2170,7 @@ fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyDbcDatabase>()?;
     module.add_class::<PyLdfDatabase>()?;
     module.add_class::<PySignalQuery>()?;
+    module.add_class::<Reassembler>()?;
     module.add("BlfFormatError", module.py().get_type::<BlfFormatError>())?;
     module.add("BlfIoError", module.py().get_type::<BlfIoError>())?;
     module.add("BlfLimitError", module.py().get_type::<BlfLimitError>())?;

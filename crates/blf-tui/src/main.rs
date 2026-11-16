@@ -428,6 +428,9 @@ struct App {
     database_detail_offset: usize,
     database_filter: String,
     help: Option<HelpState>,
+    /// Decoded UDS messages, keyed by the object index of every frame that
+    /// belongs to them. Filled once while the trace is loaded.
+    uds: HashMap<usize, UdsFrame>,
 }
 
 /// State of the `?` help overlay; closing restores the previous status.
@@ -481,6 +484,7 @@ impl App {
             .map(|(object_index, object)| summary_for(object_index, object))
             .collect::<Vec<_>>();
         let filtered = (0..summaries.len()).collect::<Vec<_>>();
+        let uds = reassemble_trace(&objects, &summaries);
         let time_base = summaries
             .iter()
             .find_map(|summary| summary.timestamp_ns)
@@ -489,6 +493,7 @@ impl App {
             trace,
             objects,
             summaries,
+            uds,
             bindings: Vec::new(),
             mode: Mode::Messages,
             input: None,
@@ -2103,7 +2108,15 @@ impl App {
         let available = height.saturating_sub(7);
         let preview = self
             .selected_summary()
-            .map(|summary| summary_detail_lines(summary, self.selected_object(), self.time_axis()))
+            .map(|summary| {
+                let index = summary.object_index;
+                summary_detail_lines(
+                    summary,
+                    self.selected_object(),
+                    self.time_axis(),
+                    self.uds.get(&index),
+                )
+            })
             .unwrap_or_else(|| vec!["No matching messages".to_string()]);
         let preview = preview
             .iter()
@@ -2143,7 +2156,12 @@ impl App {
         };
         let split = (width * 43 / 100).max(24).min(width.saturating_sub(3));
         let right_width = width.saturating_sub(split + 3);
-        let mut left = summary_detail_lines(summary, self.selected_object(), self.time_axis());
+        let mut left = summary_detail_lines(
+            summary,
+            self.selected_object(),
+            self.time_axis(),
+            self.uds.get(&summary.object_index),
+        );
         left.extend(timing_lines(self.timing.clone()));
         let left = left
             .iter()
@@ -3496,6 +3514,7 @@ fn summary_detail_lines(
     summary: &MessageSummary,
     object: Option<&Object>,
     axis: TimeAxis,
+    uds: Option<&UdsFrame>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push(format!("time: {}", axis.format(summary.timestamp_ns)));
@@ -3548,9 +3567,24 @@ fn summary_detail_lines(
                     .map_or_else(|| "-".to_string(), |value| value.to_string())
             ));
             lines.push(format!("data: {}", hex_bytes(&summary.payload)));
-            if let Some(uds) = uds_info(summary) {
-                lines.push(format!("uds: {uds}"));
-            }
+        }
+    }
+    if let Some(uds) = uds {
+        let transport = uds.transport;
+        let node = uds
+            .node
+            .map_or_else(String::new, |node| format!("  node 0x{node:02X}"));
+        lines.push(format!("uds ({transport}){node}"));
+        if uds.complete {
+            lines.push(format!("  {}  [{} frames]", uds.summary, uds.frames));
+        } else {
+            lines.push(format!(
+                "  frame {}/{} of {}",
+                uds.position, uds.frames, uds.summary
+            ));
+        }
+        for (name, value) in &uds.fields {
+            lines.push(format!("    {name} = {value}"));
         }
     }
     if let Some(object) = object {
@@ -3653,25 +3687,141 @@ fn timing_lines(stats: Option<TimingStats>) -> Vec<String> {
     ]
 }
 
-/// Decode the UDS message a CAN or CAN FD payload carries, if any.
-fn uds_info(summary: &MessageSummary) -> Option<String> {
-    if !matches!(summary.bus, Some(BusKind::Can)) || summary.payload.is_empty() {
-        return None;
+/// One frame's place in a reassembled UDS message.
+#[derive(Debug, Clone)]
+struct UdsFrame {
+    /// Service summary, such as `ReadDataByIdentifier 0x22 DID 0xF190`.
+    summary: String,
+    /// Fields of the decoded message, in `name = value` form.
+    fields: Vec<(String, String)>,
+    /// Frames that make up the message.
+    frames: usize,
+    /// Position of this frame inside the message, starting at one.
+    position: usize,
+    /// Whether this frame completes the message.
+    complete: bool,
+    /// Transport that carried it, for the detail heading.
+    transport: &'static str,
+    /// Node address of a LIN diagnostic frame.
+    node: Option<u8>,
+}
+
+/// Reassemble the diagnostic messages of a whole trace.
+///
+/// Frames must be visited in trace order, because a segmented message is only
+/// complete once its consecutive frames have arrived. Every participating
+/// object index maps to the message it belongs to.
+fn reassemble_trace(objects: &[Object], summaries: &[MessageSummary]) -> HashMap<usize, UdsFrame> {
+    let mut reassembler = blf_core::Reassembler::new();
+    let mut out = HashMap::new();
+    let mut pending_frames: HashMap<blf_core::SessionKey, Vec<usize>> = HashMap::new();
+    for (index, summary) in summaries.iter().enumerate() {
+        let Some(object) = objects.get(index) else {
+            continue;
+        };
+        let (transport, key, node) = match object {
+            Object::Lin(value) => {
+                let Some(frame_id) = lin_frame_id(value) else {
+                    continue;
+                };
+                if frame_id != blf_core::LIN_MASTER_REQUEST
+                    && frame_id != blf_core::LIN_SLAVE_RESPONSE
+                {
+                    continue;
+                }
+                let direction = u8::from(frame_id == blf_core::LIN_SLAVE_RESPONSE);
+                match blf_core::classify_lin(&summary.payload) {
+                    Some((node, frame)) => (
+                        blf_core::Transport::Lin,
+                        (
+                            blf_core::SessionKey::new(
+                                blf_core::Transport::Lin,
+                                summary.channel.unwrap_or(0),
+                                frame_id,
+                                direction,
+                            )
+                            .with_node(node),
+                            frame,
+                        ),
+                        Some(node),
+                    ),
+                    None => continue,
+                }
+            }
+            _ if matches!(summary.bus, Some(BusKind::Can)) => {
+                let Some(frame) = blf_core::classify_can(&summary.payload) else {
+                    continue;
+                };
+                let direction = u8::from(summary.direction == Some("Tx"));
+                (
+                    blf_core::Transport::Can,
+                    (
+                        blf_core::SessionKey::new(
+                            blf_core::Transport::Can,
+                            summary.channel.unwrap_or(0),
+                            summary.frame_id.unwrap_or(0),
+                            direction,
+                        ),
+                        frame,
+                    ),
+                    None,
+                )
+            }
+            _ => continue,
+        };
+        let (key, frame) = key;
+        let members = pending_frames.entry(key).or_default();
+        let outcome = reassembler.push(key, frame.clone());
+        match outcome {
+            blf_core::Reassembly::Complete { payload, frames } => {
+                members.push(index);
+                let Some(message) = blf_core::decode_uds(&payload) else {
+                    members.clear();
+                    continue;
+                };
+                let summary_text = message.summary();
+                let fields = message.fields();
+                let total = frames.max(members.len());
+                for (position, member) in members.iter().enumerate() {
+                    out.insert(
+                        *member,
+                        UdsFrame {
+                            summary: summary_text.clone(),
+                            fields: fields.clone(),
+                            frames: total,
+                            position: position + 1,
+                            complete: true,
+                            transport: transport.as_str(),
+                            node,
+                        },
+                    );
+                }
+                members.clear();
+            }
+            blf_core::Reassembly::Incomplete { .. } => {
+                members.push(index);
+            }
+            blf_core::Reassembly::Control => {}
+            blf_core::Reassembly::Desync { .. } => {
+                members.clear();
+            }
+        }
     }
-    let message = blf_core::decode_isotp_single(&summary.payload)?;
-    let mut text = message.summary();
-    if !message.data.is_empty() {
-        text.push_str(&format!(
-            "  data={}",
-            message
-                .data
-                .iter()
-                .map(|byte| format!("{byte:02X}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        ));
-    }
-    Some(text)
+    out
+}
+
+fn lin_frame_id(object: &blf_core::LinObject) -> Option<u32> {
+    object.fields.iter().find_map(|(name, value)| {
+        if name != "id" {
+            return None;
+        }
+        match value {
+            blf_core::FieldValue::U8(value) => Some(u32::from(*value)),
+            blf_core::FieldValue::U16(value) => Some(u32::from(*value)),
+            blf_core::FieldValue::U32(value) => Some(*value),
+            _ => None,
+        }
+    })
 }
 
 /// Dissect the object when it is an Ethernet frame; `None` for every other type.
@@ -7133,6 +7283,180 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
         assert!(!summary_matches_in(&summary, "0x0806", &mut buffer));
     }
 
+    fn can_message(id: u32, data: &[u8], timestamp: u64) -> Object {
+        use blf_core::{CanMessage, ObjectHeader, ObjectHeaderBase, ObjectType};
+        let mut payload = [0_u8; 8];
+        payload[..data.len().min(8)].copy_from_slice(&data[..data.len().min(8)]);
+        Object::CanMessage(CanMessage {
+            header: ObjectHeader {
+                base: ObjectHeaderBase {
+                    signature: blf_core::OBJECT_SIGNATURE,
+                    header_size: 32,
+                    header_version: 1,
+                    object_size: 48,
+                    object_type: ObjectType::CanMessage,
+                    raw_object_type: ObjectType::CanMessage as u32,
+                },
+                object_flags: 2,
+                client_index: 0,
+                object_version: 0,
+                object_time_stamp: timestamp,
+            },
+            channel: 1,
+            flags: 1,
+            dlc: data.len() as u8,
+            id,
+            data: payload,
+            raw_data: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn reassembles_a_segmented_can_uds_response() {
+        // 0x62 0xF1 0x90 plus 17 data octets: 0x10 0x14 first frame, then two
+        // consecutive frames of seven octets each.
+        let message: Vec<u8> = std::iter::once(&[0x62_u8, 0xF1, 0x90][..])
+            .chain([(0u8..17).collect::<Vec<_>>().leak() as &[u8]])
+            .flatten()
+            .copied()
+            .collect();
+        let first = can_message(
+            0x7E8,
+            &[
+                0x10, 0x14, message[0], message[1], message[2], message[3], message[4], message[5],
+            ],
+            1,
+        );
+        let second = can_message(
+            0x7E8,
+            &[
+                0x21,
+                message[6],
+                message[7],
+                message[8],
+                message[9],
+                message[10],
+                message[11],
+                message[12],
+            ],
+            2,
+        );
+        let third = can_message(
+            0x7E8,
+            &[
+                0x22,
+                message[13],
+                message[14],
+                message[15],
+                message[16],
+                message[17],
+                message[18],
+                message[19],
+            ],
+            3,
+        );
+        let objects = vec![first, second, third];
+        let summaries: Vec<MessageSummary> = objects
+            .iter()
+            .enumerate()
+            .map(|(index, object)| summary_for(index, object))
+            .collect();
+        let uds = reassemble_trace(&objects, &summaries);
+        for index in 0..3 {
+            let frame = uds
+                .get(&index)
+                .unwrap_or_else(|| panic!("frame {index} missing"));
+            assert!(frame.complete, "{frame:?}");
+            assert_eq!(frame.frames, 3);
+            assert_eq!(frame.transport, "iso-tp");
+            assert!(
+                frame.summary.contains("ReadDataByIdentifier"),
+                "{}",
+                frame.summary
+            );
+            assert!(
+                frame
+                    .fields
+                    .iter()
+                    .any(|(name, value)| name == "dataIdentifier" && value == "0xF190"),
+                "{:?}",
+                frame.fields
+            );
+        }
+    }
+
+    fn lin_message(frame_id: u8, data: &[u8], timestamp: u64) -> Object {
+        use blf_core::{FieldValue, LinObject, ObjectHeader, ObjectHeaderBase, ObjectType};
+        let mut payload = [0_u8; 8];
+        payload[..data.len().min(8)].copy_from_slice(&data[..data.len().min(8)]);
+        Object::Lin(LinObject {
+            object_type: ObjectType::LinMessage,
+            header: ObjectHeader {
+                base: ObjectHeaderBase {
+                    signature: blf_core::OBJECT_SIGNATURE,
+                    header_size: 32,
+                    header_version: 1,
+                    object_size: 56,
+                    object_type: ObjectType::LinMessage,
+                    raw_object_type: ObjectType::LinMessage as u32,
+                },
+                object_flags: 2,
+                client_index: 0,
+                object_version: 0,
+                object_time_stamp: timestamp,
+            },
+            fields: vec![
+                ("channel".to_string(), FieldValue::U16(1)),
+                ("id".to_string(), FieldValue::U8(frame_id)),
+                ("dlc".to_string(), FieldValue::U8(data.len() as u8)),
+                ("data".to_string(), FieldValue::Bytes(payload.to_vec())),
+                ("dir".to_string(), FieldValue::U8(0)),
+            ],
+            extensions: Vec::new(),
+            raw_data: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn reassembles_a_segmented_lin_uds_response() {
+        // LIN diagnostic frames: node address, PCI, then payload octets.
+        let message = [0x62_u8, 0xF1, 0x90, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let first = lin_message(0x3D, &[0x0A, 0x10, 0x08, 0x62, 0xF1, 0x90, 0x11, 0x22], 1);
+        let second = lin_message(0x3D, &[0x0A, 0x21, 0x33, 0x44, 0x55, 0, 0, 0], 2);
+        let objects = vec![first, second];
+        let summaries: Vec<MessageSummary> = objects
+            .iter()
+            .enumerate()
+            .map(|(index, object)| summary_for(index, object))
+            .collect();
+        let uds = reassemble_trace(&objects, &summaries);
+        for index in 0..2 {
+            let frame = uds
+                .get(&index)
+                .unwrap_or_else(|| panic!("frame {index} missing"));
+            assert!(frame.complete, "{frame:?}");
+            assert_eq!(frame.frames, 2);
+            assert_eq!(frame.transport, "lin-tp");
+            assert_eq!(frame.node, Some(0x0A));
+            assert!(
+                frame.summary.contains("ReadDataByIdentifier"),
+                "{}",
+                frame.summary
+            );
+        }
+        // The reassembled payload is the whole UDS message.
+        let frame = uds.get(&1).expect("second frame");
+        assert_eq!(
+            frame
+                .fields
+                .iter()
+                .find(|(name, _)| name == "data")
+                .map(|(_, value)| value.as_str()),
+            Some("11 22 33 44 55")
+        );
+        assert_eq!(message.len(), 8);
+    }
+
     #[test]
     fn ethernet_detail_lists_every_layer() {
         let object = ethernet_object();
@@ -7144,6 +7468,7 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
                 mode: TimeMode::Absolute,
                 base: 0,
             },
+            None,
         );
         assert!(
             lines.iter().any(|line| line.starts_with("id: 0x0800")),
