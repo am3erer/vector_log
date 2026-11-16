@@ -3548,6 +3548,9 @@ fn summary_detail_lines(
                     .map_or_else(|| "-".to_string(), |value| value.to_string())
             ));
             lines.push(format!("data: {}", hex_bytes(&summary.payload)));
+            if let Some(uds) = uds_info(summary) {
+                lines.push(format!("uds: {uds}"));
+            }
         }
     }
     if let Some(object) = object {
@@ -3648,6 +3651,27 @@ fn timing_lines(stats: Option<TimingStats>) -> Vec<String> {
         format!("  jitter: ±{:.3} ms", stats.jitter_ms),
         format!("  frames: {}", stats.frames),
     ]
+}
+
+/// Decode the UDS message a CAN or CAN FD payload carries, if any.
+fn uds_info(summary: &MessageSummary) -> Option<String> {
+    if !matches!(summary.bus, Some(BusKind::Can)) || summary.payload.is_empty() {
+        return None;
+    }
+    let message = blf_core::decode_isotp_single(&summary.payload)?;
+    let mut text = message.summary();
+    if !message.data.is_empty() {
+        text.push_str(&format!(
+            "  data={}",
+            message
+                .data
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+    }
+    Some(text)
 }
 
 /// Dissect the object when it is an Ethernet frame; `None` for every other type.

@@ -2005,11 +2005,77 @@ fn dissect_ethernet_payload(
     dissection_to_py(py, &dissection)
 }
 
+/// Decode one UDS (ISO 14229) request or response PDU.
+///
+/// Returns ``None`` when the bytes are not a recognisable diagnostic message.
+#[pyfunction]
+fn decode_uds(py: Python<'_>, payload: Vec<u8>) -> PyResult<Option<PyObject>> {
+    let Some(message) = blf_core::decode_uds(&payload) else {
+        return Ok(None);
+    };
+    let dict = PyDict::new(py);
+    dict.set_item("service", message.service)?;
+    dict.set_item("serviceName", message.service_name)?;
+    dict.set_item("subFunction", message.sub_function)?;
+    dict.set_item("subFunctionName", message.sub_function_name)?;
+    dict.set_item("dataIdentifier", message.data_identifier)?;
+    dict.set_item("data", PyBytes::new(py, &message.data))?;
+    dict.set_item("summary", message.summary())?;
+    if let Some(negative) = &message.negative {
+        let detail = PyDict::new(py);
+        detail.set_item("service", negative.service)?;
+        detail.set_item("serviceName", negative.service_name)?;
+        detail.set_item("code", negative.code)?;
+        detail.set_item("codeName", negative.code_name)?;
+        dict.set_item("negativeResponse", detail)?;
+    }
+    Ok(Some(dict.into_any().unbind()))
+}
+
+/// Classify one ISO-TP (ISO 15765-2) frame carried by a CAN payload.
+#[pyfunction]
+fn decode_isotp(py: Python<'_>, payload: Vec<u8>) -> PyResult<Option<PyObject>> {
+    let Some(frame) = blf_core::decode_isotp(&payload) else {
+        return Ok(None);
+    };
+    let dict = PyDict::new(py);
+    match &frame {
+        blf_core::IsoTpFrame::Single { data } => {
+            dict.set_item("frameType", "single")?;
+            dict.set_item("data", PyBytes::new(py, data))?;
+        }
+        blf_core::IsoTpFrame::First { length, data } => {
+            dict.set_item("frameType", "first")?;
+            dict.set_item("length", *length)?;
+            dict.set_item("data", PyBytes::new(py, data))?;
+        }
+        blf_core::IsoTpFrame::Consecutive { sequence, data } => {
+            dict.set_item("frameType", "consecutive")?;
+            dict.set_item("sequence", *sequence)?;
+            dict.set_item("data", PyBytes::new(py, data))?;
+        }
+        blf_core::IsoTpFrame::FlowControl {
+            flow_status,
+            block_size,
+            separation,
+        } => {
+            dict.set_item("frameType", "flowControl")?;
+            dict.set_item("flowStatus", *flow_status)?;
+            dict.set_item("blockSize", *block_size)?;
+            dict.set_item("separation", *separation)?;
+        }
+    }
+    dict.set_item("summary", frame.summary())?;
+    Ok(Some(dict.into_any().unbind()))
+}
+
 #[pymodule]
 fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(open, module)?)?;
     module.add_function(wrap_pyfunction!(dissect_ethernet_frame, module)?)?;
     module.add_function(wrap_pyfunction!(dissect_ethernet_payload, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_uds, module)?)?;
+    module.add_function(wrap_pyfunction!(decode_isotp, module)?)?;
     module.add_class::<PyFile>()?;
     module.add_class::<PyDbcDatabase>()?;
     module.add_class::<PyLdfDatabase>()?;

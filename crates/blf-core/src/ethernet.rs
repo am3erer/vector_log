@@ -37,8 +37,8 @@ pub struct EthernetDissection {
     pub protocol: &'static str,
     pub destination: String,
     pub source: String,
-    /// VLAN text that follows the addresses in `summary`.
-    vlan_text: String,
+    /// Tag text (VLAN, EDSA, R-TAG) that follows the addresses in `summary`.
+    link_text: String,
     /// Protocol text that follows the protocol name in `summary`.
     detail: String,
 }
@@ -84,26 +84,180 @@ pub fn dissect_frame(frame: &[u8]) -> Option<EthernetDissection> {
     destination.copy_from_slice(&frame[..6]);
     let mut source = [0_u8; 6];
     source.copy_from_slice(&frame[6..12]);
-    let mut offset = 12;
-    let mut ether_type = u16::from_be_bytes([frame[offset], frame[offset + 1]]);
-    offset += 2;
-    let mut vlan_tci = Vec::new();
-    while matches!(ether_type, 0x8100 | 0x88A8 | 0x9100) {
-        if frame.len() < offset + 4 {
-            break;
-        }
-        let tci = u16::from_be_bytes([frame[offset], frame[offset + 1]]);
-        vlan_tci.push(tci);
-        ether_type = u16::from_be_bytes([frame[offset + 2], frame[offset + 3]]);
-        offset += 4;
-    }
+    let ether_type = u16::from_be_bytes([frame[12], frame[13]]);
     Some(dissect(EthernetHeader {
         destination,
         source,
         ether_type,
-        vlan_tci: &vlan_tci,
-        payload: frame.get(offset..).unwrap_or_default(),
+        vlan_tci: &[],
+        payload: frame.get(14..).unwrap_or_default(),
     }))
+}
+
+/// EtherTypes that carry another tag instead of an upper-layer payload.
+const VLAN_ETHERTYPES: &[u16] = &[0x8100, 0x88A8, 0x9100];
+/// IEEE 802.1CB redundancy tag.
+const RTAG_ETHERTYPE: u16 = 0xF1C1;
+/// Marvell Ethertype DSA tags: the programmable value and the `0x0000` form.
+const EDSA_ETHERTYPES: &[u16] = &[0xDADA, 0x0000];
+
+/// Peel the link-layer tag stack (VLAN, Marvell EDSA, 802.1CB R-TAG).
+///
+/// Returns the upper-layer EtherType and the bytes that follow it.  Every tag
+/// is recorded on the dissection, so stacked tags keep their order.
+fn peel_tags(
+    dissection: &mut EthernetDissection,
+    mut ether_type: u16,
+    payload: &[u8],
+) -> (u16, Vec<u8>) {
+    let mut rest = payload.to_vec();
+    let mut hops = 0;
+    loop {
+        hops += 1;
+        if hops > 8 {
+            break;
+        }
+        if VLAN_ETHERTYPES.contains(&ether_type) {
+            if rest.len() < 4 {
+                break;
+            }
+            let tci = u16::from_be_bytes([rest[0], rest[1]]);
+            record_vlan(dissection, tci);
+            ether_type = u16::from_be_bytes([rest[2], rest[3]]);
+            rest.drain(..4);
+        } else if ether_type == RTAG_ETHERTYPE {
+            // 802.1CB: EtherType, 16-bit sequence number, next EtherType.
+            if rest.len() < 4 {
+                break;
+            }
+            let sequence = u16::from_be_bytes([rest[0], rest[1]]);
+            record_rtag(dissection, sequence);
+            ether_type = u16::from_be_bytes([rest[2], rest[3]]);
+            rest.drain(..4);
+        } else if EDSA_ETHERTYPES.contains(&ether_type) {
+            // Marvell EDSA: two reserved octets, then a 4-octet DSA tag.
+            if rest.len() < 8 || rest[0] != 0 || rest[1] != 0 {
+                break;
+            }
+            let tag = u32::from_be_bytes([rest[2], rest[3], rest[4], rest[5]]);
+            record_dsa(dissection, tag);
+            ether_type = u16::from_be_bytes([rest[6], rest[7]]);
+            rest.drain(..8);
+        } else {
+            break;
+        }
+    }
+    (ether_type, rest)
+}
+
+fn record_vlan(dissection: &mut EthernetDissection, tci: u16) {
+    if !dissection.layers.contains(&"vlan") {
+        dissection.layers.push("vlan");
+    }
+    let index = dissection.vlan_ids.len();
+    dissection.vlan_ids.push(tci & 0x0FFF);
+    let name = if index == 0 {
+        "vlanId".to_string()
+    } else {
+        format!("vlanId{}", index + 1)
+    };
+    dissection.describe("vlan", name, (tci & 0x0FFF).to_string());
+    dissection.describe(
+        "vlan",
+        if index == 0 {
+            "priority"
+        } else {
+            "priority_inner"
+        },
+        ((tci >> 13) & 0x7).to_string(),
+    );
+    if index == 0 {
+        dissection.link_text = format!(" VLAN {}", tci & 0x0FFF);
+    }
+}
+
+/// Record an 802.1CB redundancy tag, keeping its sequence number searchable.
+fn record_rtag(dissection: &mut EthernetDissection, sequence: u16) {
+    if !dissection.layers.contains(&"rtag") {
+        dissection.layers.push("rtag");
+    }
+    dissection.describe("rtag", "sequenceNumber", sequence.to_string());
+    dissection
+        .link_text
+        .push_str(&format!(" R-TAG seq {sequence}"));
+}
+
+/// Record a Marvell EDSA switch tag.
+fn record_dsa(dissection: &mut EthernetDissection, tag: u32) {
+    if !dissection.layers.contains(&"edsa") {
+        dissection.layers.push("edsa");
+    }
+    let mode = tag >> 30;
+    let tagged = (tag >> 29) & 1;
+    let device = (tag >> 24) & 0x1F;
+    let port = (tag >> 19) & 0x1F;
+    let b18 = (tag >> 18) & 1;
+    let b17 = (tag >> 17) & 1;
+    let b16 = (tag >> 16) & 1;
+    let priority = (tag >> 13) & 0x7;
+    let b12 = (tag >> 12) & 1;
+    let vlan = tag & 0x0FFF;
+    let mode_name = match mode {
+        0 => "To_CPU",
+        1 => "From_CPU",
+        2 => "To_Sniffer",
+        _ => "Forward",
+    };
+    dissection.describe("edsa", "mode", mode_name);
+    dissection.describe("edsa", "tagged", tagged.to_string());
+    match mode {
+        0 | 2 => {
+            dissection.describe("edsa", "sourceDevice", device.to_string());
+            dissection.describe("edsa", "sourcePort", port.to_string());
+        }
+        1 => {
+            dissection.describe("edsa", "destinationDevice", device.to_string());
+            dissection.describe("edsa", "destinationPort", port.to_string());
+        }
+        _ => {
+            if b18 == 1 {
+                dissection.describe("edsa", "sourceTrunk", port.to_string());
+            } else {
+                dissection.describe("edsa", "sourcePort", port.to_string());
+            }
+        }
+    }
+    if mode == 2 {
+        // b18 tells whether the frame left the source port on ingress or egress.
+        dissection.describe(
+            "edsa",
+            "direction",
+            if b18 == 1 { "ingress" } else { "egress" },
+        );
+    }
+    if mode == 0 {
+        // To_CPU code bits are b18, b17 and b12.
+        let code = ((b18 << 2) | (b17 << 1) | b12) as u8;
+        dissection.describe("edsa", "code", format!("{code} ({})", edsa_code_name(code)));
+    }
+    dissection.describe("edsa", "cfi", b16.to_string());
+    dissection.describe("edsa", "priority", priority.to_string());
+    dissection.describe("edsa", "vlanId", vlan.to_string());
+    dissection
+        .link_text
+        .push_str(&format!(" EDSA {mode_name} dev{device} port{port}"));
+}
+
+fn edsa_code_name(code: u8) -> &'static str {
+    match code {
+        0 => "MGMT_TRAP",
+        1 => "FRAME2REG",
+        2 => "IGMP_MLD_TRAP",
+        3 => "POLICY_TRAP",
+        4 => "ARP_MIRROR",
+        5 => "POLICY_MIRROR",
+        _ => "reserved",
+    }
 }
 
 /// Dissect the pieces BLF keeps separately from the upper-layer payload.
@@ -113,11 +267,12 @@ pub fn dissect(header: EthernetHeader<'_>) -> EthernetDissection {
     let mut dissection = EthernetDissection {
         layers: vec!["ethernet"],
         summary: String::new(),
-        vlan_text: String::new(),
+        link_text: String::new(),
         detail: String::new(),
         fields: Vec::new(),
         ether_type: header.ether_type,
-        vlan_ids: header.vlan_tci.iter().map(|tci| tci & 0x0FFF).collect(),
+        // `record_vlan` fills this while the tag stack is peeled.
+        vlan_ids: Vec::new(),
         protocol: ether_type_name(header.ether_type),
         destination: destination.clone(),
         source: source.clone(),
@@ -133,21 +288,22 @@ pub fn dissect(header: EthernetHeader<'_>) -> EthernetDissection {
             ether_type_name(header.ether_type)
         ),
     );
-    for (index, tci) in header.vlan_tci.iter().enumerate() {
-        if !dissection.layers.contains(&"vlan") {
-            dissection.layers.push("vlan");
-        }
-        let layer = "vlan";
-        dissection.describe(layer, "vlanId", (tci & 0x0FFF).to_string());
-        dissection.describe(layer, "priority", ((tci >> 13) & 0x7).to_string());
-        dissection.describe(layer, "dropEligible", ((tci >> 12) & 0x1).to_string());
-        if index == 0 {
-            dissection.vlan_text = format!(" VLAN {}", tci & 0x0FFF);
-        }
+    // BLF keeps the outermost VLAN tag beside the addresses; the rest of the
+    // stack (inner VLANs, EDSA, R-TAG) lives in the payload.
+    for tci in header.vlan_tci {
+        record_vlan(&mut dissection, *tci);
     }
-
-    let payload = header.payload;
-    let upper = match header.ether_type {
+    let (ether_type, payload) = peel_tags(&mut dissection, header.ether_type, header.payload);
+    let payload = payload.as_slice();
+    if ether_type != header.ether_type {
+        dissection.ether_type = ether_type;
+        dissection.describe(
+            "ethernet",
+            "innerEtherType",
+            format!("0x{ether_type:04X} ({})", ether_type_name(ether_type)),
+        );
+    }
+    let upper = match ether_type {
         0x0806 => {
             dissect_arp(&mut dissection, payload);
             "ARP"
@@ -162,7 +318,7 @@ pub fn dissect(header: EthernetHeader<'_>) -> EthernetDissection {
             dissect_ptp(&mut dissection, payload);
             "PTP"
         }
-        _ => ether_type_name(header.ether_type),
+        _ => ether_type_name(ether_type),
     };
     if dissection.layers.len() == 1 {
         dissection.layers.push("payload");
@@ -172,7 +328,7 @@ pub fn dissect(header: EthernetHeader<'_>) -> EthernetDissection {
     dissection.protocol = upper;
     dissection.summary = format!(
         "{source} > {destination}{} {upper}{}",
-        dissection.vlan_text, dissection.detail
+        dissection.link_text, dissection.detail
     );
     dissection
 }
@@ -489,10 +645,7 @@ fn dissect_application(
             dissect_someip(dissection, payload);
             "SOME/IP"
         }
-        13400 => {
-            dissect_doip(dissection, payload);
-            "DoIP"
-        }
+        13400 => dissect_doip(dissection, payload),
         68 => {
             dissect_dhcp(dissection, payload);
             "DHCP"
@@ -549,11 +702,11 @@ fn dissect_someip(dissection: &mut EthernetDissection, payload: &[u8]) {
         .push_str(&format!(" SOME/IP 0x{:04X}", message_id >> 16));
 }
 
-fn dissect_doip(dissection: &mut EthernetDissection, payload: &[u8]) {
+fn dissect_doip(dissection: &mut EthernetDissection, payload: &[u8]) -> &'static str {
     dissection.layers.push("doip");
     if payload.len() < 8 {
         dissection.describe("doip", "error", "truncated DoIP header");
-        return;
+        return "DoIP";
     }
     let version = payload[0];
     let payload_type = u16::from_be_bytes([payload[2], payload[3]]);
@@ -565,9 +718,31 @@ fn dissect_doip(dissection: &mut EthernetDissection, payload: &[u8]) {
         format!("0x{payload_type:04X} ({})", doip_payload_name(payload_type)),
     );
     dissection.describe("doip", "payloadLength", length.to_string());
+    let end = (8 + length as usize).min(payload.len());
+    let body = payload.get(8..end).unwrap_or_default();
+    if payload_type == 0x8001 && body.len() >= 5 {
+        let source = u16::from_be_bytes([body[0], body[1]]);
+        let target = u16::from_be_bytes([body[2], body[3]]);
+        dissection.describe("doip", "sourceAddress", format!("0x{source:04X}"));
+        dissection.describe("doip", "targetAddress", format!("0x{target:04X}"));
+        if let Some(name) = dissect_uds(dissection, &body[4..]) {
+            dissection
+                .detail
+                .push_str(&format!(" DoIP {}", doip_payload_name(payload_type)));
+            return name;
+        }
+    } else if payload_type == 0x8002 && body.len() >= 5 {
+        let source = u16::from_be_bytes([body[0], body[1]]);
+        let target = u16::from_be_bytes([body[2], body[3]]);
+        let acknowledge = body[4];
+        dissection.describe("doip", "sourceAddress", format!("0x{source:04X}"));
+        dissection.describe("doip", "targetAddress", format!("0x{target:04X}"));
+        dissection.describe("doip", "acknowledgeCode", format!("0x{acknowledge:02X}"));
+    }
     dissection
         .detail
         .push_str(&format!(" DoIP {}", doip_payload_name(payload_type)));
+    "DoIP"
 }
 
 fn dissect_dhcp(dissection: &mut EthernetDissection, payload: &[u8]) {
@@ -700,16 +875,235 @@ fn dissect_ptp(dissection: &mut EthernetDissection, payload: &[u8]) {
     let version = payload[1] & 0x0F;
     let length = u16::from_be_bytes([payload[2], payload[3]]);
     let domain = payload[4];
+    let flags = u16::from_be_bytes([payload[6], payload[7]]);
+    // The correction field is a 48-bit nanoseconds value in units of 2^-16 ns.
+    let correction = i64::from_be_bytes([
+        0,
+        0,
+        payload[8],
+        payload[9],
+        payload[10],
+        payload[11],
+        payload[12],
+        payload[13],
+    ]);
+    let clock_identity = payload[20..28]
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(":");
+    let port_number = u16::from_be_bytes([payload[28], payload[29]]);
     let sequence = u16::from_be_bytes([payload[30], payload[31]]);
-    dissection.describe("ptp", "messageType", ptp_message_name(message_type));
+    let control = payload[32];
+    let log_interval = payload[33] as i8;
+    let name = ptp_message_name(message_type);
+    dissection.describe("ptp", "messageType", format!("{name} ({message_type})"));
     dissection.describe("ptp", "version", version.to_string());
     dissection.describe("ptp", "messageLength", length.to_string());
     dissection.describe("ptp", "domain", domain.to_string());
+    dissection.describe("ptp", "flags", ptp_flags(flags));
+    dissection.describe(
+        "ptp",
+        "correctionField",
+        format!("{:.3} ns", correction as f64 / 65_536.0),
+    );
+    dissection.describe(
+        "ptp",
+        "sourcePortIdentity",
+        format!("{clock_identity}/{port_number}"),
+    );
     dissection.describe("ptp", "sequenceId", sequence.to_string());
-    dissection.describe("ptp", "clockIdentity", hex(&payload[20..28]));
-    dissection
-        .summary
-        .push_str(&format!(" PTP {}", ptp_message_name(message_type)));
+    dissection.describe("ptp", "control", control.to_string());
+    dissection.describe("ptp", "logMessageInterval", log_interval.to_string());
+
+    let body_end = usize::from(length).min(payload.len()).max(34);
+    let body = payload.get(34..body_end).unwrap_or_default();
+    match message_type {
+        0x0 | 0x8 => {
+            // Sync and Follow_Up carry a 10-octet timestamp.
+            dissect_ptp_timestamp(dissection, body, "originTimestamp");
+        }
+        0x1 | 0x2 => {
+            dissect_ptp_timestamp(dissection, body, "originTimestamp");
+        }
+        0x3 | 0x9 | 0xA => {
+            dissect_ptp_timestamp(dissection, body, "requestReceiptTimestamp");
+            if body.len() >= 20 {
+                let turn = u16::from_be_bytes([body[10], body[11]]);
+                dissection.describe("ptp", "requestingPortNumber", turn.to_string());
+                dissect_ptp_timestamp(dissection, &body[10..], "responseOriginTimestamp");
+            }
+        }
+        0xB => dissect_ptp_announce(dissection, body),
+        _ => {}
+    }
+    let body_length = match message_type {
+        0x0 | 0x1 | 0x2 | 0x8 | 0x9 | 0xC | 0xD => 10,
+        0x3 | 0xA => 20,
+        0xB => 30,
+        _ => 0,
+    };
+    dissect_ptp_tlvs(dissection, payload, length, 34 + body_length);
+    dissection.detail.push_str(&format!(" PTP {name}"));
+}
+
+/// gPTP timestamps are 48-bit seconds plus a 32-bit nanoseconds fraction.
+fn dissect_ptp_timestamp(dissection: &mut EthernetDissection, body: &[u8], name: &str) {
+    if body.len() < 10 {
+        dissection.describe("ptp", "error", format!("truncated {name}"));
+        return;
+    }
+    let seconds = u64::from_be_bytes([0, 0, body[0], body[1], body[2], body[3], body[4], body[5]]);
+    let nanoseconds = u32::from_be_bytes([body[6], body[7], body[8], body[9]]);
+    dissection.describe("ptp", name, format!("{seconds}.{nanoseconds:09} s"));
+}
+
+fn dissect_ptp_announce(dissection: &mut EthernetDissection, body: &[u8]) {
+    if body.len() < 30 {
+        dissection.describe("ptp", "error", "truncated announce body");
+        return;
+    }
+    dissect_ptp_timestamp(dissection, body, "originTimestamp");
+    let current_utc_offset = i16::from_be_bytes([body[10], body[11]]);
+    let priority1 = body[13];
+    let clock_class = body[14];
+    let clock_accuracy = body[15];
+    let clock_variance = u16::from_be_bytes([body[16], body[17]]);
+    let priority2 = body[18];
+    let steps_removed = u16::from_be_bytes([body[20], body[21]]);
+    let time_source = body[22];
+    dissection.describe("ptp", "currentUtcOffset", current_utc_offset.to_string());
+    dissection.describe("ptp", "priority1", priority1.to_string());
+    dissection.describe("ptp", "clockClass", clock_class.to_string());
+    dissection.describe("ptp", "clockAccuracy", format!("0x{clock_accuracy:02X}"));
+    dissection.describe("ptp", "offsetScaledLogVariance", clock_variance.to_string());
+    dissection.describe("ptp", "priority2", priority2.to_string());
+    dissection.describe("ptp", "stepsRemoved", steps_removed.to_string());
+    dissection.describe("ptp", "timeSource", time_source.to_string());
+}
+
+/// Walk the TLV suffix; 802.1AS uses organizationally-specific TLVs (OUI 00-80-C2).
+fn dissect_ptp_tlvs(
+    dissection: &mut EthernetDissection,
+    payload: &[u8],
+    length: u16,
+    start: usize,
+) {
+    let end = usize::from(length).min(payload.len()).max(start);
+    let mut offset = start;
+    let mut index = 0;
+    while offset + 4 <= end {
+        // The body length of a PTP message decides where the TLVs start, but a
+        // BLF frame rarely tells us that, so only structs we can read are used.
+        let tlv_type = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+        let tlv_length = usize::from(u16::from_be_bytes([
+            payload[offset + 2],
+            payload[offset + 3],
+        ]));
+        if offset + 4 + tlv_length > end {
+            break;
+        }
+        let value = &payload[offset + 4..offset + 4 + tlv_length];
+        index += 1;
+        if tlv_type == 0x0003 && value.len() >= 3 {
+            let oui = format!("{:02X}-{:02X}-{:02X}", value[0], value[1], value[2]);
+            let subtype = if value.len() >= 5 {
+                u16::from_be_bytes([value[3], value[4]])
+            } else {
+                0
+            };
+            dissection.describe(
+                "ptp",
+                format!("tlv{index}"),
+                format!(
+                    "organizationally specific oui {oui} subtype {subtype} ({} octets)",
+                    tlv_length
+                ),
+            );
+        } else {
+            dissection.describe(
+                "ptp",
+                format!("tlv{index}"),
+                format!("type 0x{tlv_type:04X} ({tlv_length} octets)"),
+            );
+        }
+        offset += 4 + tlv_length;
+        if tlv_length == 0 && index > 8 {
+            break;
+        }
+    }
+}
+
+fn ptp_flags(flags: u16) -> String {
+    let mut names = Vec::new();
+    if flags & 0x0200 != 0 {
+        names.push("twoStep");
+    }
+    if flags & 0x0100 != 0 {
+        names.push("unicast");
+    }
+    if flags & 0x0080 != 0 {
+        names.push("alternateMaster");
+    }
+    if flags & 0x0400 != 0 {
+        names.push("leap61");
+    }
+    if flags & 0x0800 != 0 {
+        names.push("leap59");
+    }
+    if flags & 0x1000 != 0 {
+        names.push("currentUtcOffsetValid");
+    }
+    if flags & 0x2000 != 0 {
+        names.push("ptpTimescale");
+    }
+    if flags & 0x4000 != 0 {
+        names.push("timeTraceable");
+    }
+    if flags & 0x8000 != 0 {
+        names.push("frequencyTraceable");
+    }
+    if names.is_empty() {
+        "none".to_string()
+    } else {
+        names.join("|")
+    }
+}
+
+/// Append a UDS diagnostic message to the dissection.
+fn dissect_uds(dissection: &mut EthernetDissection, payload: &[u8]) -> Option<&'static str> {
+    let message = crate::uds::decode_uds(payload)?;
+    if !dissection.layers.contains(&"uds") {
+        dissection.layers.push("uds");
+    }
+    let summary = message.summary();
+    let negative = message.negative.is_some();
+    let service_name = message.service_name;
+    for (name, value) in message.fields() {
+        dissection.describe("uds", name, value);
+    }
+    dissection.detail.push_str(&format!(" {summary}"));
+    if negative {
+        Some("UDS/NRC")
+    } else {
+        Some(uds_protocol_name(service_name))
+    }
+}
+
+fn uds_protocol_name(service: &'static str) -> &'static str {
+    match service {
+        "ReadDataByIdentifier" => "UDS/RDBI",
+        "WriteDataByIdentifier" => "UDS/WDBI",
+        "DiagnosticSessionControl" => "UDS/DSC",
+        "ECUReset" => "UDS/ER",
+        "SecurityAccess" => "UDS/SA",
+        "RoutineControl" => "UDS/RC",
+        "TesterPresent" => "UDS/TP",
+        "ReadDTCInformation" => "UDS/RDTC",
+        "ClearDiagnosticInformation" => "UDS/CDTC",
+        "NegativeResponse" => "UDS/NRC",
+        _ => "UDS",
+    }
 }
 
 fn field_value<'a>(fields: &'a [(String, FieldValue)], name: &str) -> Option<&'a FieldValue> {
@@ -1287,6 +1681,155 @@ mod tests {
             data: Vec::new(),
         }))
         .is_none());
+    }
+
+    fn l2(ether_type: u16, payload: &[u8]) -> Vec<u8> {
+        let mut frame = vec![
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00, 0x01,
+        ];
+        frame.extend_from_slice(&ether_type.to_be_bytes());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    #[test]
+    fn keeps_every_vlan_tag_of_a_stacked_frame() {
+        // QinQ: 0x88A8 outer (VID 100), 0x8100 inner (VID 200), then IPv4.
+        let ipv4 = ipv4_udp_frame(&[]);
+        let mut frame = l2(0x88A8, &[]);
+        frame.extend_from_slice(&(0x2000_u16 | 100).to_be_bytes());
+        frame.extend_from_slice(&0x8100_u16.to_be_bytes());
+        frame.extend_from_slice(&(0x2000_u16 | 200).to_be_bytes());
+        frame.extend_from_slice(&ipv4[12..]);
+        let dissection = dissect_frame(&frame).expect("dissection");
+        assert_eq!(dissection.vlan_ids, vec![100, 200]);
+        assert_eq!(dissection.protocol, "SOME/IP");
+        let text = dissection.field_text();
+        assert!(text.contains("vlan.vlanId=100"), "{text}");
+        assert!(text.contains("vlan.vlanId2=200"), "{text}");
+    }
+
+    #[test]
+    fn dissects_a_marvell_edsa_mirror_frame() {
+        // dst, src, EDSA EtherType 0xDADA, two reserved octets, DSA tag, IPv4.
+        // Tag: To_Sniffer, device 3, port 7, ingress direction, VID 20.
+        let tag: u32 = (0x2 << 30) | (3 << 24) | (7 << 19) | (1 << 18) | 20;
+        let mut payload = vec![0x00, 0x00];
+        payload.extend_from_slice(&tag.to_be_bytes());
+        let ipv4 = ipv4_udp_frame(&[]);
+        payload.extend_from_slice(&ipv4[12..]);
+        let frame = l2(0xDADA, &payload);
+        let dissection = dissect_frame(&frame).expect("dissection");
+        assert_eq!(dissection.protocol, "SOME/IP");
+        assert_eq!(dissection.ether_type, 0x0800);
+        assert!(
+            dissection.layers.contains(&"edsa"),
+            "{:?}",
+            dissection.layers
+        );
+        let text = dissection.field_text();
+        assert!(text.contains("edsa.mode=To_Sniffer"), "{text}");
+        assert!(text.contains("edsa.sourceDevice=3"), "{text}");
+        assert!(text.contains("edsa.sourcePort=7"), "{text}");
+        assert!(text.contains("edsa.direction=ingress"), "{text}");
+        assert!(text.contains("edsa.vlanId=20"), "{text}");
+        assert!(
+            dissection.summary.contains("EDSA To_Sniffer dev3 port7"),
+            "{}",
+            dissection.summary
+        );
+    }
+
+    #[test]
+    fn dissects_an_802_1cb_redundancy_tag() {
+        // Ethernet, R-TAG (seq 4660), then IPv4/UDP.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0x1234_u16.to_be_bytes());
+        let ipv4 = ipv4_udp_frame(&[]);
+        payload.extend_from_slice(&ipv4[12..]);
+        let frame = l2(0xF1C1, &payload);
+        let dissection = dissect_frame(&frame).expect("dissection");
+        assert_eq!(dissection.protocol, "SOME/IP");
+        assert!(
+            dissection.layers.contains(&"rtag"),
+            "{:?}",
+            dissection.layers
+        );
+        let text = dissection.field_text();
+        assert!(text.contains("rtag.sequenceNumber=4660"), "{text}");
+        assert!(
+            dissection.summary.contains("R-TAG seq 4660"),
+            "{}",
+            dissection.summary
+        );
+    }
+
+    #[test]
+    fn dissects_a_gptp_follow_up_with_a_timestamp() {
+        // 802.1AS Follow_Up: type 0x8, version 2, 44-octet message, body holds
+        // the precise origin timestamp and an organizationally specific TLV.
+        let mut payload = vec![0x08, 0x02, 0x00, 0x36, 0x00, 0x00, 0x02, 0x08];
+        payload.extend_from_slice(&[0; 8]); // correction field
+        payload.extend_from_slice(&[0; 4]); // message type specific
+        payload.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]); // clock identity
+        payload.extend_from_slice(&[0x00, 0x01]); // port number
+        payload.extend_from_slice(&[0x00, 0x2A]); // sequence id 42
+        payload.extend_from_slice(&[0x05, 0x7F]); // control, log interval
+                                                  // preciseOriginTimestamp: 1728 s + 500000000 ns
+        payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x06, 0xC0]);
+        payload.extend_from_slice(&[0x1D, 0xCD, 0x65, 0x00]);
+        // TLV: organizationally specific, OUI 00-80-C2, subtype 1.
+        payload.extend_from_slice(&[0x00, 0x03, 0x00, 0x06]);
+        payload.extend_from_slice(&[0x00, 0x80, 0xC2, 0x00, 0x01, 0x00]);
+        let frame = l2(0x88F7, &payload);
+        let dissection = dissect_frame(&frame).expect("dissection");
+        assert_eq!(dissection.protocol, "PTP");
+        let text = dissection.field_text();
+        assert!(text.contains("ptp.messageType=follow up"), "{text}");
+        assert!(text.contains("ptp.sequenceId=42"), "{text}");
+        assert!(
+            text.contains("ptp.sourcePortIdentity=01:02:03:04:05:06:07:08/1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ptp.originTimestamp=1728.500000000 s"),
+            "{text}"
+        );
+        assert!(text.contains("oui 00-80-C2 subtype 1"), "{text}");
+    }
+
+    #[test]
+    fn dissects_uds_inside_a_doip_diagnostic_message() {
+        // DoIP diagnostic message (0x8001): SA 0x0E00, TA 0x1001, UDS 0x22 0xF1 0x90.
+        let mut payload = vec![0x03, 0xFC, 0x80, 0x01, 0x00, 0x00, 0x00, 0x07];
+        payload.extend_from_slice(&[0x0E, 0x00, 0x10, 0x01]);
+        payload.extend_from_slice(&[0x22, 0xF1, 0x90]);
+        let udp = {
+            let mut udp = vec![0x10, 0x00, 0x34, 0x94, 0x00, 0x00, 0x00, 0x00];
+            udp.extend_from_slice(&payload);
+            let length = (udp.len() as u16).to_be_bytes();
+            udp[4..6].copy_from_slice(&length);
+            udp
+        };
+        let mut frame = ipv4_frame(17, &udp);
+        // Destination port 13400 is what selects DoIP.
+        frame[36] = 0x34;
+        frame[37] = 0x58;
+        let dissection = dissect_frame(&frame).expect("dissection");
+        assert_eq!(dissection.protocol, "UDS/RDBI");
+        assert!(
+            dissection.layers.contains(&"uds"),
+            "{:?}",
+            dissection.layers
+        );
+        let text = dissection.field_text();
+        assert!(text.contains("doip.sourceAddress=0x0E00"), "{text}");
+        assert!(text.contains("doip.targetAddress=0x1001"), "{text}");
+        assert!(
+            text.contains("uds.serviceName=ReadDataByIdentifier"),
+            "{text}"
+        );
+        assert!(text.contains("uds.dataIdentifier=0xF190"), "{text}");
     }
 
     #[test]

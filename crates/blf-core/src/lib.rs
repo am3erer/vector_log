@@ -9,6 +9,7 @@ mod query;
 mod reader;
 mod sample;
 mod types;
+mod uds;
 
 pub use can::{
     decode_message, decode_signal, decode_signal_for_message, message_for_id, CanDecodeError,
@@ -42,6 +43,10 @@ pub use types::{
     ObjectHeader, ObjectHeader2, ObjectHeaderBase, ObjectType, RawObject, RawObjectHeader,
     RestorePoint, RestorePointContainer, RestorePoints, StructuredObject, SystemTime,
     VarObjectHeader, FILE_SIGNATURE, OBJECT_SIGNATURE,
+};
+pub use uds::{
+    decode_isotp, decode_isotp_single, decode_uds, negative_response_name, service_name,
+    IsoTpFrame, NegativeResponse, UdsMessage,
 };
 
 /// Return the direction encoded in the low four bits of a classic CAN BLF

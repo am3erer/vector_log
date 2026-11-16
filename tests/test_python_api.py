@@ -6,6 +6,8 @@ import pytest
 from vector_log.blf_rs.classes import SignalSample, object_from_data
 from vector_log.blf_rs import (
     DatabaseParseError,
+    decode_isotp,
+    decode_uds,
     dissect_ethernet_frame,
     dissect_ethernet_payload,
     DbcDatabase,
@@ -1559,3 +1561,53 @@ def test_ethernet_helpers_decode_raw_bytes():
     icmp = dissect_ethernet_payload(payload, 0x0800, b"\x02\0\0\0\0\x01", b"\x02\0\0\0\0\x02")
     assert icmp["layers"][:2] == ["ethernet", "ipv4"]
     assert icmp["fields"]["ipv4.source"] == "10.0.0.1"
+
+def test_uds_and_isotp_helpers():
+    request = decode_uds(bytes([0x22, 0xF1, 0x90]))
+    assert request["serviceName"] == "ReadDataByIdentifier"
+    assert request["dataIdentifier"] == 0xF190
+    assert request["summary"] == "ReadDataByIdentifier 0x22 DID 0xF190"
+
+    negative = decode_uds(bytes([0x7F, 0x22, 0x31]))
+    assert negative["negativeResponse"]["codeName"] == "requestOutOfRange"
+    assert negative["negativeResponse"]["serviceName"] == "ReadDataByIdentifier"
+
+    assert decode_uds(bytes([0x99, 0x01])) is None
+
+    single = decode_isotp(bytes([0x03, 0x22, 0xF1, 0x90]))
+    assert single["frameType"] == "single"
+    assert single["data"] == bytes([0x22, 0xF1, 0x90])
+
+
+def test_ethernet_vlan_stack_edsa_rtag_and_gptp():
+    # QinQ: 0x88A8 VID 100, 0x8100 VID 200, then ARP.
+    arp = bytes.fromhex(
+        "0001080006040001" "020000000001" "0a000001" "000000000000" "0a000002"
+    )
+    frame = bytes.fromhex("020000000002" "020000000001")
+    frame += (0x88A8).to_bytes(2, "big") + (0x2064).to_bytes(2, "big")
+    frame += (0x8100).to_bytes(2, "big") + (0x20C8).to_bytes(2, "big")
+    frame += (0x0806).to_bytes(2, "big") + arp
+    dissection = dissect_ethernet_frame(frame)
+    assert dissection["vlanIds"] == [100, 200]
+    assert dissection["protocol"] == "ARP"
+    assert dissection["fields"]["vlan.vlanId2"] == "200"
+
+    # 802.1CB R-TAG with sequence 4660, then ARP.
+    frame = bytes.fromhex("020000000002" "020000000001")
+    frame += (0xF1C1).to_bytes(2, "big") + (4660).to_bytes(2, "big")
+    frame += (0x0806).to_bytes(2, "big") + arp
+    dissection = dissect_ethernet_frame(frame)
+    assert dissection["fields"]["rtag.sequenceNumber"] == "4660"
+    assert "R-TAG seq 4660" in dissection["summary"]
+
+    # Marvell EDSA To_Sniffer tag: device 3, port 7, ingress, VID 20.
+    tag = (0x2 << 30) | (3 << 24) | (7 << 19) | (1 << 18) | 20
+    frame = bytes.fromhex("020000000002" "020000000001")
+    frame += (0xDADA).to_bytes(2, "big") + b"\x00\x00" + tag.to_bytes(4, "big")
+    frame += (0x0806).to_bytes(2, "big") + arp
+    dissection = dissect_ethernet_frame(frame)
+    assert dissection["fields"]["edsa.mode"] == "To_Sniffer"
+    assert dissection["fields"]["edsa.sourceDevice"] == "3"
+    assert dissection["fields"]["edsa.sourcePort"] == "7"
+    assert dissection["fields"]["edsa.vlanId"] == "20"

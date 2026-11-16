@@ -19,10 +19,16 @@ diagnostic objects, including:
 - CAN, CAN FD, CAN error, and CAN FD error frames.
 - LIN message, error, sleep, wakeup, and scheduler event objects.
 - FlexRay, MOST, Ethernet, AFDX, A429, WLAN, J1708, and K-Line objects.
-- Ethernet frames are dissected beyond the link layer: VLAN/priority tags,
-  ARP, IPv4/IPv6, ICMP/ICMPv6, TCP, UDP, and the automotive payloads SOME/IP,
-  DoIP, DHCP, DNS, PTP, and LLDP. Every layer keeps named fields
-  (`layer.name`), so a frame can be filtered, exported, or inspected per layer.
+- Ethernet frames are dissected beyond the link layer. Link-layer tags:
+  stacked VLAN/QinQ, Marvell EDSA switch tags (`To_CPU`, `From_CPU`,
+  `To_Sniffer`, `Forward`, with device/port/trunk, CPU code and VLAN), and
+  IEEE 802.1CB R-TAG sequence numbers. Network and transport: ARP, IPv4/IPv6,
+  ICMP/ICMPv6, TCP, UDP. Applications: SOME/IP, DoIP, DHCP, DNS, PTP/gPTP
+  (802.1AS bodies plus organizationally specific TLVs), LLDP, and UDS
+  (ISO 14229) inside DoIP diagnostic messages.
+- CAN and CAN FD payloads are checked for ISO-TP framing (ISO 15765-2), so a
+  single-frame UDS request or response is shown by service, sub-function,
+  data identifier and negative response code instead of raw bytes.
 - Environment variables and system variables.
 - Serial events, test structures, diagnostic objects, and Function Bus objects.
 - Marker, trigger, data-lost, watermark, attribute, and distributed-object
@@ -162,7 +168,8 @@ remaining count.
 
 Ethernet frames appear with `eth` in the bus column, their EtherType as the frame
 id, and a protocol summary in the payload column (`VLAN 10 ARP 10.0.0.1 >
-10.0.0.2`). The detail pane lists every layer from Ethernet down to the
+10.0.0.2`, `R-TAG seq 4660 UDP ...`, `EDSA To_Sniffer dev3 port7 ...`,
+`UDS/RDBI 192.168.1.1 > 192.168.1.2`). The detail pane lists every layer from Ethernet down to the
 application protocol, and `/` matches any parsed field, such as an IP address,
 port, or SOME/IP service id.
 

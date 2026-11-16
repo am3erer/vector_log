@@ -71,6 +71,8 @@ DbcDatabase = _core.DbcDatabase
 LdfDatabase = _core.LdfDatabase
 dissect_ethernet_frame = _core.dissect_ethernet_frame
 dissect_ethernet_payload = _core.dissect_ethernet_payload
+decode_uds = _core.decode_uds
+decode_isotp = _core.decode_isotp
 
 
 class SignalQuery:
@@ -529,6 +531,8 @@ __all__ = [
     "LdfDatabase",
     "dissect_ethernet_frame",
     "dissect_ethernet_payload",
+    "decode_uds",
+    "decode_isotp",
     "SignalQuery",
     "objects_to_numpy",
     "objects_to_arrow",
