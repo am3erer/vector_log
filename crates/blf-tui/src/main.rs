@@ -306,6 +306,8 @@ enum Mode {
     Curve,
     Databases,
     Statistics,
+    /// Every attribute of the selected frame, scrollable.
+    Inspector,
 }
 
 /// Which column of the database browser owns the keyboard focus.
@@ -553,6 +555,9 @@ struct App {
     uds: HashMap<usize, UdsFrame>,
     /// Interned Ethernet summaries and search texts.
     pool: TextPool,
+    /// First visible line of the inspector, and its wrapped line count.
+    inspector_offset: usize,
+    inspector_lines: usize,
     /// Which bus the message list shows in its own columns.
     view: View,
     /// Whether frames from other buses stay visible as a dim description.
@@ -622,6 +627,8 @@ impl App {
             summaries,
             uds,
             pool,
+            inspector_offset: 0,
+            inspector_lines: 0,
             view: View::All,
             show_foreign: true,
             bindings: Vec::new(),
@@ -765,6 +772,7 @@ impl App {
                 InputEvent::Char('p') => self.open_curve(),
                 InputEvent::Char('d') => self.enter_databases(),
                 InputEvent::Char('s') => self.open_statistics(),
+                InputEvent::Char('i') => self.open_inspector(),
                 InputEvent::Char('t') => self.start_input(InputKind::TimeRange),
                 InputEvent::Char('e') => self.export_csv(),
                 InputEvent::Char('P') => self.export_pcap(),
@@ -796,12 +804,27 @@ impl App {
                 InputEvent::End => self.select_last_signal(),
                 InputEvent::Char('p') => self.open_curve(),
                 InputEvent::Char('a') => self.add_curve_series(),
+                InputEvent::Char('i') => self.open_inspector(),
                 InputEvent::Char('T') => self.toggle_time_mode(),
                 InputEvent::Char('b') => self.start_input(InputKind::Binding),
                 InputEvent::Char('e') => self.export_csv(),
                 InputEvent::Esc | InputEvent::Left => self.mode = Mode::Messages,
                 InputEvent::Char('?') => self.open_help(),
                 InputEvent::Mouse(mouse) => self.handle_detail_mouse(mouse),
+                _ => {}
+            },
+            Mode::Inspector => match event {
+                InputEvent::Char('q') => return Ok(true),
+                InputEvent::Up | InputEvent::Char('k') => self.scroll_inspector(-1),
+                InputEvent::Down | InputEvent::Char('j') => self.scroll_inspector(1),
+                InputEvent::PageUp => self.scroll_inspector(-self.page_step()),
+                InputEvent::PageDown => self.scroll_inspector(self.page_step()),
+                InputEvent::Home => self.inspector_offset = 0,
+                InputEvent::End => self.scroll_inspector(isize::MAX / 2),
+                InputEvent::Char('e') => self.export_csv(),
+                InputEvent::Char('P') => self.export_pcap(),
+                InputEvent::Char('?') => self.open_help(),
+                InputEvent::Esc | InputEvent::Left => self.mode = Mode::Messages,
                 _ => {}
             },
             Mode::Statistics => match event {
@@ -1382,6 +1405,7 @@ impl App {
             },
             Mode::Curve => 1,
             Mode::Statistics => self.stats_page_size(),
+            Mode::Inspector => self.inspector_page_size(),
         };
         rows as isize
     }
@@ -2288,6 +2312,7 @@ impl App {
                     self.render_databases(&mut lines, width, height);
                 }
                 Mode::Statistics => self.render_statistics(&mut lines, width, height),
+                Mode::Inspector => self.render_inspector(&mut lines, width, height),
             }
         }
         lines.push(paint("─".repeat(width), ANSI_BRIGHT_CYAN));
@@ -2586,6 +2611,77 @@ impl App {
         lines.push(String::new());
         let rows = height.saturating_sub(3 + legend);
         lines.extend(plot_series(curve, window, width.saturating_sub(1), rows));
+    }
+
+    fn inspector_page_size(&self) -> usize {
+        // The title and the footer take three rows.
+        self.viewport_height.saturating_sub(4).max(1)
+    }
+
+    /// Open the full attribute list of the selected frame.
+    fn open_inspector(&mut self) {
+        if self.selected_summary().is_none() {
+            self.status = "No message selected".to_string();
+            return;
+        }
+        self.mode = Mode::Inspector;
+        self.inspector_offset = 0;
+        self.status = "All attributes".to_string();
+    }
+
+    fn scroll_inspector(&mut self, delta: isize) {
+        let page = self.inspector_page_size();
+        let max = self.inspector_lines.saturating_sub(page);
+        let next = self.inspector_offset as isize + delta;
+        self.inspector_offset = next.clamp(0, max as isize) as usize;
+    }
+
+    fn render_inspector(&mut self, lines: &mut Vec<String>, width: usize, height: usize) {
+        let Some(summary) = self.selected_summary() else {
+            lines.push("No message selected".to_string());
+            return;
+        };
+        let index = self.selected;
+        let total = self.filtered.len();
+        let object_index = summary.object_index;
+        let class_name = summary.class_name;
+        let object = self.selected_object();
+        let uds = self.uds.get(&object_index);
+        let content = inspector_lines(
+            summary,
+            object,
+            self.time_axis(),
+            uds,
+            &self.pool,
+            index,
+            total,
+        );
+        // Wrap once per frame; the scroll offset counts wrapped lines.
+        let body = content
+            .iter()
+            .flat_map(|line| wrap(line, width))
+            .collect::<Vec<_>>();
+        self.inspector_lines = body.len();
+        let page = height.saturating_sub(4).max(1);
+        let max = body.len().saturating_sub(page);
+        self.inspector_offset = self.inspector_offset.min(max);
+        lines.push(paint_bold(
+            format!(
+                "Attributes  {}  line {}/{}",
+                class_name,
+                self.inspector_offset + 1,
+                body.len().max(1)
+            ),
+            ANSI_BRIGHT_CYAN,
+        ));
+        lines.push(paint("─".repeat(width), ANSI_CYAN));
+        for row in 0..page {
+            let line = body
+                .get(self.inspector_offset + row)
+                .cloned()
+                .unwrap_or_default();
+            lines.push(line);
+        }
     }
 
     fn render_statistics(&self, lines: &mut Vec<String>, width: usize, height: usize) {
@@ -4177,6 +4273,194 @@ fn structured_frame_hints(object: &Object) -> (Option<u16>, Option<&'static str>
     (channel, direction)
 }
 
+/// Every attribute of one frame, as scrollable text.
+///
+/// The list pane only shows what fits in its columns; this is the place that
+/// shows the whole object: header fields, bus fields, the payload as hex and
+/// ASCII, every parsed protocol field, the reassembled UDS message and the raw
+/// object bytes.
+fn inspector_lines(
+    summary: &MessageSummary,
+    object: Option<&Object>,
+    axis: TimeAxis,
+    uds: Option<&UdsFrame>,
+    pool: &TextPool,
+    index: usize,
+    total: usize,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(format!("frame {}/{}", index + 1, total));
+    lines.push(format!("  class          {}", summary.class_name));
+    lines.push(format!(
+        "  object type    {} (raw {})",
+        summary.class_name, summary.object_type_raw
+    ));
+    if let Some(source) = summary.timestamp_source {
+        lines.push(format!(
+            "  timestamp      {}",
+            axis.format(summary.timestamp_ns)
+        ));
+        lines.push(format!("  time source    {source}"));
+    } else {
+        lines.push(format!(
+            "  timestamp      {}",
+            axis.format(summary.timestamp_ns)
+        ));
+    }
+
+    if let Some(object) = object {
+        let header = object.header_info();
+        lines.push("header".to_string());
+        lines.push(format!("  signature      0x{:08X}", header.signature));
+        lines.push(format!(
+            "  header size    {} bytes, version {}",
+            header.header_size, header.header_version
+        ));
+        lines.push(format!("  object size    {} bytes", header.object_size));
+        lines.push(format!(
+            "  flags          0x{:08X}  (client {}, version {})",
+            header.object_flags, header.client_index, header.object_version
+        ));
+        lines.push(format!("  raw timestamp  {}", header.timestamp));
+    }
+
+    lines.push("bus".to_string());
+    lines.push(format!(
+        "  bus            {}  channel {}",
+        summary.bus_label,
+        summary
+            .channel
+            .map_or_else(|| "-".to_string(), |value| value.to_string())
+    ));
+    if let Some(direction) = summary.direction {
+        lines.push(format!("  direction      {direction}"));
+    }
+    if let Some(id) = summary.frame_id {
+        lines.push(format!("  id             0x{id:X}  ({id})"));
+    }
+    if let Some(dlc) = summary.dlc {
+        lines.push(format!("  dlc            {dlc}"));
+    }
+    lines.push(format!("  status         {}", summary.status));
+    if let Some(info) = &summary.ethernet {
+        lines.push("ethernet".to_string());
+        lines.push(format!(
+            "  etherType      0x{:04X}  protocol {}",
+            info.ether_type, info.protocol
+        ));
+        lines.push(format!("  summary        {}", pool.get(info.summary)));
+        // Every parsed layer, in order, without the field cap of the preview.
+        if let Some(dissection) = object.and_then(blf_core::dissect_object) {
+            let mut layer = "";
+            for field in &dissection.fields {
+                if field.layer != layer {
+                    layer = field.layer;
+                    lines.push(format!("  [{layer}]"));
+                }
+                lines.push(format!("    {} = {}", field.name, field.value));
+            }
+        }
+    }
+
+    if summary.ethernet.is_some() {
+        lines.push("frame bytes".to_string());
+        match object.and_then(blf_core::frame_bytes) {
+            Some(frame) => lines.extend(hex_dump(&frame, 2)),
+            None => lines.push("  (not available for this object)".to_string()),
+        }
+    } else {
+        lines.push("payload".to_string());
+        lines.extend(hex_dump(&summary.payload, 2));
+    }
+
+    if let Some(uds) = uds {
+        lines.push("uds".to_string());
+        lines.push(format!(
+            "  transport      {}  frames {}  position {}",
+            uds.transport, uds.frames, uds.position
+        ));
+        if let Some(node) = uds.node {
+            lines.push(format!("  node           0x{node:02X}"));
+        }
+        lines.push(format!("  message        {}", uds.summary));
+        for (name, value) in &uds.fields {
+            lines.push(format!("    {name} = {value}"));
+        }
+    }
+
+    if let Some(object) = object {
+        let extensions = object_extensions(object);
+        if !extensions.is_empty() {
+            lines.push("extensions".to_string());
+            lines.extend(hex_dump(&extensions, 2));
+        }
+        let raw = object_raw_bytes(object);
+        if !raw.is_empty() {
+            lines.push("raw object bytes".to_string());
+            lines.extend(hex_dump(&raw, 2));
+        }
+    }
+    lines
+}
+
+/// Hex dump with an ASCII column, `indent` spaces of leading padding.
+fn hex_dump(bytes: &[u8], indent: usize) -> Vec<String> {
+    if bytes.is_empty() {
+        return vec![format!("{}  (empty)", " ".repeat(indent))];
+    }
+    let pad = " ".repeat(indent);
+    bytes
+        .chunks(16)
+        .enumerate()
+        .map(|(row, chunk)| {
+            let mut hex = String::new();
+            for byte in chunk {
+                hex.push_str(&format!("{byte:02X} "));
+            }
+            for _ in chunk.len()..16 {
+                hex.push_str("   ");
+            }
+            let ascii: String = chunk
+                .iter()
+                .map(|byte| {
+                    if byte.is_ascii_graphic() || *byte == b' ' {
+                        char::from(*byte)
+                    } else {
+                        '.'
+                    }
+                })
+                .collect();
+            format!("{pad}{:04X}  {hex} {ascii}", row * 16)
+        })
+        .collect()
+}
+
+/// Bytes a BLF object stores beyond its decoded fields.
+fn object_extensions(object: &Object) -> Vec<u8> {
+    match object {
+        Object::Structured(value) => value.extensions.clone(),
+        Object::Lin(value) => value.extensions.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// The original bytes of an object, when the reader kept them.
+fn object_raw_bytes(object: &Object) -> Vec<u8> {
+    match object {
+        Object::Structured(value) => {
+            if value.data.is_empty() {
+                Vec::new()
+            } else {
+                value.data.clone()
+            }
+        }
+        Object::CanMessage(value) => value.raw_data.clone(),
+        Object::CanMessage2(value) => value.raw_data.clone(),
+        Object::Raw(value) => value.data.clone(),
+        _ => Vec::new(),
+    }
+}
+
 /// Column header of the current view, or empty when the view has no columns.
 fn view_header(view: View, width: usize) -> String {
     match view {
@@ -5078,6 +5362,7 @@ fn mode_hint(mode: Mode) -> &'static str {
         Mode::Curve => "←/→ pan · +/- zoom · x remove signal · Esc back · ? help",
         Mode::Databases => "Tab panes · j/k move · Enter open · / search · [/] database · ? help",
         Mode::Statistics => "j/k move · Enter jump to frame · s sort · Esc back · ? help",
+        Mode::Inspector => "j/k scroll · PgUp/PgDn · Home/End · e export · Esc back · ? help",
     }
 }
 
@@ -5103,6 +5388,7 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     binding("v / 1 2 3 4", "switch view: ALL, CAN, LIN, ETHERNET"),
     binding("H", "hide frames of other buses in this view"),
     binding("P", "export the visible frames as pcapng"),
+    binding("i", "inspect every attribute of the selected frame"),
     binding("Esc", "clear the message filter and the time range"),
     binding("q", "quit"),
     heading("Detail (needs a trace)"),
@@ -7973,6 +8259,29 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
         let mut summary = summary_for(0, &object, pool);
         summary.timestamp_ns = Some(timestamp);
         summary
+    }
+
+    #[test]
+    fn the_inspector_scrolls_and_stops_at_the_end() {
+        let mut app = App::new(None, Vec::new(), Vec::new()).expect("build app");
+        app.mode = Mode::Inspector;
+        app.inspector_lines = 41;
+        app.viewport_height = 24;
+        for _ in 0..3 {
+            app.handle_event(InputEvent::Char('j')).expect("handle");
+        }
+        assert_eq!(app.inspector_offset, 3);
+        for _ in 0..200 {
+            app.handle_event(InputEvent::Char('j')).expect("handle");
+        }
+        // The last page stays on screen.
+        assert_eq!(app.inspector_offset, 41 - app.inspector_page_size());
+        app.handle_event(InputEvent::Char('k')).expect("handle");
+        assert_eq!(app.inspector_offset, 41 - app.inspector_page_size() - 1);
+        app.handle_event(InputEvent::Home).expect("handle");
+        assert_eq!(app.inspector_offset, 0);
+        app.handle_event(InputEvent::Esc).expect("handle");
+        assert_eq!(app.mode, Mode::Messages);
     }
 
     #[test]

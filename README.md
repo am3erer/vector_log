@@ -184,6 +184,13 @@ channel/EtherType/protocol/VLAN/addresses plus a one-line description such as
 visible as a dim one-line description, so the interleaving is still readable;
 `H` hides them.
 
+`i` opens an inspector for the selected frame: every attribute the file holds —
+object header fields (signature, sizes, flags, client index, raw timestamp), bus
+fields, the payload or the rebuilt L2 frame as a hex and ASCII dump, every parsed
+protocol field grouped by layer, the reassembled UDS message with its ISO-TP
+position, extension bytes and the raw object bytes. The list scrolls, so nothing
+is cut off the way the preview pane cuts it.
+
 `P` writes the visible frames to a `.pcapng` next to the trace, with one
 interface per bus (Ethernet and SocketCAN), so Wireshark dissects SOME/IP, PTP or
 FRER traffic directly; the export follows the current view, message filter and

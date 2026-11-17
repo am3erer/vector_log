@@ -734,7 +734,98 @@ pub enum Object {
     Raw(RawObject),
 }
 
+/// The fields every BLF object header carries, whatever its shape.
+///
+/// BLF uses four header layouts (`ObjectHeader`, `ObjectHeader2`,
+/// `VarObjectHeader` and a bare base header); this flattening lets a caller
+/// show them without matching every variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectHeaderInfo {
+    pub signature: u32,
+    pub header_size: u16,
+    pub header_version: u16,
+    pub object_size: u32,
+    pub object_type: ObjectType,
+    pub raw_object_type: u32,
+    pub object_flags: u32,
+    pub client_index: u16,
+    pub object_version: u16,
+    pub timestamp: u64,
+}
+
+impl ObjectHeaderInfo {
+    fn from_base(base: &ObjectHeaderBase) -> Self {
+        Self {
+            signature: base.signature,
+            header_size: base.header_size,
+            header_version: base.header_version,
+            object_size: base.object_size,
+            object_type: base.object_type,
+            raw_object_type: base.raw_object_type,
+            object_flags: 0,
+            client_index: 0,
+            object_version: 0,
+            timestamp: 0,
+        }
+    }
+
+    fn from_header(header: &ObjectHeader) -> Self {
+        Self {
+            object_flags: header.object_flags,
+            client_index: header.client_index,
+            object_version: header.object_version,
+            timestamp: header.object_time_stamp,
+            ..Self::from_base(&header.base)
+        }
+    }
+
+    fn from_header2(header: &ObjectHeader2) -> Self {
+        Self {
+            object_flags: header.object_flags,
+            object_version: header.object_version,
+            timestamp: header.object_time_stamp,
+            ..Self::from_base(&header.base)
+        }
+    }
+
+    fn from_var(header: &VarObjectHeader) -> Self {
+        Self {
+            object_flags: header.object_flags,
+            object_version: header.object_version,
+            timestamp: header.object_time_stamp,
+            ..Self::from_base(&header.base)
+        }
+    }
+
+    fn from_raw(header: &RawObjectHeader) -> Self {
+        match header {
+            RawObjectHeader::Object(value) => Self::from_header(value),
+            RawObjectHeader::Object2(value) => Self::from_header2(value),
+            RawObjectHeader::Var(value) => Self::from_var(value),
+            RawObjectHeader::Base(value) => Self::from_base(value),
+        }
+    }
+}
+
 impl Object {
+    /// Header fields of this object, flattened across the four layouts.
+    pub fn header_info(&self) -> ObjectHeaderInfo {
+        match self {
+            Self::CanMessage(value) => ObjectHeaderInfo::from_header(&value.header),
+            Self::CanMessage2(value) => ObjectHeaderInfo::from_header(&value.header),
+            Self::CanFdMessage(value) => ObjectHeaderInfo::from_header(&value.header),
+            Self::CanFdMessage64(value) => ObjectHeaderInfo::from_header(&value.header),
+            Self::CanErrorFrame(value) => ObjectHeaderInfo::from_header(&value.header),
+            Self::CanErrorFrameExt(value) => ObjectHeaderInfo::from_header(&value.header),
+            Self::CanFdErrorFrame64(value) => ObjectHeaderInfo::from_header(&value.header),
+            Self::AppText(value) => ObjectHeaderInfo::from_header(&value.header),
+            Self::RestorePointContainer(value) => ObjectHeaderInfo::from_header(&value.header),
+            Self::Lin(value) => ObjectHeaderInfo::from_header(&value.header),
+            Self::Structured(value) => ObjectHeaderInfo::from_raw(&value.header),
+            Self::Raw(value) => ObjectHeaderInfo::from_raw(&value.header),
+        }
+    }
+
     pub fn object_type(&self) -> ObjectType {
         match self {
             Object::CanMessage(_) => ObjectType::CanMessage,

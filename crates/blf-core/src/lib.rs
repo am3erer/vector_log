@@ -48,9 +48,9 @@ pub use transport::{
 pub use types::{
     AppText, CanErrorFrame, CanErrorFrameExt, CanFdErrorFrame64, CanFdExtFrameData, CanFdMessage,
     CanFdMessage64, CanMessage, CanMessage2, FieldValue, FileStatistics, LinObject, Object,
-    ObjectHeader, ObjectHeader2, ObjectHeaderBase, ObjectType, RawObject, RawObjectHeader,
-    RestorePoint, RestorePointContainer, RestorePoints, StructuredObject, SystemTime,
-    VarObjectHeader, FILE_SIGNATURE, OBJECT_SIGNATURE,
+    ObjectHeader, ObjectHeader2, ObjectHeaderBase, ObjectHeaderInfo, ObjectType, RawObject,
+    RawObjectHeader, RestorePoint, RestorePointContainer, RestorePoints, StructuredObject,
+    SystemTime, VarObjectHeader, FILE_SIGNATURE, OBJECT_SIGNATURE,
 };
 pub use uds::{
     decode_isotp, decode_isotp_single, decode_uds, negative_response_name, service_name,
