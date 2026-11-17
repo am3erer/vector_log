@@ -174,16 +174,28 @@ category shows each definition's type, range or enum members, default and
 assignment count. A detail list only stops after 500 entries and reports the
 remaining count.
 
-Ethernet frames appear with `eth` in the bus column, their EtherType as the frame
-id, and a protocol summary in the payload column (`VLAN 10 ARP 10.0.0.1 >
-10.0.0.2`, `R-TAG seq 4660 UDP ...`, `EDSA To_Sniffer dev3 port7 ...`,
-`UDS/RDBI 192.168.1.1 > 192.168.1.2`). The statistics view groups Ethernet
-frames by EtherType, so `s` reports each protocol's frame count with its period,
-minimum, maximum and jitter and `Enter` jumps to the first frame, while `]`/`[`
-step between frames of the same EtherType on the same channel. The detail pane
-lists every layer from Ethernet down to the
-application protocol, and `/` matches any parsed field, such as an IP address,
-port, or SOME/IP service id.
+A trace can hold CAN, LIN and Ethernet frames at once, and forcing them into one
+table leaves every column too narrow. `v` cycles the message list through four
+views (`1`–`4` jump straight to one): `ALL` keeps the mixed table, while `CAN`,
+`LIN` and `ETHERNET` give that bus its own columns — CAN shows
+channel/id/dir/DLC/data, LIN adds the checksum state, and Ethernet shows
+channel/EtherType/protocol/VLAN/addresses plus a one-line description such as
+`10.0.0.1 > 10.0.0.2` or `R-TAG seq 4660`. Frames from the other buses stay
+visible as a dim one-line description, so the interleaving is still readable;
+`H` hides them.
+
+`P` writes the visible frames to a `.pcapng` next to the trace, with one
+interface per bus (Ethernet and SocketCAN), so Wireshark dissects SOME/IP, PTP or
+FRER traffic directly; the export follows the current view, message filter and
+time range, and LIN frames are reported as skipped because no pcapng link type
+is filled in for them.
+
+The statistics view groups Ethernet frames by EtherType, so `s` reports each
+protocol's frame count and period in microseconds, and `Enter` jumps to the
+first frame while `]`/`[` step between frames of the same EtherType on the same
+channel. The detail pane lists every layer from Ethernet down to the application
+protocol, and `/` matches any parsed field, such as an IP address, port, or
+SOME/IP service id.
 
 Key controls are:
 

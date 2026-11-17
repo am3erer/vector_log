@@ -386,6 +386,42 @@ fn dissect_with(header: EthernetHeader<'_>, keep_fields: bool) -> EthernetDissec
     dissection
 }
 
+/// Rebuild the complete L2 frame of an Ethernet object, for pcap export.
+///
+/// `EthernetFrame` keeps the addresses, the tag and the EtherType in separate
+/// fields, so they are reassembled here; the `Ex`/`Forwarded` variants already
+/// carry the frame.
+pub fn frame_bytes(object: &Object) -> Option<Vec<u8>> {
+    let Object::Structured(value) = object else {
+        return None;
+    };
+    match value.object_type {
+        ObjectType::EthernetFrame => {
+            let destination = field_bytes(&value.fields, "destinationAddress")?;
+            let source = field_bytes(&value.fields, "sourceAddress")?;
+            let ether_type = u16::try_from(field_u64(&value.fields, "type")?).ok()?;
+            let tpid = field_u64(&value.fields, "tpid").unwrap_or(0);
+            let tci = u16::try_from(field_u64(&value.fields, "tci").unwrap_or(0)).unwrap_or(0);
+            let payload = field_bytes(&value.fields, "payLoad").unwrap_or_default();
+            let mut frame = Vec::with_capacity(18 + payload.len());
+            frame.extend_from_slice(&destination[..destination.len().min(6)]);
+            frame.extend_from_slice(&source[..source.len().min(6)]);
+            if matches!(tpid, 0x8100 | 0x88A8 | 0x9100) {
+                frame.extend_from_slice(&(tpid as u16).to_be_bytes());
+                frame.extend_from_slice(&tci.to_be_bytes());
+            }
+            frame.extend_from_slice(&ether_type.to_be_bytes());
+            frame.extend_from_slice(&payload);
+            Some(frame)
+        }
+        ObjectType::EthernetFrameEx
+        | ObjectType::EthernetFrameForwarded
+        | ObjectType::EthernetErrorEx
+        | ObjectType::EthernetErrorForwarded => field_bytes(&value.fields, "frameData"),
+        _ => None,
+    }
+}
+
 /// Dissect a structured BLF object when it carries an Ethernet frame.
 pub fn dissect_object(object: &Object) -> Option<EthernetDissection> {
     dissect_object_with(object, true)
@@ -806,7 +842,7 @@ fn dissect_doip(dissection: &mut EthernetDissection, payload: &[u8]) -> &'static
     }
     dissection
         .detail
-        .push_str(&format!(" DoIP {}", doip_payload_name(payload_type)));
+        .push_str(&format!(" {}", doip_payload_name(payload_type)));
     "DoIP"
 }
 
@@ -927,7 +963,7 @@ fn dissect_lldp(dissection: &mut EthernetDissection, payload: &[u8]) {
         }
         offset += 2 + length;
     }
-    dissection.detail.push_str(" LLDP");
+    // The chain already names the protocol; only structured values follow.
 }
 
 fn dissect_ptp(dissection: &mut EthernetDissection, payload: &[u8]) {
@@ -1009,7 +1045,7 @@ fn dissect_ptp(dissection: &mut EthernetDissection, payload: &[u8]) {
         _ => 0,
     };
     dissect_ptp_tlvs(dissection, payload, length, 34 + body_length);
-    dissection.detail.push_str(&format!(" PTP {name}"));
+    dissection.detail.push_str(&format!(" {name}"));
 }
 
 /// gPTP timestamps are 48-bit seconds plus a 32-bit nanoseconds fraction.

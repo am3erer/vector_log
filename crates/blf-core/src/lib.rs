@@ -5,6 +5,7 @@ mod error;
 mod ethernet;
 mod ldf;
 mod lin;
+mod pcap;
 mod query;
 mod reader;
 mod sample;
@@ -27,8 +28,8 @@ pub use database::{
 pub use error::{BlfError, Result};
 pub use ethernet::{
     dissect, dissect_frame, dissect_frame_summary, dissect_object, dissect_object_summary,
-    dissect_summary, ether_type_name, ip_protocol_name, EthernetDissection, EthernetField,
-    EthernetHeader,
+    dissect_summary, ether_type_name, frame_bytes, ip_protocol_name, EthernetDissection,
+    EthernetField, EthernetHeader,
 };
 pub use ldf::{
     decode_lin_frame, decode_lin_object, decode_lin_signal, protected_identifier,
@@ -36,6 +37,7 @@ pub use ldf::{
     LinDecodeError,
 };
 pub use lin::{classify_lin_object, LinObservation, LinResponseState};
+pub use pcap::{ExportReport, LinkType, PcapWriter};
 pub use query::{QueryError, SignalQuery};
 pub use reader::{parse_file_statistics, File, ReaderOptions};
 pub use sample::{DecodeStatus, SampleContext, SampleValue, SignalSample};

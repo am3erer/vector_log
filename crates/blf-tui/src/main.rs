@@ -145,6 +145,64 @@ struct SignalRow {
     error: Option<String>,
 }
 
+/// Which bus a list view shows in its own columns.
+///
+/// One BLF trace can hold CAN, LIN and Ethernet frames at once. Showing them
+/// in one table forces every bus into the narrowest common shape, so each bus
+/// gets a view with columns that fit it; frames from other buses stay visible
+/// as a dim one-line description, which keeps the interleaving readable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    All,
+    Can,
+    Lin,
+    Ethernet,
+}
+
+impl View {
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "ALL",
+            Self::Can => "CAN",
+            Self::Lin => "LIN",
+            Self::Ethernet => "ETHERNET",
+        }
+    }
+
+    fn cycle(self) -> Self {
+        match self {
+            Self::All => Self::Can,
+            Self::Can => Self::Lin,
+            Self::Lin => Self::Ethernet,
+            Self::Ethernet => Self::All,
+        }
+    }
+
+    fn from_digit(digit: char) -> Option<Self> {
+        match digit {
+            '1' => Some(Self::All),
+            '2' => Some(Self::Can),
+            '3' => Some(Self::Lin),
+            '4' => Some(Self::Ethernet),
+            _ => None,
+        }
+    }
+
+    /// Whether this frame belongs to the bus the view is about.
+    fn owns(self, summary: &MessageSummary) -> bool {
+        match self {
+            Self::All => true,
+            Self::Can => summary.bus == Some(BusKind::Can),
+            Self::Lin => summary.bus == Some(BusKind::Lin),
+            Self::Ethernet => summary.ethernet.is_some(),
+        }
+    }
+
+    fn is_all(self) -> bool {
+        self == Self::All
+    }
+}
+
 /// Identifies one frame id on one bus and channel.
 ///
 /// Ethernet has no CAN-style frame identifier, so it is grouped by its
@@ -495,6 +553,10 @@ struct App {
     uds: HashMap<usize, UdsFrame>,
     /// Interned Ethernet summaries and search texts.
     pool: TextPool,
+    /// Which bus the message list shows in its own columns.
+    view: View,
+    /// Whether frames from other buses stay visible as a dim description.
+    show_foreign: bool,
 }
 
 /// State of the `?` help overlay; closing restores the previous status.
@@ -560,6 +622,8 @@ impl App {
             summaries,
             uds,
             pool,
+            view: View::All,
+            show_foreign: true,
             bindings: Vec::new(),
             mode: Mode::Messages,
             input: None,
@@ -621,8 +685,9 @@ impl App {
                     )
                 });
                 format!(
-                    " vector-log-tui  {}  objects={}/{}  skipped={}  mode={:?}  time={}{range}",
+                    " vector-log-tui  {}  view={}  objects={}/{}  skipped={}  mode={:?}  time={}{range}",
                     trace.path.display(),
+                    self.view.label(),
                     self.filtered.len(),
                     self.summaries.len(),
                     trace.skipped_objects,
@@ -702,11 +767,20 @@ impl App {
                 InputEvent::Char('s') => self.open_statistics(),
                 InputEvent::Char('t') => self.start_input(InputKind::TimeRange),
                 InputEvent::Char('e') => self.export_csv(),
+                InputEvent::Char('P') => self.export_pcap(),
                 InputEvent::Char('T') => self.toggle_time_mode(),
                 InputEvent::Char('g') => self.start_input(InputKind::Goto),
                 InputEvent::Char('G') => self.jump_to_end(),
                 InputEvent::Char(']') => self.step_frame(1),
                 InputEvent::Char('[') => self.step_frame(-1),
+                InputEvent::Char('v') => self.set_view(self.view.cycle()),
+                InputEvent::Char('V') => self.set_view(self.view.cycle()),
+                InputEvent::Char(digit @ '1'..='4') => {
+                    if let Some(view) = View::from_digit(digit) {
+                        self.set_view(view);
+                    }
+                }
+                InputEvent::Char('H') => self.toggle_foreign(),
                 InputEvent::Char('?') => self.open_help(),
                 InputEvent::Esc => self.clear_filter(),
                 InputEvent::Mouse(mouse) => self.handle_message_mouse(mouse),
@@ -1183,6 +1257,41 @@ impl App {
         }
     }
 
+    /// Switch the message list to another bus view.
+    fn set_view(&mut self, view: View) {
+        if self.view == view {
+            return;
+        }
+        let anchor = self.selected_summary().map(|summary| summary.object_index);
+        self.view = view;
+        self.rebuild_filtered();
+        // Keep the same frame selected when it is still visible, otherwise
+        // land on the first frame the new view owns.
+        if let Some(anchor) = anchor {
+            if let Some(position) = self.filtered.iter().position(|index| *index == anchor) {
+                self.selected = position;
+                self.keep_selection_visible();
+                self.status = format!("View {}", view.label());
+                return;
+            }
+        }
+        self.selected = 0;
+        self.list_offset = 0;
+        self.status = format!("View {} · {} frames", view.label(), self.filtered.len());
+    }
+
+    /// Show or hide the dim description of frames from other buses.
+    fn toggle_foreign(&mut self) {
+        self.show_foreign = !self.show_foreign;
+        self.rebuild_filtered();
+        self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
+        self.status = if self.show_foreign {
+            "Foreign frames shown".to_string()
+        } else {
+            format!("Showing {} only", self.view.label())
+        };
+    }
+
     fn selected_frame_key(&self) -> Option<FrameKey> {
         frame_key(self.selected_summary()?)
     }
@@ -1558,13 +1667,19 @@ impl App {
     fn rebuild_filtered(&mut self) {
         let filter = self.filter.to_ascii_lowercase();
         let range = self.time_range;
+        let view = self.view;
+        let show_foreign = self.show_foreign;
+        // Only the current bus is kept when foreign frames are hidden.
+        let keep = |summary: &MessageSummary| show_foreign || view.owns(summary);
         let filtered = if filter.is_empty() && range.is_none() {
-            (0..self.summaries.len()).collect()
+            (0..self.summaries.len())
+                .filter(|index| keep(&self.summaries[*index]))
+                .collect()
         } else {
             let mut buffer = String::with_capacity(128);
             let mut indices = Vec::new();
             for (index, summary) in self.summaries.iter().enumerate() {
-                if !in_time_range(summary.timestamp_ns, range) {
+                if !in_time_range(summary.timestamp_ns, range) || !keep(summary) {
                     continue;
                 }
                 if filter.is_empty()
@@ -1630,6 +1745,78 @@ impl App {
     /// instead of tearing down the whole session.
     /// Write the filtered messages, with their decoded signals, to a CSV
     /// next to the trace so a bench report can quote real numbers.
+    /// Export the visible frames as pcapng so Wireshark can read them.
+    ///
+    /// The current view, message filter and time range decide what goes in, so
+    /// a CAN view produces only CAN packets and an EtherType filter narrows the
+    /// capture to the traffic under investigation. LIN frames have no pcapng
+    /// link type this writer fills in, so they are counted as skipped.
+    fn export_pcap(&mut self) {
+        if self.trace.is_none() {
+            self.status = NO_TRACE_STATUS.to_string();
+            return;
+        }
+        if self.filtered.is_empty() {
+            self.status = "Nothing to export: the list is empty".to_string();
+            return;
+        }
+        let mut writer = blf_core::PcapWriter::new();
+        for index in &self.filtered {
+            let Some(summary) = self.summaries.get(*index) else {
+                continue;
+            };
+            // Frames of other buses are only a dim description in this view, so
+            // they stay out of the capture as well.
+            if !self.view.owns(summary) {
+                continue;
+            }
+            let Some(timestamp) = summary.timestamp_ns else {
+                writer.skip();
+                continue;
+            };
+            let Some(object) = self.objects.get(summary.object_index) else {
+                writer.skip();
+                continue;
+            };
+            if summary.ethernet.is_some() {
+                match blf_core::frame_bytes(object) {
+                    Some(frame) => writer.write_ethernet(timestamp, &frame),
+                    None => writer.skip(),
+                }
+            } else if matches!(summary.bus, Some(BusKind::Can)) {
+                let extended = summary.frame_id.is_some_and(|id| id > 0x7FF);
+                writer.write_can(
+                    timestamp,
+                    summary.channel.unwrap_or(0),
+                    summary.frame_id.unwrap_or(0),
+                    extended,
+                    &summary.payload,
+                );
+            } else {
+                writer.skip();
+            }
+        }
+        let report = writer.report();
+        let bytes = writer.finish();
+        let path = self
+            .trace
+            .as_ref()
+            .map(|trace| export_pcap_path(&trace.path))
+            .unwrap_or_default();
+        match std::fs::write(&path, &bytes) {
+            Ok(()) => {
+                self.status = format!(
+                    "Exported {} ethernet, {} CAN frames to {} ({} skipped)",
+                    report.ethernet,
+                    report.can,
+                    path.display(),
+                    report.skipped
+                )
+            }
+            Err(error) => self.status = format!("write {}: {error}", path.display()),
+        }
+    }
+
     fn export_csv(&mut self) {
         let Some(trace) = &self.trace else {
             self.status = NO_TRACE_STATUS.to_string();
@@ -2147,16 +2334,44 @@ impl App {
 
     fn render_messages(&self, lines: &mut Vec<String>, width: usize, height: usize) {
         let indices = &self.filtered;
-        let split = (width * 43 / 100).max(24).min(width.saturating_sub(3));
+        // Bus views need wider columns than the mixed view.
+        let list_share = if self.view.is_all() { 43 } else { 55 };
+        let split = (width * list_share / 100)
+            .max(24)
+            .min(width.saturating_sub(3));
         let preview_width = width.saturating_sub(split + 3);
+        let view = self.view;
+        let foreign_hidden = !self.show_foreign;
         lines.push(paint_bold(
             two_column(
-                &format!("Messages ({}/{})", indices.len(), self.summaries.len()),
+                &format!(
+                    "Messages ({}/{})  view={}{}",
+                    indices.len(),
+                    self.summaries.len(),
+                    view.label(),
+                    if foreign_hidden {
+                        "  foreign=hidden"
+                    } else {
+                        ""
+                    }
+                ),
                 "Preview",
                 split,
                 width,
             ),
             ANSI_BRIGHT_CYAN,
+        ));
+        // Column header for the current view; the selection marker keeps the
+        // alignment with the rows below.
+        lines.push(paint(
+            format!(
+                "  {}",
+                truncate_ansi(
+                    &view_header(view, split.saturating_sub(2)),
+                    split.saturating_sub(2)
+                )
+            ),
+            ANSI_CYAN,
         ));
         lines.push(paint(
             format!(
@@ -2192,11 +2407,25 @@ impl App {
                 .and_then(|index| self.summaries.get(*index));
             let left = summary
                 .map(|summary| {
-                    format!(
-                        "{}{}",
-                        if selected { "▶ " } else { "  " },
-                        summary_line(summary, self.time_axis(), &self.pool)
-                    )
+                    let pane = split.saturating_sub(2);
+                    if view.is_all() || view.owns(summary) {
+                        let row = view_row(summary, view, self.time_axis(), &self.pool, pane);
+                        format!(
+                            "{}{}",
+                            if selected { "▶ " } else { "  " },
+                            truncate(&row, pane)
+                        )
+                    } else {
+                        // A frame from another bus keeps the timing visible but
+                        // collapses into a single dim description.
+                        let text =
+                            truncate(&foreign_row(summary, self.time_axis(), &self.pool), pane);
+                        if selected {
+                            format!("▶ {text}")
+                        } else {
+                            format!("\x1b[2m  {text}{ANSI_RESET}")
+                        }
+                    }
                 })
                 .unwrap_or_default();
             let right = preview.get(row).cloned().unwrap_or_default();
@@ -2369,7 +2598,10 @@ impl App {
             ),
             ANSI_BRIGHT_CYAN,
         ));
-        lines.push(paint(stat_header_row(width), ANSI_BRIGHT_CYAN));
+        lines.push(paint(
+            stat_header_row(width, stat_unit(&self.stats, self.view)),
+            ANSI_BRIGHT_CYAN,
+        ));
         lines.push(paint("─".repeat(width), ANSI_CYAN));
         if self.stats.is_empty() {
             lines.push(paint(
@@ -3702,6 +3934,15 @@ fn field_value(value: &FieldValue) -> String {
     }
 }
 
+/// `<trace>.pcapng` next to the trace, so Wireshark can open it directly.
+fn export_pcap_path(trace: &Path) -> PathBuf {
+    let name = trace.file_name().map_or_else(
+        || "trace".to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    trace.with_file_name(format!("{name}.pcapng"))
+}
+
 fn export_path(trace: &Path) -> PathBuf {
     let name = trace.file_name().map_or_else(
         || "trace".to_string(),
@@ -3934,6 +4175,171 @@ fn structured_frame_hints(object: &Object) -> (Option<u16>, Option<&'static str>
         }
     }
     (channel, direction)
+}
+
+/// Column header of the current view, or empty when the view has no columns.
+fn view_header(view: View, width: usize) -> String {
+    match view {
+        View::All => format!(
+            "{:>12} {:<3} {:>3} {:<6} {:<3}  {}",
+            "time", "bus", "ch", "id", "dir", "data"
+        ),
+        View::Can => format!(
+            "{:>12} {:>3} {:<6} {:<3} {:>3}  {}",
+            "time", "ch", "id", "dir", "dlc", "data"
+        ),
+        View::Lin => format!(
+            "{:>12} {:>3} {:<6} {:<3} {:>3} {:<8}  {}",
+            "time", "ch", "id", "dir", "dlc", "crc", "data"
+        ),
+        View::Ethernet => {
+            if width >= 108 {
+                format!(
+                    "{:>12} {:>3} {:<7} {:<9} {:<5} {:<17} {:<17}  {}",
+                    "time", "ch", "type", "proto", "vlan", "source", "destination", "info"
+                )
+            } else {
+                format!(
+                    "{:>12} {:>3} {:<7} {:<9} {:<5}  {}",
+                    "time", "ch", "type", "proto", "vlan", "info"
+                )
+            }
+        }
+    }
+}
+
+/// One frame rendered in the columns of `view`.
+fn view_row(
+    summary: &MessageSummary,
+    view: View,
+    axis: TimeAxis,
+    pool: &TextPool,
+    width: usize,
+) -> String {
+    let time = axis.format(summary.timestamp_ns);
+    let channel = summary
+        .channel
+        .map_or_else(|| "-".to_string(), |value| value.to_string());
+    match view {
+        View::All => summary_line(summary, axis, pool),
+        View::Can => format!(
+            "{time:>12} {channel:>3} {:<6} {:<3} {:>3}  {}",
+            summary
+                .frame_id
+                .map_or_else(|| "-".to_string(), |id| format!("0x{id:X}")),
+            summary.direction.unwrap_or("-"),
+            summary
+                .dlc
+                .map_or_else(|| "-".to_string(), |value| value.to_string()),
+            hex_bytes(&summary.payload)
+        ),
+        View::Lin => format!(
+            "{time:>12} {channel:>3} {:<6} {:<3} {:>3} {:<8}  {}",
+            summary
+                .frame_id
+                .map_or_else(|| "-".to_string(), |id| format!("0x{id:X}")),
+            summary.direction.unwrap_or("-"),
+            summary
+                .dlc
+                .map_or_else(|| "-".to_string(), |value| value.to_string()),
+            lin_crc_label(summary.status),
+            hex_bytes(&summary.payload)
+        ),
+        View::Ethernet => {
+            let Some(info) = &summary.ethernet else {
+                return summary_line(summary, axis, pool);
+            };
+            let summary_text = pool.get(info.summary);
+            let short = ethernet_info_text(summary_text, info.protocol);
+            let vlan = vlan_label(summary_text);
+            if width >= 108 {
+                format!(
+                    "{time:>12} {channel:>3} 0x{:04X}  {:<9} {:<5} {:<17} {:<17}  {short}",
+                    info.ether_type,
+                    info.protocol,
+                    vlan,
+                    ethernet_address(summary_text, 0),
+                    ethernet_address(summary_text, 1),
+                )
+            } else {
+                format!(
+                    "{time:>12} {channel:>3} 0x{:04X}  {:<9} {:<5}  {short}",
+                    info.ether_type, info.protocol, vlan
+                )
+            }
+        }
+    }
+}
+
+/// LIN checksum state, shown in its own column.
+fn lin_crc_label(status: &str) -> &'static str {
+    match status {
+        "response" => "ok",
+        "checksum_error" => "crc-err",
+        "parity_error" => "par-err",
+        "no_response" => "no-resp",
+        "header_only" => "hdr",
+        "send_error" => "tx-err",
+        "receive_error" => "rx-err",
+        _ => "-",
+    }
+}
+
+/// The part of an Ethernet summary that the columns do not already show.
+fn ethernet_info_text(summary: &str, protocol: &str) -> String {
+    let mut tokens: Vec<&str> = summary.split_whitespace().skip(3).collect();
+    // Tags and the protocol name have their own columns.
+    loop {
+        if tokens.first() == Some(&"VLAN") {
+            tokens.drain(..2);
+            continue;
+        }
+        if tokens.first() == Some(&protocol) {
+            tokens.drain(..1);
+            continue;
+        }
+        break;
+    }
+    tokens.join(" ")
+}
+
+/// VLAN identifier out of a summary such as `… VLAN 10 ARP 10.0.0.1 > …`.
+fn vlan_label(summary: &str) -> String {
+    let tokens: Vec<&str> = summary.split_whitespace().collect();
+    for (index, token) in tokens.iter().enumerate() {
+        if *token == "VLAN" {
+            return tokens.get(index + 1).copied().unwrap_or("-").to_string();
+        }
+    }
+    "-".to_string()
+}
+
+/// Source (index 0) or destination (index 1) address of a summary.
+fn ethernet_address(summary: &str, index: usize) -> String {
+    summary
+        .split_whitespace()
+        .nth(index)
+        .unwrap_or("-")
+        .to_string()
+}
+
+/// A dim one-line description of a frame that belongs to another bus.
+fn foreign_row(summary: &MessageSummary, axis: TimeAxis, pool: &TextPool) -> String {
+    let time = axis.format(summary.timestamp_ns);
+    let description = if let Some(info) = &summary.ethernet {
+        let text = pool.get(info.summary);
+        format!("eth 0x{:04X} {}", info.ether_type, short_summary(text))
+    } else {
+        format!(
+            "{} {} {}",
+            summary.bus_label,
+            summary
+                .frame_id
+                .map_or_else(|| "-".to_string(), |id| format!("0x{id:X}")),
+            hex_bytes(&summary.payload)
+        )
+    };
+    format!("{time:>12}  · {description}")
 }
 
 /// Drop the leading `source > destination` pair; the row shows addresses in
@@ -4204,12 +4610,25 @@ fn stat_columns(width: usize) -> usize {
     }
 }
 
-fn stat_header_row(width: usize) -> String {
+fn stat_header_row(width: usize, unit: &str) -> String {
     let columns = match stat_columns(width) {
-        4 => "ID       BUS CH     N   AVG(ms)  MIN(ms)  MAX(ms)  JIT(ms)",
-        _ => "ID       BUS CH     N   AVG(ms)",
+        4 => format!("ID       BUS CH     N   AVG({unit})  MIN({unit})  MAX({unit})  JIT({unit})"),
+        _ => format!("ID       BUS CH     N   AVG({unit})"),
     };
-    columns.to_string()
+    columns
+}
+
+/// Ethernet timing is reported in microseconds, CAN in milliseconds.
+fn stat_unit(stats: &[FrameStat], view: View) -> &'static str {
+    let ethernet = view == View::Ethernet
+        || stats
+            .iter()
+            .any(|stat| matches!(stat.key, FrameKey::Ethernet(..)));
+    if ethernet {
+        "us"
+    } else {
+        "ms"
+    }
 }
 
 fn stat_row(stat: &FrameStat, width: usize) -> String {
@@ -4224,13 +4643,21 @@ fn stat_row(stat: &FrameStat, width: usize) -> String {
         channel,
         stat.count
     );
+    // Ethernet rows use microseconds, which is where TSN jitter lives.
+    let scale = if matches!(stat.key, FrameKey::Ethernet(..)) {
+        1000.0
+    } else {
+        1.0
+    };
     if let Some(timing) = &stat.timing {
-        let _ = write!(row, " {:>8.3}", timing.avg_ms);
+        let _ = write!(row, " {:>8.3}", timing.avg_ms * scale);
         if stat_columns(width) >= 4 {
             let _ = write!(
                 row,
                 " {:>8.3} {:>8.3} {:>8.3}",
-                timing.min_ms, timing.max_ms, timing.jitter_ms
+                timing.min_ms * scale,
+                timing.max_ms * scale,
+                timing.jitter_ms * scale
             );
         }
     } else {
@@ -4645,7 +5072,7 @@ const fn binding(key: &'static str, description: &'static str) -> HelpEntry {
 fn mode_hint(mode: Mode) -> &'static str {
     match mode {
         Mode::Messages => {
-            "j/k move · Enter detail · / filter · t range · g goto · s stats · T time · ? help"
+            "j/k move · Enter detail · v view · / filter · t range · s stats · e export · ? help"
         }
         Mode::Detail => "j/k signal · p curve · T time · Esc back · ? help",
         Mode::Curve => "←/→ pan · +/- zoom · x remove signal · Esc back · ? help",
@@ -4673,6 +5100,9 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     binding("G", "jump to the last message"),
     binding("T", "switch timestamps between trace clock and first frame"),
     binding("] / [", "next / previous occurrence of the frame id"),
+    binding("v / 1 2 3 4", "switch view: ALL, CAN, LIN, ETHERNET"),
+    binding("H", "hide frames of other buses in this view"),
+    binding("P", "export the visible frames as pcapng"),
     binding("Esc", "clear the message filter and the time range"),
     binding("q", "quit"),
     heading("Detail (needs a trace)"),
@@ -6980,7 +7410,7 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
         assert!(narrow.contains("0x344"));
         assert!(narrow.contains("10.000"));
         assert!(!narrow.contains("0.012"));
-        assert!(stat_header_row(40).contains("AVG"));
+        assert!(stat_header_row(40, "ms").contains("AVG"));
 
         let single = FrameStat {
             key: FrameKey::Bus(BusKind::Lin, 3, 0x2f),
@@ -7529,6 +7959,99 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
             Some("11 22 33 44 55")
         );
         assert_eq!(message.len(), 8);
+    }
+
+    /// A message carrying one Ethernet frame, for view tests.
+    fn ethernet_summary(pool: &mut TextPool, timestamp: u64) -> MessageSummary {
+        let mut summary = summary_for(0, &ethernet_object(), pool);
+        summary.timestamp_ns = Some(timestamp);
+        summary
+    }
+
+    fn can_summary(pool: &mut TextPool, timestamp: u64) -> MessageSummary {
+        let object = can_message(0x7E0, &[0x03, 0x22, 0xF1, 0x90], timestamp);
+        let mut summary = summary_for(0, &object, pool);
+        summary.timestamp_ns = Some(timestamp);
+        summary
+    }
+
+    #[test]
+    fn views_own_their_bus_and_skip_the_others() {
+        let mut pool = TextPool::default();
+        let can = can_summary(&mut pool, 1_000);
+        let eth = ethernet_summary(&mut pool, 2_000);
+        assert!(View::All.owns(&can) && View::All.owns(&eth));
+        assert!(View::Can.owns(&can) && !View::Can.owns(&eth));
+        assert!(View::Ethernet.owns(&eth) && !View::Ethernet.owns(&can));
+        assert!(!View::Lin.owns(&can) && !View::Lin.owns(&eth));
+        assert_eq!(View::All.cycle(), View::Can);
+        assert_eq!(View::Ethernet.cycle(), View::All);
+        assert_eq!(View::from_digit('4'), Some(View::Ethernet));
+        assert_eq!(View::from_digit('9'), None);
+    }
+
+    #[test]
+    fn each_view_renders_its_own_columns() {
+        let mut pool = TextPool::default();
+        let can = can_summary(&mut pool, 1_000);
+        let eth = ethernet_summary(&mut pool, 2_000);
+        let axis = TimeAxis {
+            mode: TimeMode::Absolute,
+            base: 0,
+        };
+        let can_row = view_row(&can, View::Can, axis, &pool, 120);
+        assert!(can_row.contains("0x7E0"), "{can_row}");
+        assert!(can_row.contains("03 22 F1 90"), "{can_row}");
+
+        let eth_row = view_row(&eth, View::Ethernet, axis, &pool, 120);
+        assert!(eth_row.contains("0x0800"), "{eth_row}");
+        assert!(eth_row.contains("UDP"), "{eth_row}");
+        // The info column no longer repeats the protocol name.
+        let info = ethernet_info_text(
+            pool.get(eth.ethernet.as_ref().expect("ethernet").summary),
+            "UDP",
+        );
+        assert!(!info.starts_with("UDP"), "{info}");
+
+        // A foreign frame collapses into one dim description.
+        let foreign = foreign_row(&eth, axis, &pool);
+        assert!(foreign.contains("eth 0x0800"), "{foreign}");
+        let foreign = foreign_row(&can, axis, &pool);
+        assert!(foreign.contains("can 0x7E0"), "{foreign}");
+    }
+
+    #[test]
+    fn hiding_foreign_frames_narrows_the_list_to_the_view() {
+        let mut pool = TextPool::default();
+        let objects = vec![
+            can_message(0x7E0, &[0x01], 1_000_000),
+            ethernet_object(),
+            can_message(0x7E1, &[0x02], 2_000_000),
+        ];
+        let mut app = App::new(None, objects, Vec::new()).expect("build app");
+        app.summaries = app
+            .objects
+            .iter()
+            .enumerate()
+            .map(|(index, object)| summary_for(index, object, &mut pool))
+            .collect();
+        app.rebuild_filtered();
+        assert_eq!(app.filtered.len(), 3);
+
+        app.set_view(View::Can);
+        // Foreign frames stay as dim descriptions by default.
+        assert_eq!(app.filtered.len(), 3);
+        app.toggle_foreign();
+        assert_eq!(app.filtered.len(), 2);
+        assert!(app
+            .filtered
+            .iter()
+            .all(|index| app.summaries[*index].bus == Some(BusKind::Can)));
+
+        // Switching views keeps working with the narrowed list.
+        app.set_view(View::Ethernet);
+        assert_eq!(app.filtered.len(), 1);
+        assert!(app.summaries[app.filtered[0]].ethernet.is_some());
     }
 
     #[test]
