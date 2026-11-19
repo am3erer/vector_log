@@ -46,11 +46,13 @@ pub use transport::{
     LIN_MASTER_REQUEST, LIN_SLAVE_RESPONSE,
 };
 pub use types::{
-    AppText, CanErrorFrame, CanErrorFrameExt, CanFdErrorFrame64, CanFdExtFrameData, CanFdMessage,
-    CanFdMessage64, CanMessage, CanMessage2, FieldValue, FileStatistics, LinObject, Object,
-    ObjectHeader, ObjectHeader2, ObjectHeaderBase, ObjectHeaderInfo, ObjectType, RawObject,
-    RawObjectHeader, RestorePoint, RestorePointContainer, RestorePoints, StructuredObject,
-    SystemTime, VarObjectHeader, FILE_SIGNATURE, OBJECT_SIGNATURE,
+    ethernet_clock_mode_name, ethernet_connector_name, ethernet_duplex_name,
+    ethernet_link_status_name, ethernet_mdi_name, ethernet_pairs_name, ethernet_phy_event_name,
+    ethernet_phy_state_name, ethernet_phy_type_name, AppText, CanErrorFrame, CanErrorFrameExt,
+    CanFdErrorFrame64, CanFdExtFrameData, CanFdMessage, CanFdMessage64, CanMessage, CanMessage2,
+    FieldValue, FileStatistics, LinObject, Object, ObjectHeader, ObjectHeader2, ObjectHeaderBase,
+    ObjectHeaderInfo, ObjectType, RawObject, RawObjectHeader, RestorePoint, RestorePointContainer,
+    RestorePoints, StructuredObject, SystemTime, VarObjectHeader, FILE_SIGNATURE, OBJECT_SIGNATURE,
 };
 pub use uds::{
     decode_isotp, decode_isotp_single, decode_uds, negative_response_name, service_name,

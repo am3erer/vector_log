@@ -1623,8 +1623,16 @@ fn structured_schema(object_type: ObjectType) -> &'static [FieldSpec] {
             U8("pairs"),
             U8("hardwareChannel"),
             U32("bitrate"),
+            U64("linkUpDuration"),
         ],
         ObjectType::AfdxStatus => afdx_status_schema(),
+        ObjectType::EthernetPhyState => &[
+            U16("channel"),
+            U16("flags"),
+            U8("phyState"),
+            U8("phyEvent"),
+            U8("hardwareChannel"),
+        ],
         ObjectType::AfdxBusStatistic => afdx_bus_statistic_schema(),
         ObjectType::AfdxErrorEvent => &[
             U16("channel"),

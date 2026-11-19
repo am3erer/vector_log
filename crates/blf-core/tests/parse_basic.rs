@@ -1045,3 +1045,97 @@ fn rejects_huge_serial_timestamp_length_without_allocating() {
     let mut reader = File::open(&path).unwrap();
     assert!(matches!(reader.read(), Err(blf_core::BlfError::Truncated)));
 }
+
+/// `VBLEthernetStatus` body as logged by CANoe: channel, flags, the six
+/// eight-bit port attributes, bitrate and the link-up duration.
+fn ethernet_status() -> Vec<u8> {
+    let mut object = object_header(103, 56, 700);
+    push_u16(&mut object, 4);
+    push_u16(&mut object, 0x01CF);
+    object.extend_from_slice(&[2, 2, 2, 0, 0, 2, 1, 12]);
+    push_u32(&mut object, 100_000);
+    push_u64(&mut object, 0);
+    assert_eq!(object.len(), 56);
+    object
+}
+
+/// `VBLEthernetPhyState`: channel, flags, state, event, hardware channel.
+fn ethernet_phy_state() -> Vec<u8> {
+    let mut object = object_header(133, 40, 800);
+    push_u16(&mut object, 4);
+    push_u16(&mut object, 0x0007);
+    object.extend_from_slice(&[1, 8, 12]);
+    // Vector pads the object to 40 bytes: 32-octet header plus eight.
+    object.push(0);
+    assert_eq!(object.len(), 40);
+    object
+}
+
+#[test]
+fn parses_ethernet_status_and_phy_state() {
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("ethernet-status.blf");
+    let mut inner = ethernet_status();
+    inner.extend_from_slice(&ethernet_phy_state());
+    write_blf_with_inner(&path, &inner, 2);
+
+    let mut reader = File::open(&path).unwrap();
+
+    let status = reader.read().unwrap().unwrap();
+    assert_eq!(status.object_type(), ObjectType::EthernetStatus);
+    let Object::Structured(status) = status else {
+        panic!("expected a structured status object");
+    };
+    let field = |name: &str| {
+        status
+            .fields
+            .iter()
+            .find(|(field, _)| field == name)
+            .map(|(_, value)| value.clone())
+    };
+    assert_eq!(field("channel"), Some(blf_core::FieldValue::U16(4)));
+    assert_eq!(field("linkStatus"), Some(blf_core::FieldValue::U8(2)));
+    assert_eq!(field("ethernetPhy"), Some(blf_core::FieldValue::U8(2)));
+    assert_eq!(field("hardwareChannel"), Some(blf_core::FieldValue::U8(12)));
+    assert_eq!(field("bitrate"), Some(blf_core::FieldValue::U32(100_000)));
+    // The link-up duration is the field newer logs append, so it must be parsed
+    // here rather than left in the extension bytes.
+    assert_eq!(field("linkUpDuration"), Some(blf_core::FieldValue::U64(0)));
+    assert!(status.extensions.is_empty());
+
+    let phy = reader.read().unwrap().unwrap();
+    assert_eq!(phy.object_type(), ObjectType::EthernetPhyState);
+    let Object::Structured(phy) = phy else {
+        panic!("expected a structured PHY state object");
+    };
+    let field = |name: &str| {
+        phy.fields
+            .iter()
+            .find(|(field, _)| field == name)
+            .map(|(_, value)| value.clone())
+    };
+    assert_eq!(field("channel"), Some(blf_core::FieldValue::U16(4)));
+    assert_eq!(field("flags"), Some(blf_core::FieldValue::U16(7)));
+    assert_eq!(field("phyState"), Some(blf_core::FieldValue::U8(1)));
+    assert_eq!(field("phyEvent"), Some(blf_core::FieldValue::U8(8)));
+    assert_eq!(field("hardwareChannel"), Some(blf_core::FieldValue::U8(12)));
+    assert!(reader.read().unwrap().is_none());
+}
+
+#[test]
+fn ethernet_status_values_have_names() {
+    assert_eq!(blf_core::ethernet_link_status_name(2), "link up");
+    assert_eq!(blf_core::ethernet_link_status_name(1), "link down");
+    assert_eq!(blf_core::ethernet_phy_type_name(2), "100BASE-T1 (OABR)");
+    assert_eq!(blf_core::ethernet_duplex_name(2), "full duplex");
+    assert_eq!(blf_core::ethernet_clock_mode_name(2), "slave");
+    assert_eq!(blf_core::ethernet_pairs_name(1), "one pair");
+    assert_eq!(blf_core::ethernet_phy_state_name(1), "normal state");
+    assert_eq!(blf_core::ethernet_phy_state_name(2), "sleep state");
+    assert_eq!(blf_core::ethernet_phy_event_name(8), "wakeup received");
+    assert_eq!(blf_core::ethernet_phy_event_name(4), "sleep ack received");
+    // Values the document does not define stay recognisable.
+    assert_eq!(blf_core::ethernet_phy_type_name(4), "other");
+    assert_eq!(blf_core::ethernet_phy_state_name(9), "reserved");
+}

@@ -26,6 +26,13 @@ diagnostic objects, including:
   ICMP/ICMPv6, TCP, UDP. Applications: SOME/IP, DoIP, DHCP, DNS, PTP/gPTP
   (802.1AS bodies plus organizationally specific TLVs), LLDP, and UDS
   (ISO 14229) inside DoIP diagnostic messages.
+- Port status is decoded too: `EthernetStatus` (`link up`/`link down`, bitrate,
+  PHY type such as `100BASE-T1 (OABR)`, duplex, MDI, connector, clock mode,
+  pairs, link-up duration) and `EthernetPhyState` (`normal`/`sleep`/`power off`
+  state with its event, `wakeup received`, `sleep ack received`, ...). Both
+  appear in the Ethernet view with their channel and hardware channel, for
+  example `ch 4.12 · PHY normal state · wakeup received`, and their values keep
+  the names from the BLF Ethernet format document.
 - Parsing a whole capture stays cheap: the load pass keeps only a summary and a
   per-flow interned search text, and the detail pane dissects the selected
   frame again. A 200 000-frame Ethernet capture loads in about 0.7 s and holds

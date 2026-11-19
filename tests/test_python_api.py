@@ -227,6 +227,17 @@ def _ethernet_frame_object(source, destination, ether_type, payload, timestamp, 
     return header + body + b"\0" * ((-32 - len(body)) % 4)
 
 
+def _write_objects(path, inner, count):
+    """Wrap already-encoded objects in a container and a file header."""
+    container_size = 32 + len(inner)
+    container = struct.pack(
+        "<IHHIIHHIII", 0x4A424F4C, 16, 1, container_size, 10, 0, 0, 0, len(inner), 0
+    )
+    container += inner
+    container += b"\0" * (container_size % 4)
+    path.write_bytes(_file_statistics(len(inner), count) + container)
+
+
 def _write_ethernet_blf(path):
     arp = bytes.fromhex("0001080006040001" "020000000001" "0a000001" "000000000000" "0a000002")
     someip = bytes.fromhex("1234567800000010" "abcd0001" "01010000" "deadbeef")
@@ -1650,3 +1661,52 @@ def test_reassembler_reports_a_sequence_gap():
     assert outcome["state"] == "desync"
     assert outcome["expectedSequence"] == 1
     assert outcome["actualSequence"] == 5
+
+def test_ethernet_status_and_phy_state_fields(tmp_path):
+    """The two CANoe Ethernet events keep their documented fields."""
+    inner = bytearray()
+
+    # VBLEthernetStatus: channel 4, flags 0x01CF, link up, 100BASE-T1, full
+    # duplex, slave clock, one pair, hardware channel 12, 100 Mbit/s.
+    status = bytearray(
+        struct.pack("<IHHIIIHHQ", 0x4A424F4C, 32, 1, 56, 103, 2, 0, 0, 700)
+    )
+    status += struct.pack("<HH", 4, 0x01CF)
+    status += bytes([2, 2, 2, 0, 0, 2, 1, 12])
+    status += struct.pack("<IQ", 100_000, 0)
+    assert len(status) == 56
+    inner += status
+
+    # VBLEthernetPhyState: channel 4, flags 7, normal state, wakeup received.
+    phy = bytearray(
+        struct.pack("<IHHIIIHHQ", 0x4A424F4C, 32, 1, 40, 133, 2, 0, 0, 800)
+    )
+    phy += struct.pack("<HH", 4, 7)
+    phy += bytes([1, 8, 12, 0])
+    assert len(phy) == 40
+    inner += phy
+
+    path = tmp_path / "ethernet-status.blf"
+    _write_objects(path, bytes(inner), 2)
+
+    with open(str(path)) as reader:
+        objects = list(reader)
+
+    assert [type(obj).__name__ for obj in objects] == ["EthernetStatus", "EthernetPhyState"]
+
+    status = objects[0].fields
+    assert status["channel"] == 4
+    assert status["linkStatus"] == 2
+    assert status["ethernetPhy"] == 2
+    assert status["duplex"] == 2
+    assert status["clockMode"] == 2
+    assert status["pairs"] == 1
+    assert status["hardwareChannel"] == 12
+    assert status["bitrate"] == 100_000
+    assert status["linkUpDuration"] == 0
+
+    phy = objects[1].fields
+    assert phy["channel"] == 4
+    assert phy["phyState"] == 1
+    assert phy["phyEvent"] == 8
+    assert phy["hardwareChannel"] == 12

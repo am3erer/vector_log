@@ -138,6 +138,9 @@ pub enum ObjectType {
     CanSettingChanged = 129,
     DistributedObjectMember = 130,
     AttributeEvent = 131,
+    /// Ethernet PHY state event, `VBLEthernetPhyState`; the value is not in the
+    /// public document, it was confirmed against a captured log.
+    EthernetPhyState = 133,
 }
 
 impl ObjectType {
@@ -274,6 +277,7 @@ impl ObjectType {
             129 => Self::CanSettingChanged,
             130 => Self::DistributedObjectMember,
             131 => Self::AttributeEvent,
+            133 => Self::EthernetPhyState,
             _ => Self::Unknown,
         }
     }
@@ -413,6 +417,7 @@ pub fn object_type_name(value: u32) -> &'static str {
         129 => "CanSettingChanged",
         130 => "DistributedObjectMember",
         131 => "AttributeEvent",
+        133 => "EthernetPhyState",
         _ => "UnknownObject",
     }
 }
@@ -734,7 +739,105 @@ pub enum Object {
     Raw(RawObject),
 }
 
-/// The fields every BLF object header carries, whatever its shape.
+/// Link state of an Ethernet port, from `VBLEthernetStatus::mLinkStatus`.
+pub fn ethernet_link_status_name(value: u8) -> &'static str {
+    match value {
+        0 => "unknown",
+        1 => "link down",
+        2 => "link up",
+        3 => "negotiate",
+        4 => "link error",
+        _ => "reserved",
+    }
+}
+
+/// Physical layer of an Ethernet port, from `VBLEthernetStatus::mEthernetPhy`.
+pub fn ethernet_phy_type_name(value: u8) -> &'static str {
+    match value {
+        0 => "unknown",
+        1 => "100BASE-TX/1000BASE-T",
+        2 => "100BASE-T1 (OABR)",
+        // Newer firmware reports further types; keep the raw value visible.
+        _ => "other",
+    }
+}
+
+pub fn ethernet_duplex_name(value: u8) -> &'static str {
+    match value {
+        0 => "unknown",
+        1 => "half duplex",
+        2 => "full duplex",
+        _ => "reserved",
+    }
+}
+
+pub fn ethernet_mdi_name(value: u8) -> &'static str {
+    match value {
+        0 => "unknown",
+        1 => "direct",
+        2 => "crossover",
+        _ => "reserved",
+    }
+}
+
+pub fn ethernet_connector_name(value: u8) -> &'static str {
+    match value {
+        0 => "unknown",
+        1 => "RJ45",
+        2 => "D-Sub",
+        _ => "reserved",
+    }
+}
+
+pub fn ethernet_clock_mode_name(value: u8) -> &'static str {
+    match value {
+        0 => "unknown",
+        1 => "master",
+        2 => "slave",
+        _ => "reserved",
+    }
+}
+
+pub fn ethernet_pairs_name(value: u8) -> &'static str {
+    match value {
+        0 => "unknown",
+        1 => "one pair",
+        2 => "two pairs",
+        3 => "four pairs",
+        _ => "reserved",
+    }
+}
+
+/// PHY power state, from `VBLEthernetPhyState::mPhyState`.
+pub fn ethernet_phy_state_name(value: u8) -> &'static str {
+    match value {
+        0 => "invalid state",
+        1 => "normal state",
+        2 => "sleep state",
+        3 => "power off state",
+        4 => "sleep request",
+        _ => "reserved",
+    }
+}
+
+/// PHY transition, from `VBLEthernetPhyState::mPhyEvent`.
+pub fn ethernet_phy_event_name(value: u8) -> &'static str {
+    match value {
+        0 => "invalid event",
+        1 => "sleep received",
+        2 => "sleep sent",
+        3 => "sleep abort",
+        4 => "sleep ack received",
+        8 => "wakeup received",
+        9 => "wakeup sent",
+        17 => "power off",
+        18 => "power on",
+        25 => "activated",
+        _ => "reserved",
+    }
+}
+
+/// The fields every BLF object header carries, whatever its shape./// The fields every BLF object header carries, whatever its shape.
 ///
 /// BLF uses four header layouts (`ObjectHeader`, `ObjectHeader2`,
 /// `VarObjectHeader` and a bare base header); this flattening lets a caller

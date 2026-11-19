@@ -126,6 +126,8 @@ struct MessageSummary {
     /// Bus name for the list column; Ethernet and events are not `BusKind`s.
     bus_label: &'static str,
     ethernet: Option<EthernetInfo>,
+    /// Status or PHY-state event of an Ethernet port.
+    ethernet_event: Option<EthernetEvent>,
     channel: Option<u16>,
     frame_id: Option<u32>,
     object_type_raw: u32,
@@ -194,7 +196,7 @@ impl View {
             Self::All => true,
             Self::Can => summary.bus == Some(BusKind::Can),
             Self::Lin => summary.bus == Some(BusKind::Lin),
-            Self::Ethernet => summary.ethernet.is_some(),
+            Self::Ethernet => summary.bus_label == "eth",
         }
     }
 
@@ -3760,12 +3762,14 @@ fn summary_for(object_index: usize, object: &Object, pool: &mut TextPool) -> Mes
         _ => "event",
     };
     let ethernet = ethernet_info(object, pool);
+    let ethernet_event = ethernet_event(object);
     let (hint_channel, hint_direction) = structured_frame_hints(object);
     let direction = direction.or(hint_direction);
-    let (bus_label, channel, frame_id) = match (&ethernet, bus) {
-        (Some(info), _) => ("eth", hint_channel, Some(u32::from(info.ether_type))),
-        (None, Some(bus)) => (bus.as_str(), channel, frame_id),
-        (None, None) => ("-", channel, frame_id),
+    let (bus_label, channel, frame_id) = match (&ethernet, &ethernet_event, bus) {
+        (Some(info), _, _) => ("eth", hint_channel, Some(u32::from(info.ether_type))),
+        (None, Some(_), _) => ("eth", hint_channel, None),
+        (None, None, Some(bus)) => (bus.as_str(), channel, frame_id),
+        (None, None, None) => ("-", channel, frame_id),
     };
     MessageSummary {
         object_index,
@@ -3774,6 +3778,7 @@ fn summary_for(object_index: usize, object: &Object, pool: &mut TextPool) -> Mes
         bus,
         bus_label,
         ethernet,
+        ethernet_event,
         channel,
         frame_id,
         object_type_raw: object.object_type_raw(),
@@ -3925,6 +3930,9 @@ fn summary_detail_lines(
             .channel
             .map_or_else(|| "-".to_string(), |value| value.to_string())
     ));
+    if let Some(event) = &summary.ethernet_event {
+        lines.push(format!("id: -  event: {}", event.summary));
+    }
     match &summary.ethernet {
         Some(info) => {
             lines.push(format!(
@@ -4240,6 +4248,92 @@ fn ethernet_info(object: &Object, pool: &mut TextPool) -> Option<EthernetInfo> {
     })
 }
 
+/// An Ethernet status or PHY-state event, summarised for the list.
+#[derive(Debug, Clone)]
+struct EthernetEvent {
+    /// One line such as `ch 4.12 link up, 100 Mbit/s`.
+    summary: String,
+    /// Lowercased words the message filter can match.
+    search: String,
+}
+
+/// Build the summary of `VBLEthernetStatus` and `VBLEthernetPhyState`.
+fn ethernet_event(object: &Object) -> Option<EthernetEvent> {
+    let Object::Structured(value) = object else {
+        return None;
+    };
+    let field = |name: &str| -> Option<u64> {
+        value.fields.iter().find_map(|(field, value)| {
+            if field != name {
+                return None;
+            }
+            match value {
+                FieldValue::U8(number) => Some(u64::from(*number)),
+                FieldValue::U16(number) => Some(u64::from(*number)),
+                FieldValue::U32(number) => Some(u64::from(*number)),
+                FieldValue::U64(number) => Some(*number),
+                _ => None,
+            }
+        })
+    };
+    let channel = field("channel").unwrap_or(0);
+    let hardware = field("hardwareChannel").unwrap_or(0);
+    let where_ = if hardware > 0 {
+        format!("ch {channel}.{hardware}")
+    } else {
+        format!("ch {channel}")
+    };
+    let mut parts = vec![where_];
+    match value.object_type {
+        blf_core::ObjectType::EthernetStatus => {
+            let mut detail = Vec::new();
+            if let Some(link) = field("linkStatus") {
+                let name = blf_core::ethernet_link_status_name(link as u8);
+                detail.push(name.to_string());
+                if link == 2 {
+                    if let Some(bitrate) = field("bitrate") {
+                        detail.push(format!("{} Mbit/s", bitrate / 1000));
+                    }
+                }
+            }
+            if let Some(phy) = field("ethernetPhy") {
+                detail.push(blf_core::ethernet_phy_type_name(phy as u8).to_string());
+            }
+            if let Some(duplex) = field("duplex") {
+                let name = blf_core::ethernet_duplex_name(duplex as u8);
+                if name != "unknown" {
+                    detail.push(name.to_string());
+                }
+            }
+            if let Some(mode) = field("clockMode") {
+                let name = blf_core::ethernet_clock_mode_name(mode as u8);
+                if name != "unknown" {
+                    detail.push(format!("clock {name}"));
+                }
+            }
+            parts.extend(detail);
+        }
+        blf_core::ObjectType::EthernetPhyState => {
+            if let Some(state) = field("phyState") {
+                parts.push(format!(
+                    "PHY {}",
+                    blf_core::ethernet_phy_state_name(state as u8)
+                ));
+            }
+            if let Some(event) = field("phyEvent") {
+                let name = blf_core::ethernet_phy_event_name(event as u8);
+                if name != "invalid event" {
+                    parts.push(name.to_string());
+                }
+            }
+        }
+        _ => return None,
+    }
+    let summary = parts.join(" · ");
+    let search = summary.to_lowercase();
+    Some(EthernetEvent { summary, search })
+}
+
 /// The channel and direction a structured frame reports.
 ///
 /// One pass over the field list, because a trace can hold millions of frames.
@@ -4389,6 +4483,20 @@ fn inspector_lines(
     }
 
     if let Some(object) = object {
+        if summary.ethernet.is_none() {
+            let fields = object_fields(object);
+            if !fields.is_empty() {
+                lines.push("fields".to_string());
+                for (name, value) in fields {
+                    lines.push(format!("  {name:<14} {value}"));
+                }
+            }
+            // The enum names the values, so the raw numbers stay readable.
+            if let Some(event) = &summary.ethernet_event {
+                lines.push("event".to_string());
+                lines.push(format!("  {}", event.summary));
+            }
+        }
         let extensions = object_extensions(object);
         if !extensions.is_empty() {
             lines.push("extensions".to_string());
@@ -4531,6 +4639,13 @@ fn view_row(
         ),
         View::Ethernet => {
             let Some(info) = &summary.ethernet else {
+                if let Some(event) = &summary.ethernet_event {
+                    // Port status events have no EtherType; keep the event text.
+                    return format!(
+                        "{time:>12} {channel:>3} {:<7} {:<9} {:<5}  {}",
+                        "-", "event", "-", event.summary
+                    );
+                }
                 return summary_line(summary, axis, pool);
             };
             let summary_text = pool.get(info.summary);
@@ -4992,6 +5107,10 @@ fn summary_matches_in(
         buffer.push_str(info.protocol);
         buffer.push(' ');
         buffer.push_str(pool.get(info.search));
+        buffer.push(' ');
+    }
+    if let Some(event) = &summary.ethernet_event {
+        buffer.push_str(&event.search);
         buffer.push(' ');
     }
     buffer.push_str(summary.status);
@@ -7417,6 +7536,7 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
             bus: Some(BusKind::Can),
             bus_label: "can",
             ethernet: None,
+            ethernet_event: None,
             channel: Some(1),
             frame_id: Some(0x123),
             object_type_raw: 1,
@@ -7571,6 +7691,7 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
             bus: Some(BusKind::Can),
             bus_label: "can",
             ethernet: None,
+            ethernet_event: None,
             channel: Some(1),
             frame_id: Some(0x344),
             object_type_raw: 1,
@@ -7606,6 +7727,7 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
             bus: Some(bus),
             bus_label: bus.as_str(),
             ethernet: None,
+            ethernet_event: None,
             channel: Some(channel),
             frame_id: Some(frame_id),
             object_type_raw: 101,
@@ -8284,6 +8406,95 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
         assert_eq!(app.mode, Mode::Messages);
     }
 
+    fn phy_state_object(payload: &[u8]) -> Object {
+        use blf_core::{
+            FieldValue, ObjectHeader, ObjectHeaderBase, ObjectType, RawObjectHeader,
+            StructuredObject,
+        };
+        // channel, flags, phyState, phyEvent, hardwareChannel
+        let ch = u16::from_le_bytes([payload[0], payload[1]]);
+        let flags = u16::from_le_bytes([payload[2], payload[3]]);
+        Object::Structured(StructuredObject {
+            object_type: ObjectType::EthernetPhyState,
+            header: RawObjectHeader::Object(ObjectHeader {
+                base: ObjectHeaderBase {
+                    signature: blf_core::OBJECT_SIGNATURE,
+                    header_size: 32,
+                    header_version: 1,
+                    object_size: 40,
+                    object_type: ObjectType::EthernetPhyState,
+                    raw_object_type: 133,
+                },
+                object_flags: 2,
+                client_index: 0,
+                object_version: 0,
+                object_time_stamp: 5_000_000,
+            }),
+            class_name: "EthernetPhyState".to_string(),
+            fields: vec![
+                ("channel".to_string(), FieldValue::U16(ch)),
+                ("flags".to_string(), FieldValue::U16(flags)),
+                ("phyState".to_string(), FieldValue::U8(payload[4])),
+                ("phyEvent".to_string(), FieldValue::U8(payload[5])),
+                ("hardwareChannel".to_string(), FieldValue::U8(payload[6])),
+            ],
+            extensions: Vec::new(),
+            data: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn phy_state_events_join_the_ethernet_view() {
+        // channel 4, flags 7, normal state, wakeup received, hardware channel 12.
+        let object = phy_state_object(&[0x04, 0x00, 0x07, 0x00, 0x01, 0x08, 0x0C]);
+        let mut pool = TextPool::default();
+        let summary = summary_for(0, &object, &mut pool);
+        assert_eq!(summary.class_name, "EthernetPhyState");
+        assert_eq!(summary.bus_label, "eth");
+        assert_eq!(summary.channel, Some(4));
+        let event = summary.ethernet_event.as_ref().expect("event summary");
+        assert_eq!(
+            event.summary,
+            "ch 4.12 · PHY normal state · wakeup received"
+        );
+        assert!(View::Ethernet.owns(&summary));
+        assert!(!View::Can.owns(&summary));
+
+        let axis = TimeAxis {
+            mode: TimeMode::Absolute,
+            base: 0,
+        };
+        let row = view_row(&summary, View::Ethernet, axis, &pool, 120);
+        assert!(row.contains("PHY normal state"), "{row}");
+        let mut buffer = String::new();
+        assert!(summary_matches_in(&summary, "wakeup", &mut buffer, &pool));
+        assert!(summary_matches_in(&summary, "4.12", &mut buffer, &pool));
+
+        // The detail pane and the inspector list every field.
+        let lines = summary_detail_lines(&summary, Some(&object), axis, None, &pool);
+        assert!(
+            lines.iter().any(|line| line.contains("PHY normal state")),
+            "{lines:?}"
+        );
+        let lines = inspector_lines(&summary, Some(&object), axis, None, &pool, 0, 1);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.trim().starts_with("phyEvent") && line.trim().ends_with('8')),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.trim().starts_with("hardwareChannel")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("wakeup received")),
+            "{lines:?}"
+        );
+    }
+
     #[test]
     fn views_own_their_bus_and_skip_the_others() {
         let mut pool = TextPool::default();
@@ -8438,6 +8649,7 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
             bus: Some(BusKind::Can),
             bus_label: "can",
             ethernet: None,
+            ethernet_event: None,
             channel: Some(1),
             frame_id: Some(0x344),
             object_type_raw: 1,
