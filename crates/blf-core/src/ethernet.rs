@@ -1943,3 +1943,43 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod table_coverage {
+    use super::*;
+
+    /// The protocol tables answer for every byte a capture can hold.
+    #[test]
+    fn protocol_name_tables_cover_every_byte() {
+        for value in 0..=255u8 {
+            assert!(!ip_protocol_name(value).is_empty(), "ip proto {value}");
+            assert!(!dhcp_message_name(value).is_empty(), "dhcp {value}");
+            assert!(!edsa_code_name(value).is_empty(), "edsa {value}");
+            assert!(!ether_type_name(u16::from(value)).is_empty());
+            let kind = value;
+            for code in 0..=255u8 {
+                assert!(!icmp_name("icmp", kind, code).is_empty());
+                assert!(!icmp_name("icmpv6", kind, code).is_empty());
+            }
+        }
+        for value in 0..=0xFFFFu16 {
+            if value % 977 != 0 {
+                continue;
+            }
+            assert!(!arp_opcode_name(value).is_empty(), "arp {value}");
+        }
+    }
+
+    /// Every UDS service the dissector can name must map to a protocol label.
+    #[test]
+    fn uds_services_map_to_protocol_labels() {
+        for service in 0u8..=0xFF {
+            let name = crate::uds::service_name(service);
+            if name == "unknown" {
+                continue;
+            }
+            let label = uds_protocol_name(name);
+            assert!(label.starts_with("UDS"), "{name} -> {label}");
+        }
+    }
+}

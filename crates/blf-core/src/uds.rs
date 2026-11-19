@@ -483,3 +483,203 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod service_coverage {
+    use super::*;
+
+    /// Every service the table names must decode without a panic, and every
+    /// other byte must still produce a usable message.
+    #[test]
+    fn every_service_byte_decodes() {
+        let mut named = 0;
+        let mut refused = 0;
+        for service in 0u8..=0xFF {
+            if service == 0x7F {
+                // A negative response needs a rejected service and a code.
+                assert!(decode_uds(&[0x7F, 0x22, 0x31]).is_some());
+                assert_eq!(decode_uds(&[0x7F]), None);
+                continue;
+            }
+            let payload = [service, 0x01, 0x02, 0x03];
+            match decode_uds(&payload) {
+                Some(message) => {
+                    assert_eq!(message.service, service);
+                    assert!(!message.service_name.is_empty());
+                    assert!(!message.summary().is_empty());
+                    assert!(!message.fields().is_empty());
+                    named += 1;
+                }
+                // Undocumented services are refused rather than guessed at.
+                None => refused += 1,
+            }
+        }
+        assert!(named >= 25, "only {named} services decoded");
+        assert!(refused >= 100, "only {refused} services refused");
+        assert_eq!(decode_uds(&[]), None);
+    }
+
+    #[test]
+    fn every_negative_response_code_has_a_name() {
+        let mut named = 0;
+        for code in 0u8..=0xFF {
+            let name = negative_response_name(code);
+            assert!(!name.is_empty());
+            if name != "unknown" {
+                named += 1;
+            }
+        }
+        assert!(named >= 20, "only {named} response codes named");
+    }
+
+    #[test]
+    fn summary_and_fields_cover_every_decoded_shape() {
+        // Sub-function with a documented name.
+        let mut message = decode_uds(&[0x31, 0x01, 0x02, 0x03]).expect("uds");
+        assert_eq!(message.service_name, "RoutineControl");
+        let summary = message.summary();
+        assert!(summary.contains("RoutineControl"), "{summary}");
+        let fields = message.fields();
+        assert!(fields.contains(&("serviceName".to_string(), "RoutineControl".to_string())));
+        // A payload without a data identifier keeps the field list short.
+        message.data_identifier = None;
+        message.sub_function = None;
+        assert!(!message.summary().is_empty());
+
+        // A negative response keeps the rejected service and the code name.
+        let negative = decode_uds(&[0x7F, 0x22, 0x31]).expect("uds");
+        assert!(negative.summary().contains("negative response"));
+        let fields = negative.fields();
+        assert!(fields.iter().any(|(name, _)| name == "nrc"));
+        assert!(fields.iter().any(|(name, _)| name == "negativeResponseTo"));
+
+        // A negative answer to an unknown service still names both sides.
+        assert_eq!(decode_uds(&[0x99, 0x00]), None);
+        let unknown_negative = decode_uds(&[0x7F, 0x99, 0xEE]).expect("uds");
+        assert!(unknown_negative.summary().contains("unknown"));
+    }
+
+    #[test]
+    fn sub_function_names_cover_the_documented_services() {
+        for (service, sub, expected) in [
+            (0x10u8, 0x01u8, "defaultSession"),
+            (0x11, 0x01, "hardReset"),
+            (0x27, 0x01, "requestSeed"),
+            (0x28, 0x00, "enableRxAndTx"),
+            (0x3E, 0x00, "zeroSubFunction"),
+            (0x85, 0x01, "on"),
+        ] {
+            let message = decode_uds(&[service, sub]).expect("uds");
+            assert_eq!(
+                message.sub_function_name,
+                Some(expected),
+                "service {service:#04X} sub {sub:#04X}"
+            );
+            // The response service carries the same sub-function.
+            let response = decode_uds(&[service + 0x40, sub]).expect("uds");
+            assert_eq!(response.sub_function_name, Some(expected));
+        }
+    }
+}
+
+#[cfg(test)]
+mod table_exhaustive {
+    use super::*;
+
+    /// Every documented sub-function of every service that defines one.
+    #[test]
+    fn sub_function_table_names_every_listed_value() {
+        let cases: Vec<(u8, u8, &str)> = vec![
+            (0x10, 0x01, "defaultSession"),
+            (0x10, 0x02, "programmingSession"),
+            (0x10, 0x03, "extendedDiagnosticSession"),
+            (0x10, 0x04, "safetySystemDiagnosticSession"),
+            (0x11, 0x01, "hardReset"),
+            (0x11, 0x02, "keyOffOnReset"),
+            (0x11, 0x03, "softReset"),
+            (0x11, 0x04, "enableRapidPowerShutDown"),
+            (0x11, 0x05, "disableRapidPowerShutDown"),
+            (0x27, 0x01, "requestSeed"),
+            (0x27, 0x02, "sendKey"),
+            (0x27, 0x03, "requestSeed (level 3)"),
+            (0x27, 0x04, "sendKey (level 3)"),
+            (0x28, 0x00, "enableRxAndTx"),
+            (0x28, 0x01, "enableRxAndDisableTx"),
+            (0x28, 0x02, "disableRxAndEnableTx"),
+            (0x28, 0x03, "disableRxAndTx"),
+            (
+                0x28,
+                0x04,
+                "enableRxAndDisableTxWithEnhancedAddressInformation",
+            ),
+            (0x31, 0x01, "startRoutine"),
+            (0x31, 0x02, "stopRoutine"),
+            (0x31, 0x03, "requestRoutineResults"),
+            (0x3E, 0x00, "zeroSubFunction"),
+            (0x85, 0x01, "on"),
+            (0x85, 0x02, "off"),
+            (0x19, 0x01, "reportNumberOfDTCByStatusMask"),
+            (0x19, 0x02, "reportDTCByStatusMask"),
+            (0x19, 0x03, "reportDTCSnapshotIdentification"),
+            (0x19, 0x04, "reportDTCSnapshotRecordByDTCNumber"),
+            (0x19, 0x06, "reportDTCExtDataRecordByDTCNumber"),
+            (0x19, 0x0A, "reportSupportedDTC"),
+            (0x19, 0x0F, "reportMirrorMemoryDTCByStatusMask"),
+        ];
+        for (service, sub, expected) in cases {
+            assert_eq!(
+                sub_function_name(service, sub),
+                Some(expected),
+                "service {service:#04X} sub-function {sub:#04X}"
+            );
+            let message = decode_uds(&[service, sub]).expect("uds");
+            assert_eq!(message.sub_function_name, Some(expected));
+        }
+        // The suppress bit is removed before the name is looked up.
+        assert_eq!(sub_function_name(0x3E, 0x00), Some("zeroSubFunction"));
+        assert_eq!(
+            decode_uds(&[0x3E, 0x80]).expect("uds").sub_function_name,
+            Some("zeroSubFunction")
+        );
+        // A service without sub-functions and an undocumented value stay unnamed.
+        assert_eq!(sub_function_name(0x22, 0x01), None);
+        assert_eq!(sub_function_name(0x10, 0x7F), None);
+    }
+
+    /// ISO-TP framing carries its length and sequence information in the header.
+    #[test]
+    fn isotp_frames_describe_themselves() {
+        let single = decode_isotp(&[0x03, 0x22, 0xF1, 0x90]).expect("single");
+        assert_eq!(single.summary(), "single frame (3 octets)");
+        let first = decode_isotp(&[0x10, 0x09, 0x2E, 0xF1]).expect("first");
+        assert_eq!(first.summary(), "first frame (9 octets)");
+        let consecutive = decode_isotp(&[0x21, 0xDE, 0xAD]).expect("consecutive");
+        assert_eq!(consecutive.summary(), "consecutive frame 1");
+        let flow = decode_isotp(&[0x30, 0x00, 0x00]).expect("flow");
+        assert!(
+            flow.summary().contains("flow control"),
+            "{}",
+            flow.summary()
+        );
+        assert_eq!(decode_isotp(&[0x40, 0x00]), None);
+
+        // A single-frame UDS message decodes through the ISO-TP wrapper.
+        let message = decode_isotp_single(&[0x03, 0x22, 0xF1, 0x90]).expect("uds");
+        assert_eq!(message.service_name, "ReadDataByIdentifier");
+        assert_eq!(decode_isotp_single(&[0x10, 0x09, 0x2E, 0xF1]), None);
+
+        // A negative flow-control status keeps its name.
+        let wait = decode_isotp(&[0x31, 0x00, 0x00]).expect("flow wait");
+        assert!(
+            wait.summary().contains("flow control"),
+            "{}",
+            wait.summary()
+        );
+    }
+
+    #[test]
+    fn hex_helper_renders_bytes() {
+        assert_eq!(hex(&[0xDE, 0xAD, 0xBE, 0xEF]), "DE AD BE EF");
+        assert_eq!(hex(&[]), "");
+    }
+}
