@@ -171,6 +171,9 @@ pub fn classify_lin_object(object: &LinObject) -> LinObservation {
             error: Some("LIN record does not contain a response payload".to_string()),
         },
         _ => LinObservation {
+            // Other LIN records describe the bus rather than a response:
+            // wakeup and sleep events, baud rate, disturbances, statistics.
+            // They keep their state so no signal decoder invents a payload.
             state: LinResponseState::Unsupported,
             frame_id,
             header_dlc,
@@ -179,8 +182,8 @@ pub fn classify_lin_object(object: &LinObject) -> LinObservation {
             checksum,
             checksum_model,
             error: Some(format!(
-                "BLF object {} is not a decodable LIN response",
-                object.object_type.as_u32()
+                "{} is a LIN bus event, not a frame response",
+                object.object_type.name()
             )),
         },
     };

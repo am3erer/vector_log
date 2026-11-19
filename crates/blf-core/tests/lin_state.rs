@@ -134,6 +134,11 @@ fn unrelated_lin_event_is_not_treated_as_a_response() {
     let observation = classify_lin_object(&object(ObjectType::LinWakeup2, vec![]));
     assert_eq!(observation.state, LinResponseState::Unsupported);
     assert_eq!(observation.payload, None);
+    // The message names the record instead of showing a bare object number.
+    assert!(observation
+        .error
+        .unwrap()
+        .contains("LinWakeupEvent2 is a LIN bus event"));
 }
 
 #[test]

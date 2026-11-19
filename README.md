@@ -33,6 +33,16 @@ diagnostic objects, including:
   appear in the Ethernet view with their channel and hardware channel, for
   example `ch 4.12 · PHY normal state · wakeup received`, and their values keep
   the names from the BLF Ethernet format document.
+- Records that are not frames are decoded as well, with the names from the
+  logging format documents: CAN driver errors (`chip state bus off`, `receive
+  queue overrun`, ...), CAN error frames (Vector CAN core codes such as `CRC
+  error` with direction and bit position), CAN bus statistics (`bus load 12.34 %`,
+  frame counters), LIN events (sleep reasons, wakeup pulse length, baudrate,
+  synchronization errors, disturbances, short responses, bus statistics) and
+  Ethernet statistics (`rx 1000 / tx 900 frames`, SQI, dropped counters) plus
+  receive errors (`invalid CRC`, FCS, frame length). Each one is a single
+  decoded line and belongs to its bus, so the CAN, LIN and Ethernet views show
+  errors and statistics instead of hiding them.
 - Objects that straddle a container boundary are stitched back together: a
   container holds exactly 128 KiB, so Vector cuts the last object in half, and
   the reader joins it with the following container instead of dropping it.

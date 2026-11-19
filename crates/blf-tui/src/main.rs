@@ -126,8 +126,8 @@ struct MessageSummary {
     /// Bus name for the list column; Ethernet and events are not `BusKind`s.
     bus_label: &'static str,
     ethernet: Option<EthernetInfo>,
-    /// Status or PHY-state event of an Ethernet port.
-    ethernet_event: Option<EthernetEvent>,
+    /// A non-frame record: port state, driver error, bus event.
+    event: Option<BusEvent>,
     channel: Option<u16>,
     frame_id: Option<u32>,
     object_type_raw: u32,
@@ -194,8 +194,8 @@ impl View {
     fn owns(self, summary: &MessageSummary) -> bool {
         match self {
             Self::All => true,
-            Self::Can => summary.bus == Some(BusKind::Can),
-            Self::Lin => summary.bus == Some(BusKind::Lin),
+            Self::Can => summary.bus_label == "can",
+            Self::Lin => summary.bus_label == "lin",
             Self::Ethernet => summary.bus_label == "eth",
         }
     }
@@ -3753,7 +3753,10 @@ fn summary_for(object_index: usize, object: &Object, pool: &mut TextPool) -> Mes
         }
         _ => (None, None, None, None, None, Vec::new()),
     };
+    let event = bus_event(object);
     let status = match object {
+        // A decoded event is not a frame that failed to decode.
+        _ if event.is_some() => "event",
         Object::Lin(value) => lin_status(classify_lin_object(value).state),
         Object::CanMessage(_)
         | Object::CanMessage2(_)
@@ -3762,15 +3765,15 @@ fn summary_for(object_index: usize, object: &Object, pool: &mut TextPool) -> Mes
         _ => "event",
     };
     let ethernet = ethernet_info(object, pool);
-    let ethernet_event = ethernet_event(object);
     let (hint_channel, hint_direction) = structured_frame_hints(object);
     let direction = direction.or(hint_direction);
-    let (bus_label, channel, frame_id) = match (&ethernet, &ethernet_event, bus) {
+    let (bus_label, channel, frame_id) = match (&ethernet, &event, bus) {
         (Some(info), _, _) => ("eth", hint_channel, Some(u32::from(info.ether_type))),
-        (None, Some(_), _) => ("eth", hint_channel, None),
+        (None, Some(record), _) => (record.bus_label, record.channel.or(hint_channel), None),
         (None, None, Some(bus)) => (bus.as_str(), channel, frame_id),
         (None, None, None) => ("-", channel, frame_id),
     };
+    let bus = bus.or_else(|| event.as_ref().and_then(|record| record.bus));
     MessageSummary {
         object_index,
         timestamp_ns: object_timestamp_ns(object),
@@ -3778,7 +3781,7 @@ fn summary_for(object_index: usize, object: &Object, pool: &mut TextPool) -> Mes
         bus,
         bus_label,
         ethernet,
-        ethernet_event,
+        event,
         channel,
         frame_id,
         object_type_raw: object.object_type_raw(),
@@ -3930,8 +3933,8 @@ fn summary_detail_lines(
             .channel
             .map_or_else(|| "-".to_string(), |value| value.to_string())
     ));
-    if let Some(event) = &summary.ethernet_event {
-        lines.push(format!("id: -  event: {}", event.summary));
+    if let Some(event) = &summary.event {
+        lines.push(format!("id: -  {}: {}", event.kind, event.summary));
     }
     match &summary.ethernet {
         Some(info) => {
@@ -4248,22 +4251,112 @@ fn ethernet_info(object: &Object, pool: &mut TextPool) -> Option<EthernetInfo> {
     })
 }
 
-/// An Ethernet status or PHY-state event, summarised for the list.
+/// A record that is not a frame: a port state, a driver error, a bus event.
+///
+/// These carry no payload, so the list shows one decoded line instead of the
+/// frame columns.
 #[derive(Debug, Clone)]
-struct EthernetEvent {
+struct BusEvent {
+    /// Which view owns the row; `None` for records that belong to no bus.
+    bus: Option<BusKind>,
+    /// `can`, `lin` or `eth`.
+    bus_label: &'static str,
+    /// Type column: `error`, `stat`, `event`, ...
+    kind: &'static str,
+    channel: Option<u16>,
     /// One line such as `ch 4.12 link up, 100 Mbit/s`.
     summary: String,
     /// Lowercased words the message filter can match.
     search: String,
 }
 
-/// Build the summary of `VBLEthernetStatus` and `VBLEthernetPhyState`.
-fn ethernet_event(object: &Object) -> Option<EthernetEvent> {
-    let Object::Structured(value) = object else {
-        return None;
-    };
+impl BusEvent {
+    fn new(bus_label: &'static str, kind: &'static str) -> Self {
+        Self {
+            bus: match bus_label {
+                "can" => Some(BusKind::Can),
+                "lin" => Some(BusKind::Lin),
+                _ => None,
+            },
+            bus_label,
+            kind,
+            channel: None,
+            summary: String::new(),
+            search: String::new(),
+        }
+    }
+
+    fn channel(mut self, channel: Option<u16>) -> Self {
+        self.channel = channel;
+        self
+    }
+
+    fn text(mut self, summary: impl Into<String>) -> Self {
+        self.summary = summary.into();
+        self
+    }
+
+    fn done(mut self) -> Self {
+        self.search = self.summary.to_lowercase();
+        self
+    }
+}
+
+/// Decode the value of a CAN, LIN or Ethernet event record.
+fn bus_event(object: &Object) -> Option<BusEvent> {
+    match object {
+        Object::CanErrorFrame(value) => Some(
+            BusEvent::new("can", "error")
+                .channel(Some(value.channel))
+                .text("error frame")
+                .done(),
+        ),
+        Object::CanErrorFrameExt(value) => {
+            // `mECC` carries the Vector CAN core code in bits 0-5 and the
+            // direction in bits 6-7.
+            let code = blf_core::can_error_code_name(value.ecc & 0x3F);
+            let direction = blf_core::can_error_direction_name(value.ecc >> 6);
+            let mut text = format!("error frame: {code} ({direction})");
+            if value.position > 0 {
+                text.push_str(&format!(" at bit {}", value.position));
+            }
+            if value.id != 0 {
+                text.push_str(&format!(", corrupted 0x{:X}", value.id));
+            }
+            Some(
+                BusEvent::new("can", "error")
+                    .channel(Some(value.channel))
+                    .text(text)
+                    .done(),
+            )
+        }
+        Object::CanFdErrorFrame64(value) => {
+            let code = blf_core::can_error_code_name(value.ecc & 0x3F);
+            let direction = blf_core::can_error_direction_name(value.ecc >> 6);
+            let mut text = format!("CAN FD error frame: {code} ({direction})");
+            if value.error_position > 0 {
+                text.push_str(&format!(" at bit {}", value.error_position));
+            }
+            if value.id != 0 {
+                text.push_str(&format!(", corrupted 0x{:X}", value.id));
+            }
+            Some(
+                BusEvent::new("can", "error")
+                    .channel(Some(u16::from(value.channel)))
+                    .text(text)
+                    .done(),
+            )
+        }
+        Object::Lin(value) => lin_event(value),
+        Object::Structured(value) => structured_event(value),
+        _ => None,
+    }
+}
+
+/// Events that the BLF stores as plain structured objects.
+fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
     let field = |name: &str| -> Option<u64> {
-        value.fields.iter().find_map(|(field, value)| {
+        object.fields.iter().find_map(|(field, value)| {
             if field != name {
                 return None;
             }
@@ -4276,62 +4369,346 @@ fn ethernet_event(object: &Object) -> Option<EthernetEvent> {
             }
         })
     };
-    let channel = field("channel").unwrap_or(0);
-    let hardware = field("hardwareChannel").unwrap_or(0);
-    let where_ = if hardware > 0 {
-        format!("ch {channel}.{hardware}")
-    } else {
-        format!("ch {channel}")
+    let channel = field("channel").and_then(|value| u16::try_from(value).ok());
+    let where_ = |hardware: Option<u64>| match hardware {
+        Some(hardware) if hardware > 0 => format!("ch {}.{hardware}", channel.unwrap_or(0)),
+        _ => format!("ch {}", channel.unwrap_or(0)),
     };
-    let mut parts = vec![where_];
-    match value.object_type {
-        blf_core::ObjectType::EthernetStatus => {
-            let mut detail = Vec::new();
-            if let Some(link) = field("linkStatus") {
-                let name = blf_core::ethernet_link_status_name(link as u8);
-                detail.push(name.to_string());
-                if link == 2 {
-                    if let Some(bitrate) = field("bitrate") {
-                        detail.push(format!("{} Mbit/s", bitrate / 1000));
+    match object.object_type {
+        blf_core::ObjectType::CanDriverError | blf_core::ObjectType::CanDriverErrorExt => {
+            let code = field("errorCode").unwrap_or(0);
+            let mut text = format!(
+                "{} (code {code})",
+                blf_core::can_driver_error_name(u32::try_from(code).unwrap_or(0))
+            );
+            let tx = field("txErrors").unwrap_or(0);
+            let rx = field("rxErrors").unwrap_or(0);
+            if tx > 0 || rx > 0 {
+                text.push_str(&format!(", tx {tx} rx {rx} errors"));
+            }
+            Some(
+                BusEvent::new("can", "error")
+                    .channel(channel)
+                    .text(format!("ch {} {text}", channel.unwrap_or(0)))
+                    .done(),
+            )
+        }
+        blf_core::ObjectType::CanStatistic => {
+            let load = f64::from(u32::try_from(field("busLoad").unwrap_or(0)).unwrap_or(0)) / 100.0;
+            let text = format!(
+                "ch {} bus load {load:.2} %, {} standard, {} extended, {} remote, {} errors, {} overload",
+                channel.unwrap_or(0),
+                field("standardDataFrames").unwrap_or(0),
+                field("extendedDataFrames").unwrap_or(0),
+                field("standardRemoteFrames").unwrap_or(0)
+                    + field("extendedRemoteFrames").unwrap_or(0),
+                field("errorFrames").unwrap_or(0),
+                field("overloadFrames").unwrap_or(0),
+            );
+            Some(
+                BusEvent::new("can", "stat")
+                    .channel(channel)
+                    .text(text)
+                    .done(),
+            )
+        }
+        blf_core::ObjectType::CanOverload => Some(
+            BusEvent::new("can", "event")
+                .channel(channel)
+                .text(format!("ch {} overload frame", channel.unwrap_or(0)))
+                .done(),
+        ),
+        blf_core::ObjectType::CanDriverSync => Some(
+            BusEvent::new("can", "event")
+                .channel(channel)
+                .text(format!(
+                    "ch {} driver time sync (flags 0x{:X})",
+                    channel.unwrap_or(0),
+                    field("flags").unwrap_or(0)
+                ))
+                .done(),
+        ),
+        blf_core::ObjectType::CanSettingChanged => Some(
+            BusEvent::new("can", "event")
+                .channel(channel)
+                .text(format!(
+                    "ch {} bit timing changed: type {}, arbitration 0x{:X}, data 0x{:X}",
+                    channel.unwrap_or(0),
+                    field("changedType").unwrap_or(0),
+                    field("btrExtArb").unwrap_or(0),
+                    field("btrExtData").unwrap_or(0)
+                ))
+                .done(),
+        ),
+        blf_core::ObjectType::EthernetStatus | blf_core::ObjectType::EthernetPhyState => {
+            let where_ = where_(field("hardwareChannel"));
+            let mut parts = vec![where_];
+            if object.object_type == blf_core::ObjectType::EthernetStatus {
+                if let Some(link) = field("linkStatus") {
+                    parts.push(blf_core::ethernet_link_status_name(link as u8).to_string());
+                    if link == 2 {
+                        if let Some(bitrate) = field("bitrate") {
+                            parts.push(format!("{} Mbit/s", bitrate / 1000));
+                        }
+                    }
+                }
+                if let Some(phy) = field("ethernetPhy") {
+                    let name = blf_core::ethernet_phy_type_name(phy as u8);
+                    if name != "unknown" {
+                        parts.push(name.to_string());
+                    }
+                }
+                if let Some(duplex) = field("duplex") {
+                    let name = blf_core::ethernet_duplex_name(duplex as u8);
+                    if name != "unknown" {
+                        parts.push(name.to_string());
+                    }
+                }
+                if let Some(mode) = field("clockMode") {
+                    let name = blf_core::ethernet_clock_mode_name(mode as u8);
+                    if name != "unknown" {
+                        parts.push(format!("clock {name}"));
+                    }
+                }
+            } else {
+                if let Some(state) = field("phyState") {
+                    parts.push(format!(
+                        "PHY {}",
+                        blf_core::ethernet_phy_state_name(state as u8)
+                    ));
+                }
+                if let Some(event) = field("phyEvent") {
+                    let name = blf_core::ethernet_phy_event_name(event as u8);
+                    if name != "invalid event" {
+                        parts.push(name.to_string());
                     }
                 }
             }
-            if let Some(phy) = field("ethernetPhy") {
-                detail.push(blf_core::ethernet_phy_type_name(phy as u8).to_string());
-            }
-            if let Some(duplex) = field("duplex") {
-                let name = blf_core::ethernet_duplex_name(duplex as u8);
-                if name != "unknown" {
-                    detail.push(name.to_string());
-                }
-            }
-            if let Some(mode) = field("clockMode") {
-                let name = blf_core::ethernet_clock_mode_name(mode as u8);
-                if name != "unknown" {
-                    detail.push(format!("clock {name}"));
-                }
-            }
-            parts.extend(detail);
+            Some(
+                BusEvent::new("eth", "event")
+                    .channel(channel)
+                    .text(parts.join(" · "))
+                    .done(),
+            )
         }
-        blf_core::ObjectType::EthernetPhyState => {
-            if let Some(state) = field("phyState") {
-                parts.push(format!(
-                    "PHY {}",
-                    blf_core::ethernet_phy_state_name(state as u8)
-                ));
-            }
-            if let Some(event) = field("phyEvent") {
-                let name = blf_core::ethernet_phy_event_name(event as u8);
-                if name != "invalid event" {
-                    parts.push(name.to_string());
+        blf_core::ObjectType::EthernetStatistic => {
+            let sqi = object.fields.iter().find_map(|(name, value)| {
+                if name == "sqi" {
+                    match value {
+                        FieldValue::I16(number) => Some(*number),
+                        _ => None,
+                    }
+                } else {
+                    None
                 }
+            });
+            let mut text = format!(
+                "{} rx {} / tx {} frames, {} / {} errors, SQI {}",
+                where_(field("hardwareChannel")),
+                field("rcvOk_HW").unwrap_or(0),
+                field("xmitOk_HW").unwrap_or(0),
+                field("rcvError_HW").unwrap_or(0),
+                field("xmitError_HW").unwrap_or(0),
+                sqi.map_or("unknown", blf_core::ethernet_sqi_name),
+            );
+            let dropped = field("rcvNoBuffer_HW").unwrap_or(0);
+            if dropped > 0 {
+                text.push_str(&format!(", {dropped} dropped"));
             }
+            Some(
+                BusEvent::new("eth", "stat")
+                    .channel(channel)
+                    .text(text)
+                    .done(),
+            )
         }
-        _ => return None,
+        blf_core::ObjectType::EthernetRxError => {
+            let error = blf_core::ethernet_rx_error_name(
+                u32::try_from(field("error").unwrap_or(0)).unwrap_or(0),
+            );
+            let direction = match field("dir").unwrap_or(0) {
+                0 => "RX",
+                _ => "TX",
+            };
+            Some(
+                BusEvent::new("eth", "error")
+                    .channel(channel)
+                    .text(format!(
+                        "{} {direction} error: {error}, {} bytes, FCS 0x{:X}",
+                        where_(field("hardwareChannel")),
+                        field("frameDataLength").unwrap_or(0),
+                        field("fcs").unwrap_or(0),
+                    ))
+                    .done(),
+            )
+        }
+        _ => None,
     }
-    let summary = parts.join(" · ");
-    let search = summary.to_lowercase();
-    Some(EthernetEvent { summary, search })
+}
+
+/// Events that the BLF stores as LIN records.
+fn lin_event(object: &blf_core::LinObject) -> Option<BusEvent> {
+    use blf_core::ObjectType;
+    let field = |name: &str| -> Option<u64> {
+        object.fields.iter().find_map(|(field, value)| {
+            if field != name {
+                return None;
+            }
+            match value {
+                FieldValue::U8(number) => Some(u64::from(*number)),
+                FieldValue::U16(number) => Some(u64::from(*number)),
+                FieldValue::U32(number) => Some(u64::from(*number)),
+                FieldValue::U64(number) => Some(*number),
+                FieldValue::I32(number) => u64::try_from(*number).ok(),
+                FieldValue::F64(number) => Some(*number as u64),
+                _ => None,
+            }
+        })
+    };
+    let channel = field("channel").and_then(|value| u16::try_from(value).ok());
+    let ch = channel.unwrap_or(0);
+    let (kind, text) = match object.object_type {
+        ObjectType::LinBaudrate => (
+            "event",
+            format!("ch {ch} baudrate {} bit/s", field("baudrate").unwrap_or(0)),
+        ),
+        ObjectType::LinSleep => (
+            "event",
+            format!(
+                "ch {ch} sleep: {} ({})",
+                blf_core::lin_sleep_reason_name(field("reason").unwrap_or(0) as u8),
+                blf_core::lin_sleep_flags_text(field("flags").unwrap_or(0) as u8),
+            ),
+        ),
+        ObjectType::LinWakeup | ObjectType::LinWakeup2 => {
+            let mut text = format!(
+                "ch {ch} wakeup signal 0x{:02X}",
+                field("signal").unwrap_or(0)
+            );
+            if let Some((_, FieldValue::U8(length))) =
+                object.fields.iter().find(|(name, _)| name == "lengthInfo")
+            {
+                text.push_str(&format!(", {}", blf_core::lin_wakeup_length_name(*length)));
+            }
+            if field("external").unwrap_or(0) != 0 {
+                text.push_str(", external");
+            }
+            ("event", text)
+        }
+        ObjectType::LinSynError | ObjectType::LinSynError2 => {
+            ("error", format!("ch {ch} synchronization error"))
+        }
+        ObjectType::LinSchedModch => (
+            "event",
+            format!(
+                "ch {ch} schedule table {} -> {}",
+                field("oldMode").unwrap_or(0),
+                field("newMode").unwrap_or(0)
+            ),
+        ),
+        ObjectType::LinChecksumInfo => (
+            "event",
+            format!(
+                "ch {ch} frame 0x{:02X} checksum model {}",
+                field("id").unwrap_or(0),
+                blf_core::lin_checksum_model_name(field("checksumModel").unwrap_or(0) as u8)
+            ),
+        ),
+        ObjectType::LinSpikeEvent | ObjectType::LinSpikeEvent2 => (
+            "event",
+            format!(
+                "ch {ch} spike {} us ({})",
+                field("width").unwrap_or(0),
+                blf_core::lin_spike_origin_name(field("internal").unwrap_or(0) as u8)
+            ),
+        ),
+        ObjectType::LinLongDomSig | ObjectType::LinLongDomSig2 => (
+            "event",
+            format!(
+                "ch {ch} long dominant signal {}, {} ns",
+                blf_core::lin_long_dom_signal_type_name(field("type").unwrap_or(0) as u8),
+                field("length").unwrap_or(0)
+            ),
+        ),
+        ObjectType::LinDisturbanceEvent => (
+            "event",
+            format!(
+                "ch {ch} {} on frame 0x{:02X} at byte {} bit {}",
+                blf_core::lin_disturbance_type_name(
+                    u32::try_from(field("disturbanceType").unwrap_or(0)).unwrap_or(0)
+                ),
+                field("id").unwrap_or(0),
+                field("byteIndex").unwrap_or(0),
+                field("bitIndex").unwrap_or(0)
+            ),
+        ),
+        ObjectType::LinShortOrSlowResponse | ObjectType::LinShortOrSlowResponse2 => {
+            let mut text = format!(
+                "ch {ch} short response: {} bytes",
+                field("numberOfRespBytes").unwrap_or(0)
+            );
+            if field("slowResponse").unwrap_or(0) != 0 {
+                text.push_str(", slow");
+            }
+            if field("interruptedByBreak").unwrap_or(0) != 0 {
+                text.push_str(", interrupted by break");
+            }
+            ("event", text)
+        }
+        ObjectType::LinUnexpectedWakeup => (
+            "event",
+            format!(
+                "ch {ch} unexpected wakeup signal 0x{:02X}, {} ns",
+                field("signal").unwrap_or(0),
+                field("width").unwrap_or(0)
+            ),
+        ),
+        ObjectType::LinStatistic => {
+            let load = object
+                .fields
+                .iter()
+                .find_map(|(name, value)| match (name.as_str(), value) {
+                    ("busLoad", FieldValue::F64(load)) => Some(*load),
+                    _ => None,
+                })
+                .unwrap_or(0.0);
+            (
+                "stat",
+                format!(
+                    "ch {ch} bus load {load:.2} %, {} sent, {} received, {} unanswered, {} bursts ({} overrun)",
+                    field("framesSent").unwrap_or(0),
+                    field("framesReceived").unwrap_or(0),
+                    field("framesUnanswered").unwrap_or(0),
+                    field("burstsTotal").unwrap_or(0),
+                    field("burstsOverrun").unwrap_or(0),
+                ),
+            )
+        }
+        ObjectType::LinSlvTimeout => (
+            "error",
+            format!(
+                "ch {ch} slave 0x{:02X} timeout in state {} -> {}",
+                field("slaveId").unwrap_or(0),
+                field("stateId").unwrap_or(0),
+                field("followStateId").unwrap_or(0)
+            ),
+        ),
+        ObjectType::LinDlcInfo => (
+            "event",
+            format!(
+                "ch {ch} frame 0x{:02X} length adjusted to {}",
+                field("id").unwrap_or(0),
+                field("dlc").unwrap_or(0)
+            ),
+        ),
+        _ => return None,
+    };
+    Some(
+        BusEvent::new("lin", kind)
+            .channel(channel)
+            .text(text)
+            .done(),
+    )
 }
 
 /// The channel and direction a structured frame reports.
@@ -4491,8 +4868,8 @@ fn inspector_lines(
                     lines.push(format!("  {name:<14} {value}"));
                 }
             }
-            // The enum names the values, so the raw numbers stay readable.
-            if let Some(event) = &summary.ethernet_event {
+            // The decoded names keep the raw numbers readable.
+            if let Some(event) = &summary.event {
                 lines.push("event".to_string());
                 lines.push(format!("  {}", event.summary));
             }
@@ -4614,37 +4991,43 @@ fn view_row(
         .map_or_else(|| "-".to_string(), |value| value.to_string());
     match view {
         View::All => summary_line(summary, axis, pool),
-        View::Can => format!(
-            "{time:>12} {channel:>3} {:<6} {:<3} {:>3}  {}",
-            summary
-                .frame_id
-                .map_or_else(|| "-".to_string(), |id| format!("0x{id:X}")),
-            summary.direction.unwrap_or("-"),
-            summary
-                .dlc
-                .map_or_else(|| "-".to_string(), |value| value.to_string()),
-            hex_bytes(&summary.payload)
-        ),
-        View::Lin => format!(
-            "{time:>12} {channel:>3} {:<6} {:<3} {:>3} {:<8}  {}",
-            summary
-                .frame_id
-                .map_or_else(|| "-".to_string(), |id| format!("0x{id:X}")),
-            summary.direction.unwrap_or("-"),
-            summary
-                .dlc
-                .map_or_else(|| "-".to_string(), |value| value.to_string()),
-            lin_crc_label(summary.status),
-            hex_bytes(&summary.payload)
-        ),
+        View::Can => {
+            if summary.event.is_some() {
+                return event_row(summary, axis);
+            }
+            format!(
+                "{time:>12} {channel:>3} {:<6} {:<3} {:>3}  {}",
+                summary
+                    .frame_id
+                    .map_or_else(|| "-".to_string(), |id| format!("0x{id:X}")),
+                summary.direction.unwrap_or("-"),
+                summary
+                    .dlc
+                    .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                hex_bytes(&summary.payload)
+            )
+        }
+        View::Lin => {
+            if summary.event.is_some() {
+                return event_row(summary, axis);
+            }
+            format!(
+                "{time:>12} {channel:>3} {:<6} {:<3} {:>3} {:<8}  {}",
+                summary
+                    .frame_id
+                    .map_or_else(|| "-".to_string(), |id| format!("0x{id:X}")),
+                summary.direction.unwrap_or("-"),
+                summary
+                    .dlc
+                    .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                lin_crc_label(summary.status),
+                hex_bytes(&summary.payload)
+            )
+        }
         View::Ethernet => {
             let Some(info) = &summary.ethernet else {
-                if let Some(event) = &summary.ethernet_event {
-                    // Port status events have no EtherType; keep the event text.
-                    return format!(
-                        "{time:>12} {channel:>3} {:<7} {:<9} {:<5}  {}",
-                        "-", "event", "-", event.summary
-                    );
+                if summary.event.is_some() {
+                    return event_row(summary, axis);
                 }
                 return summary_line(summary, axis, pool);
             };
@@ -4667,6 +5050,21 @@ fn view_row(
                 )
             }
         }
+    }
+}
+
+/// A record without payload: time, channel, kind, then the decoded text.
+fn event_row(summary: &MessageSummary, axis: TimeAxis) -> String {
+    let time = axis.format(summary.timestamp_ns);
+    let channel = summary
+        .channel
+        .map_or_else(|| "-".to_string(), |value| value.to_string());
+    match &summary.event {
+        Some(event) => format!(
+            "{time:>12} {channel:>3} {:<7} {:<9} {:<5}  {}",
+            "-", event.kind, "-", event.summary
+        ),
+        None => format!("{time:>12} {channel:>3} -       -         -      "),
     }
 }
 
@@ -4763,9 +5161,10 @@ fn summary_line(summary: &MessageSummary, axis: TimeAxis, pool: &TextPool) -> St
         (None, None) => "------".to_string(),
     };
     let direction = summary.direction.unwrap_or("-");
-    let payload = match &summary.ethernet {
-        Some(info) => short_summary(pool.get(info.summary)),
-        None => hex_bytes(&summary.payload),
+    let payload = match (&summary.ethernet, &summary.event) {
+        (Some(info), _) => short_summary(pool.get(info.summary)),
+        (None, Some(event)) => format!("{}: {}", event.kind, event.summary),
+        (None, None) => hex_bytes(&summary.payload),
     };
     let text = format!("{time:>12} {bus:<3} {channel:>3} {id:>6} {direction:<3} {payload}");
     if display_width(&text) > 120 {
@@ -5109,7 +5508,9 @@ fn summary_matches_in(
         buffer.push_str(pool.get(info.search));
         buffer.push(' ');
     }
-    if let Some(event) = &summary.ethernet_event {
+    if let Some(event) = &summary.event {
+        buffer.push_str(event.kind);
+        buffer.push(' ');
         buffer.push_str(&event.search);
         buffer.push(' ');
     }
@@ -7536,7 +7937,7 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
             bus: Some(BusKind::Can),
             bus_label: "can",
             ethernet: None,
-            ethernet_event: None,
+            event: None,
             channel: Some(1),
             frame_id: Some(0x123),
             object_type_raw: 1,
@@ -7691,7 +8092,7 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
             bus: Some(BusKind::Can),
             bus_label: "can",
             ethernet: None,
-            ethernet_event: None,
+            event: None,
             channel: Some(1),
             frame_id: Some(0x344),
             object_type_raw: 1,
@@ -7727,7 +8128,7 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
             bus: Some(bus),
             bus_label: bus.as_str(),
             ethernet: None,
-            ethernet_event: None,
+            event: None,
             channel: Some(channel),
             frame_id: Some(frame_id),
             object_type_raw: 101,
@@ -8452,7 +8853,7 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
         assert_eq!(summary.class_name, "EthernetPhyState");
         assert_eq!(summary.bus_label, "eth");
         assert_eq!(summary.channel, Some(4));
-        let event = summary.ethernet_event.as_ref().expect("event summary");
+        let event = summary.event.as_ref().expect("event summary");
         assert_eq!(
             event.summary,
             "ch 4.12 · PHY normal state · wakeup received"
@@ -8649,7 +9050,7 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
             bus: Some(BusKind::Can),
             bus_label: "can",
             ethernet: None,
-            ethernet_event: None,
+            event: None,
             channel: Some(1),
             frame_id: Some(0x344),
             object_type_raw: 1,
@@ -8779,5 +9180,289 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
         let (start, end) = zoom_window((50 * S, 50 * S + MIN_CURVE_WINDOW_NS), 0.01, (0, 5 * S));
         assert!(end > start);
         assert!(end - start >= MIN_CURVE_WINDOW_NS.min(5 * S));
+    }
+}
+
+#[cfg(test)]
+mod bus_event_tests {
+    use super::*;
+    use blf_core::{
+        CanErrorFrameExt, LinObject, ObjectHeader, ObjectHeaderBase, ObjectType, RawObjectHeader,
+        StructuredObject,
+    };
+
+    fn header(object_type: ObjectType) -> RawObjectHeader {
+        RawObjectHeader::Object(ObjectHeader {
+            base: ObjectHeaderBase {
+                signature: blf_core::OBJECT_SIGNATURE,
+                header_size: 32,
+                header_version: 1,
+                object_size: 40,
+                object_type,
+                raw_object_type: object_type.as_u32(),
+            },
+            object_flags: 2,
+            client_index: 0,
+            object_version: 0,
+            object_time_stamp: 1_000_000,
+        })
+    }
+
+    fn structured(object_type: ObjectType, fields: Vec<(&str, FieldValue)>) -> Object {
+        Object::Structured(StructuredObject {
+            object_type,
+            header: header(object_type),
+            class_name: object_type.name().to_string(),
+            fields: fields
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value))
+                .collect(),
+            extensions: Vec::new(),
+            data: Vec::new(),
+        })
+    }
+
+    fn lin(object_type: ObjectType, fields: Vec<(&str, FieldValue)>) -> Object {
+        Object::Lin(LinObject {
+            header: match header(object_type) {
+                RawObjectHeader::Object(header) => header,
+                _ => unreachable!(),
+            },
+            object_type,
+            fields: fields
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value))
+                .collect(),
+            extensions: Vec::new(),
+            raw_data: Vec::new(),
+        })
+    }
+
+    fn axis() -> TimeAxis {
+        TimeAxis {
+            mode: TimeMode::Absolute,
+            base: 0,
+        }
+    }
+
+    #[test]
+    fn can_driver_error_shows_its_name_and_joins_the_can_view() {
+        // errorCode 102 is "chip state bus off" in the logging format document.
+        let object = structured(
+            ObjectType::CanDriverError,
+            vec![
+                ("channel", FieldValue::U16(2)),
+                ("txErrors", FieldValue::U32(3)),
+                ("rxErrors", FieldValue::U32(1)),
+                ("errorCode", FieldValue::U32(102)),
+            ],
+        );
+        let mut pool = TextPool::default();
+        let summary = summary_for(0, &object, &mut pool);
+        assert_eq!(summary.bus_label, "can");
+        assert_eq!(summary.bus, Some(BusKind::Can));
+        assert_eq!(summary.status, "event");
+        let event = summary.event.as_ref().expect("event");
+        assert_eq!(event.kind, "error");
+        assert!(event.summary.contains("chip state bus off"), "{event:?}");
+        assert!(event.summary.contains("tx 3 rx 1"), "{event:?}");
+        assert!(View::Can.owns(&summary));
+        assert!(!View::Ethernet.owns(&summary));
+
+        let row = view_row(&summary, View::Can, axis(), &pool, 120);
+        assert!(row.contains("chip state bus off"), "{row}");
+        assert!(summary_matches_in(
+            &summary,
+            "bus off",
+            &mut String::new(),
+            &pool
+        ));
+    }
+
+    #[test]
+    fn can_statistic_reports_busload_and_frame_counts() {
+        // mBusLoad is in 1/100 percent: 1234 is 12.34 %.
+        let object = structured(
+            ObjectType::CanStatistic,
+            vec![
+                ("channel", FieldValue::U16(3)),
+                ("busLoad", FieldValue::U16(1234)),
+                ("standardDataFrames", FieldValue::U32(1200)),
+                ("extendedDataFrames", FieldValue::U32(34)),
+                ("standardRemoteFrames", FieldValue::U32(0)),
+                ("extendedRemoteFrames", FieldValue::U32(0)),
+                ("errorFrames", FieldValue::U32(5)),
+                ("overloadFrames", FieldValue::U32(1)),
+            ],
+        );
+        let mut pool = TextPool::default();
+        let summary = summary_for(0, &object, &mut pool);
+        let event = summary.event.as_ref().expect("event");
+        assert_eq!(event.kind, "stat");
+        assert!(event.summary.contains("12.34 %"), "{event:?}");
+        assert!(event.summary.contains("1200 standard"), "{event:?}");
+        assert!(event.summary.contains("5 errors"), "{event:?}");
+    }
+
+    #[test]
+    fn can_error_frame_decodes_the_vector_error_code() {
+        // Vector CAN core ECC: bits 0-5 code (4 = CRC error), bits 6-7 direction (3 = TX).
+        let object = Object::CanErrorFrameExt(CanErrorFrameExt {
+            header: match header(ObjectType::CanErrorExt) {
+                RawObjectHeader::Object(header) => header,
+                _ => unreachable!(),
+            },
+            channel: 1,
+            length: 0,
+            flags: 0,
+            ecc: 0b1100_0100,
+            position: 17,
+            dlc: 8,
+            reserved_can_error_frame_ext1: 0,
+            frame_length_in_ns: 0,
+            id: 0x123,
+            flags_ext: 0,
+            reserved_can_error_frame_ext2: 0,
+            data: vec![0; 8],
+            raw_data: Vec::new(),
+        });
+        let mut pool = TextPool::default();
+        let summary = summary_for(0, &object, &mut pool);
+        let event = summary.event.as_ref().expect("event");
+        assert!(event.summary.contains("CRC error"), "{event:?}");
+        assert!(event.summary.contains("(TX)"), "{event:?}");
+        assert!(event.summary.contains("at bit 17"), "{event:?}");
+        assert!(event.summary.contains("0x123"), "{event:?}");
+    }
+
+    #[test]
+    fn lin_events_are_decoded_and_join_the_lin_view() {
+        let cases = vec![
+            (
+                lin(
+                    ObjectType::LinSleep,
+                    vec![
+                        ("channel", FieldValue::U16(1)),
+                        ("reason", FieldValue::U8(1)),
+                        ("flags", FieldValue::U8(0b001)),
+                    ],
+                ),
+                "go-to-sleep frame",
+            ),
+            (
+                lin(
+                    ObjectType::LinWakeup2,
+                    vec![
+                        ("channel", FieldValue::U16(2)),
+                        ("signal", FieldValue::U8(0x3C)),
+                        ("lengthInfo", FieldValue::U8(1)),
+                        ("external", FieldValue::U8(1)),
+                    ],
+                ),
+                "wakeup too short",
+            ),
+            (
+                lin(
+                    ObjectType::LinBaudrate,
+                    vec![
+                        ("channel", FieldValue::U16(1)),
+                        ("baudrate", FieldValue::I32(19_200)),
+                    ],
+                ),
+                "19200 bit/s",
+            ),
+            (
+                lin(
+                    ObjectType::LinSynError2,
+                    vec![("channel", FieldValue::U16(1))],
+                ),
+                "synchronization error",
+            ),
+            (
+                lin(
+                    ObjectType::LinDisturbanceEvent,
+                    vec![
+                        ("channel", FieldValue::U16(1)),
+                        ("id", FieldValue::U8(0x1A)),
+                        ("disturbanceType", FieldValue::U32(2)),
+                        ("byteIndex", FieldValue::U32(3)),
+                        ("bitIndex", FieldValue::U32(2)),
+                    ],
+                ),
+                "disturbance with a header",
+            ),
+            (
+                lin(
+                    ObjectType::LinShortOrSlowResponse2,
+                    vec![
+                        ("channel", FieldValue::U16(1)),
+                        ("numberOfRespBytes", FieldValue::U8(2)),
+                        ("slowResponse", FieldValue::U8(1)),
+                        ("interruptedByBreak", FieldValue::U8(1)),
+                    ],
+                ),
+                "interrupted by break",
+            ),
+        ];
+        for (object, expected) in cases {
+            let mut pool = TextPool::default();
+            let summary = summary_for(0, &object, &mut pool);
+            assert_eq!(summary.bus_label, "lin", "{}", summary.class_name);
+            assert_eq!(summary.status, "event", "{}", summary.class_name);
+            assert!(View::Lin.owns(&summary), "{}", summary.class_name);
+            let event = summary.event.as_ref().expect("event");
+            assert!(
+                event.summary.contains(expected),
+                "{}: {}",
+                summary.class_name,
+                event.summary
+            );
+            let row = view_row(&summary, View::Lin, axis(), &pool, 120);
+            assert!(row.contains(expected), "{row}");
+        }
+    }
+
+    #[test]
+    fn ethernet_statistic_and_rx_error_carry_their_numbers() {
+        let statistic = structured(
+            ObjectType::EthernetStatistic,
+            vec![
+                ("channel", FieldValue::U16(4)),
+                ("hardwareChannel", FieldValue::U16(12)),
+                ("rcvOk_HW", FieldValue::U64(1_000)),
+                ("xmitOk_HW", FieldValue::U64(900)),
+                ("rcvError_HW", FieldValue::U64(2)),
+                ("xmitError_HW", FieldValue::U64(0)),
+                ("rcvNoBuffer_HW", FieldValue::U64(7)),
+                ("sqi", FieldValue::I16(4)),
+            ],
+        );
+        let mut pool = TextPool::default();
+        let summary = summary_for(0, &statistic, &mut pool);
+        assert_eq!(summary.bus_label, "eth");
+        let event = summary.event.as_ref().expect("event");
+        assert!(event.summary.contains("ch 4.12"), "{event:?}");
+        assert!(event.summary.contains("rx 1000"), "{event:?}");
+        assert!(event.summary.contains("SQI good"), "{event:?}");
+        assert!(event.summary.contains("7 dropped"), "{event:?}");
+        assert!(View::Ethernet.owns(&summary));
+
+        let error = structured(
+            ObjectType::EthernetRxError,
+            vec![
+                ("channel", FieldValue::U16(4)),
+                ("hardwareChannel", FieldValue::U16(11)),
+                ("dir", FieldValue::U16(0)),
+                ("fcs", FieldValue::U32(0xDEAD_BEEF)),
+                ("frameDataLength", FieldValue::U16(64)),
+                ("error", FieldValue::U32(2)),
+            ],
+        );
+        let summary = summary_for(0, &error, &mut pool);
+        let event = summary.event.as_ref().expect("event");
+        assert_eq!(event.kind, "error");
+        assert!(event.summary.contains("invalid CRC"), "{event:?}");
+        assert!(event.summary.contains("64 bytes"), "{event:?}");
+        assert!(event.summary.contains("0xDEADBEEF"), "{event:?}");
     }
 }

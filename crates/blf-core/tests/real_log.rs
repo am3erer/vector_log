@@ -312,3 +312,38 @@ fn phy_event_token(name: &str) -> &'static str {
         _ => "invalid",
     }
 }
+
+#[test]
+fn real_capture_driver_errors_and_statistics_decode() {
+    let Some(path) = capture_path() else {
+        eprintln!("skipping: capture not present");
+        return;
+    };
+    let mut reader = File::open(&path).unwrap();
+    let mut driver_errors: BTreeMap<u32, i64> = BTreeMap::new();
+    let mut statistics = 0;
+    while let Some(object) = reader.read().unwrap() {
+        match object.object_type() {
+            ObjectType::CanDriverError => {
+                let code = field_u64(&object, "errorCode").unwrap_or(0) as u32;
+                *driver_errors.entry(code).or_default() += 1;
+            }
+            ObjectType::CanStatistic => {
+                // Bus load is reported in 1/100 percent and must stay plausible.
+                let load = field_u64(&object, "busLoad").unwrap_or(0);
+                assert!(load <= 10_000, "bus load {load} out of range");
+                statistics += 1;
+            }
+            _ => {}
+        }
+    }
+    // Every driver error in this capture is a chip-state report.
+    assert_eq!(driver_errors.values().sum::<i64>(), 5_040);
+    for code in driver_errors.keys() {
+        assert!(
+            matches!(code, 102..=104),
+            "unexpected driver error code {code}"
+        );
+    }
+    assert_eq!(statistics, 5_022);
+}
