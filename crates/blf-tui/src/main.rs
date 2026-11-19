@@ -128,6 +128,8 @@ struct MessageSummary {
     ethernet: Option<EthernetInfo>,
     /// A non-frame record: port state, driver error, bus event.
     event: Option<BusEvent>,
+    /// Packed CAN frame properties (remote, wakeup, no-error, FD, BRS, ESI).
+    can_flags: u8,
     channel: Option<u16>,
     frame_id: Option<u32>,
     object_type_raw: u32,
@@ -560,6 +562,13 @@ struct App {
     /// First visible line of the inspector, and its wrapped line count.
     inspector_offset: usize,
     inspector_lines: usize,
+    /// Complete `METADATA` XML documents rebuilt from their fragments.
+    metadata: Vec<String>,
+    /// Objects the capture admits to having lost, from data-lost and overrun
+    /// records. Non-zero means the trace is incomplete and must say so.
+    lost_objects: u64,
+    /// How many of those records were seen.
+    lost_events: u64,
     /// Which bus the message list shows in its own columns.
     view: View,
     /// Whether frames from other buses stay visible as a dim description.
@@ -612,7 +621,7 @@ impl App {
         specs: Vec<(BusKind, u16, PathBuf)>,
     ) -> Result<Self, String> {
         let mut pool = TextPool::default();
-        let summaries = objects
+        let mut summaries = objects
             .iter()
             .enumerate()
             .map(|(object_index, object)| summary_for(object_index, object, &mut pool))
@@ -623,8 +632,28 @@ impl App {
             .iter()
             .find_map(|summary| summary.timestamp_ns)
             .unwrap_or_default();
+        let (lost_objects, lost_events) = count_lost_objects(&objects);
+        let (metadata, metadata_owner) = collect_metadata(&objects);
+        for (index, summary) in summaries.iter_mut().enumerate() {
+            let Some(Some(document)) = metadata_owner.get(index).copied() else {
+                continue;
+            };
+            let Some(document) = metadata.get(document) else {
+                continue;
+            };
+            if let Some(event) = summary.event.as_mut() {
+                event.summary = format!("{} · metadata {} bytes", event.summary, document.len());
+                // The fragments only make sense together, so every row of a
+                // document carries the whole text for the filter.
+                event.search.push(' ');
+                event.search.push_str(&document.to_lowercase());
+            }
+        }
         let mut app = Self {
             trace,
+            metadata,
+            lost_objects,
+            lost_events,
             objects,
             summaries,
             uds,
@@ -683,6 +712,53 @@ impl App {
     }
 
     /// First header line: the trace, or its absence, plus the active mode.
+    /// Lines describing the metadata documents a record contributes to.
+    ///
+    /// The record itself only holds one fragment of a split XML document, so the
+    /// detail pane shows every complete document rebuilt from the fragments.
+    fn metadata_lines(&self, object_index: usize) -> Vec<String> {
+        if self.metadata.is_empty() {
+            return Vec::new();
+        }
+        let Some(object) = self.objects.get(object_index) else {
+            return Vec::new();
+        };
+        let Object::AppText(value) = object else {
+            return Vec::new();
+        };
+        if value.source != 2 {
+            return Vec::new();
+        }
+        let mut lines = Vec::new();
+        lines.push("metadata".to_string());
+        lines.push(format!(
+            "  {} document{} rebuilt from {} fragments",
+            self.metadata.len(),
+            if self.metadata.len() == 1 { "" } else { "s" },
+            self.metadata
+                .iter()
+                .map(|document| document.lines().count())
+                .sum::<usize>()
+        ));
+        for (number, document) in self.metadata.iter().enumerate() {
+            lines.push(format!(
+                "  document {} ({} bytes)",
+                number + 1,
+                document.len()
+            ));
+            for line in document.lines().take(40) {
+                lines.push(format!("  {}", line.trim_end()));
+            }
+            if document.lines().count() > 40 {
+                lines.push(format!(
+                    "  ... ({} more lines)",
+                    document.lines().count() - 40
+                ));
+            }
+        }
+        lines
+    }
+
     fn title_line(&self) -> String {
         match &self.trace {
             Some(trace) => {
@@ -2372,7 +2448,7 @@ impl App {
         lines.push(paint_bold(
             two_column(
                 &format!(
-                    "Messages ({}/{})  view={}{}",
+                    "Messages ({}/{})  view={}{}{}",
                     indices.len(),
                     self.summaries.len(),
                     view.label(),
@@ -2380,6 +2456,16 @@ impl App {
                         "  foreign=hidden"
                     } else {
                         ""
+                    },
+                    // A capture that lost objects is not a complete record; the
+                    // list header is where that has to stay visible.
+                    if self.lost_objects > 0 {
+                        format!(
+                            "  ⚠ LOST {} objects ({} events)",
+                            self.lost_objects, self.lost_events
+                        )
+                    } else {
+                        String::new()
                     }
                 ),
                 "Preview",
@@ -2413,13 +2499,17 @@ impl App {
             .selected_summary()
             .map(|summary| {
                 let index = summary.object_index;
-                summary_detail_lines(
+                let mut lines = summary_detail_lines(
                     summary,
                     self.selected_object(),
                     self.time_axis(),
                     self.uds.get(&index),
                     &self.pool,
-                )
+                );
+                // A metadata record is only a fragment of a split document; the
+                // whole XML is readable in the inspector, which can scroll.
+                lines.extend(self.metadata_lines(index));
+                lines
             })
             .unwrap_or_else(|| vec!["No matching messages".to_string()]);
         let preview = preview
@@ -2649,7 +2739,7 @@ impl App {
         let class_name = summary.class_name;
         let object = self.selected_object();
         let uds = self.uds.get(&object_index);
-        let content = inspector_lines(
+        let mut content = inspector_lines(
             summary,
             object,
             self.time_axis(),
@@ -2658,6 +2748,9 @@ impl App {
             index,
             total,
         );
+        // The metadata documents only exist for the trace as a whole, so they
+        // are appended here where the view can scroll through them.
+        content.extend(self.metadata_lines(object_index));
         // Wrap once per frame; the scroll offset counts wrapped lines.
         let body = content
             .iter()
@@ -3753,6 +3846,7 @@ fn summary_for(object_index: usize, object: &Object, pool: &mut TextPool) -> Mes
         }
         _ => (None, None, None, None, None, Vec::new()),
     };
+    let can_flags = can_frame_flags(object);
     let event = bus_event(object);
     let status = match object {
         // A decoded event is not a frame that failed to decode.
@@ -3782,6 +3876,7 @@ fn summary_for(object_index: usize, object: &Object, pool: &mut TextPool) -> Mes
         bus_label,
         ethernet,
         event,
+        can_flags,
         channel,
         frame_id,
         object_type_raw: object.object_type_raw(),
@@ -4251,6 +4346,142 @@ fn ethernet_info(object: &Object, pool: &mut TextPool) -> Option<EthernetInfo> {
     })
 }
 
+/// Total the objects a capture reports as lost.
+///
+/// `DataLostEnd` carries the count, `OverrunError` says frames were dropped
+/// without a number. Any of these means the trace is incomplete.
+fn count_lost_objects(objects: &[Object]) -> (u64, u64) {
+    let field = |object: &Object, name: &str| -> Option<u64> {
+        let Object::Structured(value) = object else {
+            return None;
+        };
+        value.fields.iter().find_map(|(field, value)| {
+            if field != name {
+                return None;
+            }
+            match value {
+                FieldValue::U8(number) => Some(u64::from(*number)),
+                FieldValue::U16(number) => Some(u64::from(*number)),
+                FieldValue::U32(number) => Some(u64::from(*number)),
+                FieldValue::U64(number) => Some(*number),
+                _ => None,
+            }
+        })
+    };
+    let mut lost = 0_u64;
+    let mut events = 0_u64;
+    for object in objects {
+        match object.object_type() {
+            blf_core::ObjectType::DataLostEnd => {
+                events += 1;
+                lost = lost.saturating_add(field(object, "numberOfLostEvents").unwrap_or(0));
+            }
+            blf_core::ObjectType::OverrunError => {
+                events += 1;
+            }
+            _ => {}
+        }
+    }
+    (lost, events)
+}
+
+/// Join the `METADATA` application texts into complete XML documents.
+///
+/// CANoe writes the metadata as a run of `AppText` records with source 2, split
+/// every 2048 bytes, so one document spans several records. A record that starts
+/// with the XML declaration begins a new document.
+fn collect_metadata(objects: &[Object]) -> (Vec<String>, Vec<Option<usize>>) {
+    let mut documents: Vec<String> = Vec::new();
+    // Which document each object contributes to, so a row can carry the whole
+    // text in its search string even when only a fragment is in the record.
+    let mut owner: Vec<Option<usize>> = vec![None; objects.len()];
+    for (index, object) in objects.iter().enumerate() {
+        let Object::AppText(value) = object else {
+            continue;
+        };
+        if value.source != 2 {
+            continue;
+        }
+        let text = blf_core::app_text_text(&value.text);
+        if text.trim_start().starts_with("<?xml") {
+            documents.push(text);
+        } else if let Some(current) = documents.last_mut() {
+            current.push_str(&text);
+        }
+        owner[index] = Some(documents.len().saturating_sub(1));
+    }
+    (documents, owner)
+}
+
+/// Pack the CAN frame properties the list shows into one byte.
+///
+/// The bits follow the official `CAN_MSG_*` and `CAN_FD_MSG_*` macros, so the
+/// names stay in `blf-core` and the summary only carries flags.
+const CAN_FLAG_REMOTE: u8 = 1 << 0;
+const CAN_FLAG_WAKEUP: u8 = 1 << 1;
+const CAN_FLAG_NO_ERROR: u8 = 1 << 2;
+const CAN_FLAG_FD: u8 = 1 << 3;
+const CAN_FLAG_BRS: u8 = 1 << 4;
+const CAN_FLAG_ESI: u8 = 1 << 5;
+
+fn can_frame_flags(object: &Object) -> u8 {
+    let mut flags = 0;
+    let (classic, fd): (Option<u8>, Option<u32>) = match object {
+        Object::CanMessage(value) => (Some(value.flags), None),
+        Object::CanMessage2(value) => (Some(value.flags), None),
+        Object::CanFdMessage(value) => (Some(value.flags & 0x0F), Some(u32::from(value.flags))),
+        Object::CanFdMessage64(value) => (None, Some(value.flags)),
+        _ => return 0,
+    };
+    if let Some(classic) = classic {
+        if classic & 0x80 != 0 {
+            flags |= CAN_FLAG_REMOTE;
+        }
+        if classic & 0x40 != 0 {
+            flags |= CAN_FLAG_WAKEUP;
+        }
+        if classic & 0x20 != 0 {
+            flags |= CAN_FLAG_NO_ERROR;
+        }
+    }
+    if let Some(fd) = fd {
+        if fd & 0x01 != 0 {
+            flags |= CAN_FLAG_FD;
+        }
+        if fd & 0x02 != 0 {
+            flags |= CAN_FLAG_BRS;
+        }
+        if fd & 0x04 != 0 {
+            flags |= CAN_FLAG_ESI;
+        }
+    }
+    flags
+}
+
+/// Short column showing the CAN frame properties, `-` when it is a plain frame.
+fn can_flag_label(flags: u8) -> String {
+    let mut parts = Vec::new();
+    if flags & CAN_FLAG_REMOTE != 0 {
+        parts.push("rtr");
+    }
+    if flags & CAN_FLAG_BRS != 0 {
+        parts.push("brs");
+    }
+    if flags & CAN_FLAG_ESI != 0 {
+        parts.push("esi");
+    }
+    if flags & CAN_FLAG_WAKEUP != 0 {
+        parts.push("wu");
+    }
+    if flags & CAN_FLAG_NO_ERROR != 0 {
+        parts.push("nerr");
+    }
+    if parts.is_empty() {
+        "-".to_string()
+    } else {
+        parts.join(",")
+    }
+}
 /// A record that is not a frame: a port state, a driver error, a bus event.
 ///
 /// These carry no payload, so the list shows one decoded line instead of the
@@ -4302,6 +4533,21 @@ impl BusEvent {
     }
 }
 
+/// Bus name of a driver-overrun record, from `BL_OVERRUN_BUSTYPE_*`.
+fn bus_type_label(bus_type: u64) -> &'static str {
+    match bus_type {
+        1 => "can",
+        5 => "lin",
+        6 => "most",
+        7 => "flexray",
+        9 => "j1708",
+        10 => "eth",
+        13 => "wlan",
+        14 => "afdx",
+        _ => "-",
+    }
+}
+
 /// Decode the value of a CAN, LIN or Ethernet event record.
 fn bus_event(object: &Object) -> Option<BusEvent> {
     match object {
@@ -4344,6 +4590,38 @@ fn bus_event(object: &Object) -> Option<BusEvent> {
                 BusEvent::new("can", "error")
                     .channel(Some(u16::from(value.channel)))
                     .text(text)
+                    .done(),
+            )
+        }
+        // ---- application text: measurement comment, channel info, metadata ----
+        Object::AppText(value) => {
+            let source = blf_core::app_text_source_name(value.source);
+            let text = blf_core::app_text_text(&value.text);
+            let preview = if text.chars().count() > 60 {
+                let short: String = text.chars().take(60).collect();
+                format!("{short}…")
+            } else {
+                text.clone()
+            };
+            let detail = match value.source {
+                // The payload of these two is a packed flag word, not text.
+                1 => blf_core::app_text_channel_info(u32::from_le_bytes([
+                    value.text.first().copied().unwrap_or(0),
+                    value.text.get(1).copied().unwrap_or(0),
+                    value.text.get(2).copied().unwrap_or(0),
+                    value.text.get(3).copied().unwrap_or(0),
+                ])),
+                4 => blf_core::app_text_trace_line(u32::from_le_bytes([
+                    value.text.first().copied().unwrap_or(0),
+                    value.text.get(1).copied().unwrap_or(0),
+                    value.text.get(2).copied().unwrap_or(0),
+                    value.text.get(3).copied().unwrap_or(0),
+                ])),
+                _ => preview,
+            };
+            Some(
+                BusEvent::new("-", "text")
+                    .text(format!("{source}: {detail}"))
                     .done(),
             )
         }
@@ -4550,6 +4828,208 @@ fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
                         where_(field("hardwareChannel")),
                         field("frameDataLength").unwrap_or(0),
                         field("fcs").unwrap_or(0),
+                    ))
+                    .done(),
+            )
+        }
+        // ---- data integrity: a lost frame or an overrun means the capture is
+        // not complete, so these must never be silent rows. ----
+        blf_core::ObjectType::DataLostBegin => Some(
+            BusEvent::new("-", "LOST")
+                .text(format!(
+                    "queue {} begins losing objects",
+                    field("queueIdentifier").unwrap_or(0)
+                ))
+                .done(),
+        ),
+        blf_core::ObjectType::DataLostEnd => {
+            let lost = field("numberOfLostEvents").unwrap_or(0);
+            let since = field("firstObjectLostTimeStamp").unwrap_or(0);
+            Some(
+                BusEvent::new("-", "LOST")
+                    .text(format!(
+                        "queue {} lost {lost} objects from timestamp {since}",
+                        field("queueIdentifier").unwrap_or(0)
+                    ))
+                    .done(),
+            )
+        }
+        blf_core::ObjectType::OverrunError => Some(
+            BusEvent::new(bus_type_label(field("busType").unwrap_or(0)), "OVERRUN")
+                .channel(channel)
+                .text(format!(
+                    "ch {} reception overrun, frames were lost",
+                    channel.unwrap_or(0)
+                ))
+                .done(),
+        ),
+        blf_core::ObjectType::SerialEvent => {
+            let port = field("port").unwrap_or(0);
+            let baudrate = field("baudrate").unwrap_or(0);
+            let mut text = format!("ch {port} at {baudrate} bit/s");
+            if object.fields.iter().any(|(name, _)| name == "byte") {
+                text.push_str(&format!(
+                    ", single byte 0x{:02X}",
+                    field("byte").unwrap_or(0)
+                ));
+            } else if object
+                .fields
+                .iter()
+                .any(|(name, _)| name == "compactLength")
+            {
+                let length = field("compactLength").unwrap_or(0);
+                text.push_str(&format!(", compact {length} bytes"));
+            } else {
+                let length = field("dataLength").unwrap_or(0);
+                let stamps = field("timeStampsLength").unwrap_or(0) / 8;
+                text.push_str(&format!(", {length} bytes, {stamps} timestamps"));
+            }
+            Some(BusEvent::new("-", "serial").text(text).done())
+        }
+
+        // ---- system variables ----
+        blf_core::ObjectType::SysVariable => {
+            let kind = u32::try_from(field("type").unwrap_or(0)).unwrap_or(0);
+            let name = object
+                .fields
+                .iter()
+                .find_map(|(name, value)| match (name.as_str(), value) {
+                    ("name", FieldValue::String(text)) => Some(text.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("-");
+            let data = object
+                .fields
+                .iter()
+                .find_map(|(name, value)| match (name.as_str(), value) {
+                    ("data", FieldValue::Bytes(bytes)) => Some(bytes.as_slice()),
+                    _ => None,
+                })
+                .unwrap_or(&[]);
+            Some(
+                BusEvent::new("-", "SV")
+                    .text(format!(
+                        "{name} = {} ({})",
+                        blf_core::sysvar_value_text(kind, data),
+                        blf_core::sysvar_type_name(kind)
+                    ))
+                    .done(),
+            )
+        }
+        // ---- measurement structure ----
+        blf_core::ObjectType::Realtimeclock => {
+            // `time` and `loggingOffset` are nanoseconds since the Unix epoch.
+            let time = field("time").unwrap_or(0);
+            let offset = field("loggingOffset").unwrap_or(0);
+            let seconds = time / 1_000_000_000;
+            let shifted = seconds.saturating_sub(offset / 1_000_000_000);
+            Some(
+                BusEvent::new("-", "clock")
+                    .text(format!(
+                        "real time {seconds} s epoch, logging offset {offset} ns (zero at {shifted} s)"
+                    ))
+                    .done(),
+            )
+        }
+        blf_core::ObjectType::GlobalMarker => {
+            let marker = object
+                .fields
+                .iter()
+                .find_map(|(name, value)| match (name.as_str(), value) {
+                    ("markerName", FieldValue::String(text)) => Some(text.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("-");
+            let group = object
+                .fields
+                .iter()
+                .find_map(|(name, value)| match (name.as_str(), value) {
+                    ("groupName", FieldValue::String(text)) => Some(text.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("");
+            let mut text = format!("marker {marker}");
+            if !group.is_empty() {
+                text.push_str(&format!(" in {group}"));
+            }
+            Some(BusEvent::new("-", "marker").text(text).done())
+        }
+        blf_core::ObjectType::EventComment => {
+            let text = object
+                .fields
+                .iter()
+                .find_map(|(name, value)| match (name.as_str(), value) {
+                    ("text", FieldValue::String(text)) => Some(text.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("");
+            Some(
+                BusEvent::new("-", "comment")
+                    .text(format!(
+                        "comment on object type {}: {text}",
+                        field("commentedEventType").unwrap_or(0)
+                    ))
+                    .done(),
+            )
+        }
+        blf_core::ObjectType::TestStructure => {
+            let name = object
+                .fields
+                .iter()
+                .find_map(|(name, value)| match (name.as_str(), value) {
+                    ("name", FieldValue::String(text)) if !text.is_empty() => Some(text.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("");
+            let text = object
+                .fields
+                .iter()
+                .find_map(|(name, value)| match (name.as_str(), value) {
+                    ("text", FieldValue::String(text)) if !text.is_empty() => Some(text.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("");
+            Some(
+                BusEvent::new("-", "test")
+                    .text(format!(
+                        "test structure type {} action {} result {}{}{}",
+                        field("type").unwrap_or(0),
+                        field("action").unwrap_or(0),
+                        field("result").unwrap_or(0),
+                        if name.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{name}]")
+                        },
+                        if text.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" {text}")
+                        },
+                    ))
+                    .done(),
+            )
+        }
+        blf_core::ObjectType::DiagRequestInterpretation => {
+            let qualifier = |field_name: &str| {
+                object
+                    .fields
+                    .iter()
+                    .find_map(|(name, value)| match (name.as_str(), value) {
+                        (name, FieldValue::String(text)) if name == field_name => {
+                            Some(text.as_str())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or("")
+            };
+            Some(
+                BusEvent::new("-", "diag")
+                    .text(format!(
+                        "diagnostic request {} / {} / {}",
+                        qualifier("ecuQualifier"),
+                        qualifier("variantQualifier"),
+                        qualifier("serviceQualifier")
                     ))
                     .done(),
             )
@@ -4966,8 +5446,8 @@ fn view_header(view: View, width: usize) -> String {
             "time", "bus", "ch", "id", "dir", "data"
         ),
         View::Can => format!(
-            "{:>12} {:>3} {:<6} {:<3} {:>3}  {}",
-            "time", "ch", "id", "dir", "dlc", "data"
+            "{:>12} {:>3} {:<6} {:<3} {:>3} {:<9}  {}",
+            "time", "ch", "id", "dir", "dlc", "flags", "data"
         ),
         View::Lin => format!(
             "{:>12} {:>3} {:<6} {:<3} {:>3} {:<8}  {}",
@@ -5005,10 +5485,10 @@ fn view_row(
         View::All => summary_line(summary, axis, pool),
         View::Can => {
             if summary.event.is_some() {
-                return event_row(summary, axis);
+                return event_row(summary, View::Can, axis);
             }
             format!(
-                "{time:>12} {channel:>3} {:<6} {:<3} {:>3}  {}",
+                "{time:>12} {channel:>3} {:<6} {:<3} {:>3} {:<9}  {}",
                 summary
                     .frame_id
                     .map_or_else(|| "-".to_string(), |id| format!("0x{id:X}")),
@@ -5016,12 +5496,13 @@ fn view_row(
                 summary
                     .dlc
                     .map_or_else(|| "-".to_string(), |value| value.to_string()),
+                can_flag_label(summary.can_flags),
                 hex_bytes(&summary.payload)
             )
         }
         View::Lin => {
             if summary.event.is_some() {
-                return event_row(summary, axis);
+                return event_row(summary, View::Lin, axis);
             }
             format!(
                 "{time:>12} {channel:>3} {:<6} {:<3} {:>3} {:<8}  {}",
@@ -5039,7 +5520,7 @@ fn view_row(
         View::Ethernet => {
             let Some(info) = &summary.ethernet else {
                 if summary.event.is_some() {
-                    return event_row(summary, axis);
+                    return event_row(summary, View::Ethernet, axis);
                 }
                 return summary_line(summary, axis, pool);
             };
@@ -5065,18 +5546,36 @@ fn view_row(
     }
 }
 
-/// A record without payload: time, channel, kind, then the decoded text.
-fn event_row(summary: &MessageSummary, axis: TimeAxis) -> String {
+/// A record without payload.
+///
+/// The frame columns keep their width so the row stays aligned with the header;
+/// they are all `-`, and the decoded text starts where the payload column does,
+/// labelled with the record kind.
+fn event_row(summary: &MessageSummary, view: View, axis: TimeAxis) -> String {
     let time = axis.format(summary.timestamp_ns);
     let channel = summary
         .channel
         .map_or_else(|| "-".to_string(), |value| value.to_string());
-    match &summary.event {
-        Some(event) => format!(
-            "{time:>12} {channel:>3} {:<7} {:<9} {:<5}  {}",
-            "-", event.kind, "-", event.summary
+    let text = match &summary.event {
+        Some(event) => format!("{}: {}", event.kind, event.summary),
+        None => "-".to_string(),
+    };
+    match view {
+        // `id dir dlc flags`
+        View::Can => format!(
+            "{time:>12} {channel:>3} {:<6} {:<3} {:>3} {:<9}  {text}",
+            "-", "-", "-", "-"
         ),
-        None => format!("{time:>12} {channel:>3} -       -         -      "),
+        // `id dir dlc crc`
+        View::Lin => format!(
+            "{time:>12} {channel:>3} {:<6} {:<3} {:>3} {:<8}  {text}",
+            "-", "-", "-", "-"
+        ),
+        // `type proto vlan`
+        View::Ethernet | View::All => format!(
+            "{time:>12} {channel:>3} {:<7} {:<9} {:<5}  {text}",
+            "-", "-", "-"
+        ),
     }
 }
 
@@ -7950,6 +8449,7 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
             bus_label: "can",
             ethernet: None,
             event: None,
+            can_flags: 0,
             channel: Some(1),
             frame_id: Some(0x123),
             object_type_raw: 1,
@@ -8105,6 +8605,7 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
             bus_label: "can",
             ethernet: None,
             event: None,
+            can_flags: 0,
             channel: Some(1),
             frame_id: Some(0x344),
             object_type_raw: 1,
@@ -8141,6 +8642,7 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
             bus_label: bus.as_str(),
             ethernet: None,
             event: None,
+            can_flags: 0,
             channel: Some(channel),
             frame_id: Some(frame_id),
             object_type_raw: 101,
@@ -9063,6 +9565,7 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
             bus_label: "can",
             ethernet: None,
             event: None,
+            can_flags: 0,
             channel: Some(1),
             frame_id: Some(0x344),
             object_type_raw: 1,
@@ -9476,5 +9979,348 @@ mod bus_event_tests {
         assert!(event.summary.contains("invalid CRC"), "{event:?}");
         assert!(event.summary.contains("64 bytes"), "{event:?}");
         assert!(event.summary.contains("0xDEADBEEF"), "{event:?}");
+    }
+}
+
+#[cfg(test)]
+mod text_record_tests {
+    use super::*;
+    use blf_core::{AppText, ObjectHeader, ObjectHeaderBase, ObjectType, RawObjectHeader};
+
+    fn app_text(source: u32, text: &[u8]) -> Object {
+        Object::AppText(AppText {
+            header: {
+                ObjectHeader {
+                    base: ObjectHeaderBase {
+                        signature: blf_core::OBJECT_SIGNATURE,
+                        header_size: 32,
+                        header_version: 1,
+                        object_size: 48 + text.len() as u32,
+                        object_type: ObjectType::AppText,
+                        raw_object_type: 65,
+                    },
+                    object_flags: 0,
+                    client_index: 0,
+                    object_version: 0,
+                    object_time_stamp: 0,
+                }
+            },
+            source,
+            reserved_app_text1: 0,
+            text_length: text.len() as u32,
+            reserved_app_text2: 0,
+            text: text.to_vec(),
+            raw_data: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn metadata_fragments_are_joined_into_one_document() {
+        let objects = vec![
+            app_text(2, b"<?xml version=\"1.0\"?><a>"),
+            app_text(2, b"middle"),
+            app_text(2, b"</a>"),
+            // A second document starts with its own declaration.
+            app_text(2, b"<?xml version=\"1.0\"?><b/>"),
+            // Other sources never join a document.
+            app_text(1, b"\x00"),
+            app_text(0, b"Comment"),
+        ];
+        let (documents, owner) = collect_metadata(&objects);
+        assert_eq!(documents.len(), 2);
+        assert_eq!(documents[0], "<?xml version=\"1.0\"?><a>middle</a>");
+        assert_eq!(documents[1], "<?xml version=\"1.0\"?><b/>");
+        assert_eq!(owner[0], Some(0));
+        assert_eq!(owner[1], Some(0));
+        assert_eq!(owner[2], Some(0));
+        assert_eq!(owner[3], Some(1));
+        assert_eq!(owner[4], None);
+    }
+
+    #[test]
+    fn metadata_rows_carry_the_whole_document_in_their_search_text() {
+        let objects = vec![
+            app_text(
+                2,
+                b"<?xml version=\"1.0\"?><channels network=\"Ethernet11\"/>",
+            ),
+            app_text(2, b""),
+        ];
+        let mut pool = TextPool::default();
+        let mut summaries: Vec<MessageSummary> = objects
+            .iter()
+            .enumerate()
+            .map(|(index, object)| summary_for(index, object, &mut pool))
+            .collect();
+        let (documents, owner) = collect_metadata(&objects);
+        for (index, summary) in summaries.iter_mut().enumerate() {
+            let Some(Some(document)) = owner.get(index).copied() else {
+                continue;
+            };
+            let Some(document) = documents.get(document) else {
+                continue;
+            };
+            if let Some(event) = summary.event.as_mut() {
+                event.search.push(' ');
+                event.search.push_str(&document.to_lowercase());
+            }
+        }
+        let mut buffer = String::new();
+        // The network name only exists in the joined document.
+        assert!(summary_matches_in(
+            &summaries[0],
+            "ethernet11",
+            &mut buffer,
+            &pool
+        ));
+    }
+
+    #[test]
+    fn lost_objects_are_totaled_from_the_trace() {
+        use blf_core::{FieldValue, StructuredObject};
+        let lost_end = |lost: u64, since: u64| {
+            Object::Structured(StructuredObject {
+                object_type: ObjectType::DataLostEnd,
+                header: RawObjectHeader::Object(ObjectHeader {
+                    base: ObjectHeaderBase {
+                        signature: blf_core::OBJECT_SIGNATURE,
+                        header_size: 32,
+                        header_version: 1,
+                        object_size: 56,
+                        object_type: ObjectType::DataLostEnd,
+                        raw_object_type: 126,
+                    },
+                    object_flags: 2,
+                    client_index: 0,
+                    object_version: 0,
+                    object_time_stamp: 0,
+                }),
+                class_name: "DataLostEnd".to_string(),
+                fields: vec![
+                    ("queueIdentifier".to_string(), FieldValue::U32(1)),
+                    (
+                        "firstObjectLostTimeStamp".to_string(),
+                        FieldValue::U64(since),
+                    ),
+                    (
+                        "numberOfLostEvents".to_string(),
+                        FieldValue::U32(lost as u32),
+                    ),
+                ],
+                extensions: Vec::new(),
+                data: Vec::new(),
+            })
+        };
+        let objects = vec![lost_end(5, 100), lost_end(7, 200)];
+        assert_eq!(count_lost_objects(&objects), (12, 2));
+        assert_eq!(count_lost_objects(&[]), (0, 0));
+
+        // A data-lost record reads as a warning row, not an empty one.
+        let mut pool = TextPool::default();
+        let summary = summary_for(0, &objects[0], &mut pool);
+        let event = summary.event.as_ref().expect("event");
+        assert!(event.summary.contains("lost 5 objects"), "{event:?}");
+        assert!(event.summary.contains("100"), "{event:?}");
+    }
+}
+
+#[cfg(test)]
+mod record_display_tests {
+    use super::*;
+    use blf_core::{
+        AppText, CanFdMessage64, ObjectHeader, ObjectHeaderBase, ObjectType, RawObjectHeader,
+        StructuredObject,
+    };
+
+    fn header(object_type: ObjectType, raw: u32) -> RawObjectHeader {
+        RawObjectHeader::Object(ObjectHeader {
+            base: ObjectHeaderBase {
+                signature: blf_core::OBJECT_SIGNATURE,
+                header_size: 32,
+                header_version: 1,
+                object_size: 96,
+                object_type,
+                raw_object_type: raw,
+            },
+            object_flags: 2,
+            client_index: 0,
+            object_version: 0,
+            object_time_stamp: 1_000_000,
+        })
+    }
+
+    fn structured(object_type: ObjectType, fields: Vec<(&str, FieldValue)>) -> Object {
+        Object::Structured(StructuredObject {
+            object_type,
+            header: header(object_type, object_type.as_u32()),
+            class_name: object_type.name().to_string(),
+            fields: fields
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value))
+                .collect(),
+            extensions: Vec::new(),
+            data: Vec::new(),
+        })
+    }
+
+    fn app_text(source: u32, text: &[u8]) -> Object {
+        Object::AppText(AppText {
+            header: match header(ObjectType::AppText, 65) {
+                RawObjectHeader::Object(header) => header,
+                _ => unreachable!(),
+            },
+            source,
+            reserved_app_text1: 0,
+            text_length: text.len() as u32,
+            reserved_app_text2: 0,
+            text: text.to_vec(),
+            raw_data: Vec::new(),
+        })
+    }
+
+    fn axis() -> TimeAxis {
+        TimeAxis {
+            mode: TimeMode::Absolute,
+            base: 0,
+        }
+    }
+
+    #[test]
+    fn system_variables_show_their_value_and_type() {
+        // type 2 is a 32-bit integer in the official table.
+        let mut data = vec![0_u8; 4];
+        data[..4].copy_from_slice(&1234_u32.to_le_bytes());
+        let object = structured(
+            ObjectType::SysVariable,
+            vec![
+                ("type", FieldValue::U32(2)),
+                ("representation", FieldValue::U32(0)),
+                ("nameLength", FieldValue::U32(5)),
+                ("dataLength", FieldValue::U32(4)),
+                ("name", FieldValue::String("::a::b".to_string())),
+                ("data", FieldValue::Bytes(data)),
+            ],
+        );
+        let mut pool = TextPool::default();
+        let summary = summary_for(0, &object, &mut pool);
+        assert_eq!(summary.status, "event");
+        let event = summary.event.as_ref().expect("event");
+        assert_eq!(event.kind, "SV");
+        assert!(event.summary.contains("::a::b = 1234"), "{event:?}");
+        assert!(event.summary.contains("(long)"), "{event:?}");
+        // The variable name is searchable.
+        let mut buffer = String::new();
+        assert!(summary_matches_in(&summary, "::a::b", &mut buffer, &pool));
+    }
+
+    #[test]
+    fn application_text_reports_its_purpose() {
+        // A measurement comment is stored as UTF-16LE by CANoe.
+        let comment: Vec<u8> = "Comment"
+            .encode_utf16()
+            .flat_map(|unit| unit.to_le_bytes())
+            .chain([0, 0])
+            .collect();
+        let object = app_text(0, &comment);
+        let mut pool = TextPool::default();
+        let summary = summary_for(0, &object, &mut pool);
+        let event = summary.event.as_ref().expect("event");
+        assert_eq!(event.kind, "text");
+        assert!(event.summary.contains("measurement comment"), "{event:?}");
+        assert!(event.summary.contains("Comment"), "{event:?}");
+
+        // Channel info carries a packed flag word, not text.
+        let mut packed = vec![0_u8; 4];
+        packed.copy_from_slice(&0x01_00_07_02_u32.to_le_bytes());
+        let object = app_text(1, &packed);
+        let summary = summary_for(0, &object, &mut pool);
+        let event = summary.event.as_ref().expect("event");
+        assert!(event.summary.contains("channel info"), "{event:?}");
+        // 0x01000702 packs version 2, channel 7, bus type 0 and CAN FD 1.
+        assert!(event.summary.contains("channel 7"), "{event:?}");
+        assert!(event.summary.contains("version 2"), "{event:?}");
+        assert!(event.summary.contains("CAN FD 1"), "{event:?}");
+    }
+
+    #[test]
+    fn can_frame_flags_are_reported() {
+        // CAN FD with BRS and ESI set.
+        let object = Object::CanFdMessage64(CanFdMessage64 {
+            header: match header(ObjectType::CanFdMessage64, 101) {
+                RawObjectHeader::Object(header) => header,
+                _ => unreachable!(),
+            },
+            channel: 1,
+            dlc: 9,
+            valid_data_bytes: 8,
+            tx_count: 0,
+            id: 0x123,
+            frame_length: 100,
+            flags: 0x02 | 0x04,
+            btr_cfg_arb: 0,
+            btr_cfg_data: 0,
+            time_offset_brs_ns: 0,
+            time_offset_crc_del_ns: 0,
+            bit_count: 0,
+            dir: 1,
+            ext_data_offset: 0,
+            crc: 0,
+            data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            ext_data: None,
+            reserved_can_fd_ext_frame_data: Vec::new(),
+            raw_data: Vec::new(),
+        });
+        let mut pool = TextPool::default();
+        let summary = summary_for(0, &object, &mut pool);
+        assert_eq!(summary.can_flags & CAN_FLAG_BRS, CAN_FLAG_BRS);
+        assert_eq!(summary.can_flags & CAN_FLAG_ESI, CAN_FLAG_ESI);
+        assert_eq!(summary.can_flags & CAN_FLAG_REMOTE, 0);
+        let label = can_flag_label(summary.can_flags);
+        assert!(label.contains("brs"), "{label}");
+        assert!(label.contains("esi"), "{label}");
+
+        // The CAN view keeps its columns aligned and shows the flags.
+        let row = view_row(&summary, View::Can, axis(), &pool, 120);
+        assert!(row.contains("brs"), "{row}");
+        let header = view_header(View::Can, 120);
+        assert!(header.contains("flags"), "{header}");
+    }
+
+    #[test]
+    fn overrun_records_name_their_bus() {
+        let object = structured(
+            ObjectType::OverrunError,
+            vec![
+                ("busType", FieldValue::U32(1)),
+                ("channel", FieldValue::U16(3)),
+            ],
+        );
+        let mut pool = TextPool::default();
+        let summary = summary_for(0, &object, &mut pool);
+        let event = summary.event.as_ref().expect("event");
+        assert_eq!(event.kind, "OVERRUN");
+        assert_eq!(event.bus_label, "can");
+        assert!(event.summary.contains("overrun"), "{event:?}");
+        assert!(event.summary.contains('3'), "{event:?}");
+    }
+
+    #[test]
+    fn a_trace_that_lost_objects_says_so_in_the_header() {
+        use blf_core::FieldValue::U32;
+        let lost = structured(
+            ObjectType::DataLostEnd,
+            vec![
+                ("queueIdentifier", U32(1)),
+                ("firstObjectLostTimeStamp", FieldValue::U64(500)),
+                ("numberOfLostEvents", U32(9)),
+            ],
+        );
+        let mut pool = TextPool::default();
+        let summary = summary_for(0, &lost, &mut pool);
+        let event = summary.event.as_ref().expect("event");
+        assert_eq!(event.kind, "LOST");
+        assert!(event.summary.contains("lost 9 objects"), "{event:?}");
+        // The header warning is driven by the same total.
+        assert_eq!(count_lost_objects(&[lost]), (9, 1));
     }
 }

@@ -1710,3 +1710,68 @@ def test_ethernet_status_and_phy_state_fields(tmp_path):
     assert phy["phyState"] == 1
     assert phy["phyEvent"] == 8
     assert phy["hardwareChannel"] == 12
+
+
+def test_app_text_names_its_purpose_and_decodes_utf16(tmp_path):
+    """An application text record carries its purpose and readable text."""
+    inner = bytearray()
+
+    def app_text(source, text):
+        # header 32, then source, reserved, textLength and a reserved word.
+        object_size = 48 + len(text)
+        header = struct.pack(
+            "<IHHIIIHHQ", 0x4A424F4C, 32, 1, object_size, 65, 0, 0, 0, 0
+        )
+        return header + struct.pack("<IIII", source, 0, len(text), 0) + text
+
+    # A measurement comment is stored as UTF-16LE by CANoe.
+    comment = "Comment".encode("utf-16-le") + b"\x00\x00"
+    inner += app_text(0, comment)
+    inner += app_text(2, b'<?xml version="1.0"?><a/>')
+
+    path = tmp_path / "app-text.blf"
+    _write_objects(path, bytes(inner), 2)
+
+    with open(str(path)) as reader:
+        objects = list(reader)
+    assert [type(obj).__name__ for obj in objects] == ["AppText", "AppText"]
+    assert objects[0].source_name == "measurement comment"
+    assert objects[0].decoded_text == "Comment"
+    assert objects[1].source_name == "metadata"
+    assert objects[1].decoded_text.startswith("<?xml")
+
+
+def test_system_variable_exposes_the_typed_value(tmp_path):
+    """A system variable's bytes are interpreted according to its type."""
+    inner = bytearray()
+
+    def sysvar(kind, name, data):
+        # type, representation, 8 reserved bytes, name length, data length,
+        # 8 more reserved bytes, then the name and the value.
+        object_size = 64 + len(name) + len(data)
+        header = struct.pack(
+            "<IHHIIIHHQ", 0x4A424F4C, 32, 1, object_size, 72, 0, 0, 0, 0
+        )
+        body = struct.pack("<II", kind, 0)
+        body += struct.pack("<Q", 0)
+        body += struct.pack("<II", len(name), len(data))
+        body += struct.pack("<Q", 0)
+        return header + body + name + data
+
+    inner += sysvar(2, b"::a::b", struct.pack("<I", 1234))
+    inner += sysvar(1, b"::a::d", struct.pack("<d", 2.5))
+    inner += sysvar(3, b"::a::s", b"hello\x00")
+
+    path = tmp_path / "sysvar.blf"
+    _write_objects(path, bytes(inner), 3)
+
+    with open(str(path)) as reader:
+        objects = list(reader)
+    assert [type(obj).__name__ for obj in objects] == ["SystemVariable"] * 3
+    assert objects[0].name == "::a::b"
+    assert objects[0].sysvar_type == "long"
+    assert objects[0].value == "1234"
+    assert objects[1].sysvar_type == "double"
+    assert objects[1].value == "2.5"
+    assert objects[2].sysvar_type == "string"
+    assert objects[2].value.strip('"') == "hello"

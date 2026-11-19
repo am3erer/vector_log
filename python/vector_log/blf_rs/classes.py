@@ -509,7 +509,22 @@ class CanFdErrorFrame64(_Object):
 
 
 class AppText(_Object):
-    pass
+    """An application text record.
+
+    ``source_name`` says what the record is for (measurement comment, channel
+    info, metadata, ...) and ``decoded_text`` decodes the payload, which CANoe
+    writes either as plain bytes or as UTF-16LE.
+    """
+
+    @property
+    def source_name(self):
+        return self._data.get("source_name")
+
+    @property
+    def decoded_text(self):
+        return self._data.get("decoded_text")
+
+
 
 
 class RestorePointContainer(_Object):
@@ -714,6 +729,29 @@ _RAW_CLASS_NAMES = (
 
 for _name in _RAW_CLASS_NAMES:
     globals()[_name] = type(_name, (StructuredObject,), {})
+
+
+class SystemVariable(StructuredObject):
+    """A system variable record with its value interpreted by type.
+
+    ``sysvar_type`` names the stored type (double, long, string, ...) and
+    ``value`` is the payload rendered the way CANoe shows it.
+    """
+
+    @property
+    def name(self):
+        return (self.fields or {}).get("name")
+
+    @property
+    def sysvar_type(self):
+        return self._data.get("sysvar_type")
+
+    @property
+    def value(self):
+        return self._data.get("sysvar_value")
+
+
+globals()["SystemVariable"] = SystemVariable
 
 CLASS_BY_NAME = {
     cls.__name__: cls

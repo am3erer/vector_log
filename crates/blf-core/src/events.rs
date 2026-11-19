@@ -190,6 +190,239 @@ pub fn lin_spike_origin_name(value: u8) -> &'static str {
     }
 }
 
+/// Kind of an application-text record, from `VBLAppText::mSource`.
+pub fn app_text_source_name(source: u32) -> &'static str {
+    match source {
+        0 => "measurement comment",
+        1 => "channel info",
+        2 => "metadata",
+        3 => "attachment",
+        4 => "trace line",
+        _ => "unknown source",
+    }
+}
+
+/// Type of a system variable payload, from `VBLSystemVariable::mType`.
+pub fn sysvar_type_name(kind: u32) -> &'static str {
+    match kind {
+        1 => "double",
+        2 => "long",
+        3 => "string",
+        4 => "double array",
+        5 => "long array",
+        6 => "long long",
+        7 => "byte array",
+        _ => "unknown type",
+    }
+}
+
+/// Where a trace-line text came from, `APPTEXT_TRACELINE_SOURCE`.
+pub fn trace_line_source_name(source: u32) -> &'static str {
+    match source {
+        0x0 => "write to log",
+        0x1 => "timer",
+        0x2 => "write to X",
+        0x3 => "node layer",
+        0x4 => "CAPL on-board",
+        _ => "unknown source",
+    }
+}
+
+/// Direction of a CAN frame, `CAN_MSG_DIR`.
+pub fn can_message_direction_name(flags: u8) -> &'static str {
+    match flags & 0x0F {
+        0 => "Rx",
+        1 => "Tx",
+        2 => "TxRq",
+        _ => "reserved",
+    }
+}
+
+/// Frame kinds a CAN record can carry beyond a plain data frame, from the
+/// `CAN_MSG_RTR`, `CAN_MSG_WU` and `CAN_MSG_NERR` bits.
+pub fn can_message_flags_text(flags: u8) -> String {
+    let mut parts = Vec::new();
+    if flags & 0x80 != 0 {
+        parts.push("remote");
+    }
+    if flags & 0x40 != 0 {
+        parts.push("wakeup");
+    }
+    if flags & 0x20 != 0 {
+        parts.push("no error");
+    }
+    parts.join(", ")
+}
+
+/// CAN FD frame properties, from `CAN_FD_MSG_EDL`, `CAN_FD_MSG_BRS` and
+/// `CAN_FD_MSG_ESI`.
+pub fn can_fd_flags_text(flags: u32) -> String {
+    let mut parts = Vec::new();
+    if flags & 0x01 != 0 {
+        parts.push("FD");
+    }
+    if flags & 0x02 != 0 {
+        parts.push("BRS");
+    }
+    if flags & 0x04 != 0 {
+        parts.push("ESI");
+    }
+    parts.join(" ")
+}
+
+/// Render the payload of a `VBLSystemVariable` according to its declared type.
+///
+/// The data block is a bare C value: a `double`, a 32-bit or 64-bit integer, a
+/// NUL-terminated string, or a run of those for the array types. Anything the
+/// type table does not name falls back to hex so the bytes stay visible.
+pub fn sysvar_value_text(kind: u32, data: &[u8]) -> String {
+    let signed = |bytes: &[u8]| -> Option<i64> {
+        match bytes.len() {
+            4 => Some(i64::from(i32::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3],
+            ]))),
+            8 => Some(i64::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ])),
+            _ => None,
+        }
+    };
+    let unsigned = |bytes: &[u8]| -> Option<u64> {
+        match bytes.len() {
+            4 => Some(u64::from(u32::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3],
+            ]))),
+            8 => Some(u64::from_le_bytes([
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+            ])),
+            _ => None,
+        }
+    };
+    let as_double = |bytes: &[u8]| -> Option<f64> {
+        (bytes.len() >= 8).then(|| f64::from_le_bytes(bytes[..8].try_into().unwrap()))
+    };
+    let text_of = |bytes: &[u8]| -> String {
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(bytes.len());
+        String::from_utf8_lossy(&bytes[..end]).to_string()
+    };
+    match kind {
+        1 => as_double(data).map_or_else(|| hex_text(data), |value| format!("{value}")),
+        2 => unsigned(data).map_or_else(|| hex_text(data), |value| format!("{value}")),
+        3 => format!("{:?}", text_of(data)),
+        4 => {
+            // A run of doubles; show the count so a long array stays readable.
+            let count = data.len() / 8;
+            let mut parts: Vec<String> = data
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .take(4)
+                .filter_map(|chunk| as_double(chunk).map(|value| format!("{value}")))
+                .collect();
+            if count > parts.len() {
+                parts.push(format!("... ({count} values)"));
+            }
+            format!("[{}]", parts.join(", "))
+        }
+        5 => {
+            let count = data.len() / 4;
+            let mut parts: Vec<String> = data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .take(4)
+                .filter_map(|chunk| unsigned(chunk).map(|value| format!("{value}")))
+                .collect();
+            if count > parts.len() {
+                parts.push(format!("... ({count} values)"));
+            }
+            format!("[{}]", parts.join(", "))
+        }
+        6 => unsigned(data).map_or_else(|| hex_text(data), |value| format!("{value}")),
+        7 => format!("{} bytes {}", data.len(), hex_text(data)),
+        _ => {
+            let _ = signed;
+            hex_text(data)
+        }
+    }
+}
+
+/// Two hex digits per byte, space separated.
+fn hex_text(data: &[u8]) -> String {
+    data.iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Decode the text of a `VBLAppText` record.
+///
+/// The header says the payload is MBCS, but CANoe writes the measurement
+/// comment as UTF-16LE, so both encodings appear in the wild. A UTF-16 run has
+/// a zero high byte in most characters, which is what the check below keys on.
+pub fn app_text_text(bytes: &[u8]) -> String {
+    let trimmed = match bytes.iter().position(|byte| *byte == 0) {
+        Some(0) if bytes.len() > 1 => bytes,
+        _ => bytes,
+    };
+    let utf16_like = trimmed.len() >= 4
+        && trimmed.len() % 2 == 0
+        && trimmed
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .filter(|b| **b == 0)
+            .count()
+            * 3
+            >= trimmed.len() / 2;
+    if utf16_like {
+        let units: Vec<u16> = trimmed
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
+            .take_while(|unit| *unit != 0)
+            .collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        let end = trimmed
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(trimmed.len());
+        String::from_utf8_lossy(&trimmed[..end]).to_string()
+    }
+}
+
+/// Fields packed into `VBLAppText` when the source is `DBCHANNELINFO`.
+pub fn app_text_channel_info(flags: u32) -> String {
+    let version = flags & 0xFF;
+    let channel = (flags >> 8) & 0xFF;
+    let bus_type = (flags >> 16) & 0xFF;
+    let can_fd = (flags >> 24) & 0x01;
+    format!("channel {channel}, bus type {bus_type}, version {version}, CAN FD {can_fd}")
+}
+
+/// A trace-line record's flags: where the line came from and how it is shown.
+pub fn app_text_trace_line(flags: u32) -> String {
+    format!(
+        "{}, {}, {}",
+        trace_line_source_name(flags & 0x0F),
+        if flags & 0x10 != 0 {
+            "shown in trace"
+        } else {
+            "hidden"
+        },
+        if flags & 0x20 != 0 {
+            "text only"
+        } else {
+            "with timestamp"
+        }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

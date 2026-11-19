@@ -1532,9 +1532,15 @@ fn object_to_dict(py: Python<'_>, object: &blf_core::Object) -> PyResult<PyObjec
         blf_core::Object::AppText(value) => {
             dict.set_item("class", "AppText")?;
             dict.set_item("source", value.source)?;
+            // The purpose names the record, and `text` decodes both the plain
+            // and the UTF-16 payloads CANoe writes.
+            dict.set_item("source_name", blf_core::app_text_source_name(value.source))?;
             dict.set_item("text", PyBytes::new(py, &value.text))?;
+            dict.set_item("decoded_text", blf_core::app_text_text(&value.text))?;
             let fields = PyDict::new(py);
             fields.set_item("source", value.source)?;
+            fields.set_item("sourceName", blf_core::app_text_source_name(value.source))?;
+            fields.set_item("decodedText", blf_core::app_text_text(&value.text))?;
             fields.set_item("reservedAppText1", value.reserved_app_text1)?;
             fields.set_item("textLength", value.text_length)?;
             fields.set_item("reservedAppText2", value.reserved_app_text2)?;
@@ -1588,6 +1594,35 @@ fn object_to_dict(py: Python<'_>, object: &blf_core::Object) -> PyResult<PyObjec
             });
             dict.set_item("payload", PyBytes::new(py, &payload))?;
             dict.set_item("extensions", PyBytes::new(py, &value.extensions))?;
+            // A system variable stores a bare C value; its type says how to read
+            // the bytes, so hand out the interpreted form as well.
+            if value.object_type == blf_core::ObjectType::SysVariable {
+                let type_of = |name: &str| {
+                    value.fields.iter().find_map(|(field, value)| {
+                        if field != name {
+                            return None;
+                        }
+                        match value {
+                            blf_core::FieldValue::U32(number) => Some(u64::from(*number)),
+                            _ => None,
+                        }
+                    })
+                };
+                let data = value.fields.iter().find_map(|(field, value)| {
+                    if field != "data" {
+                        return None;
+                    }
+                    match value {
+                        blf_core::FieldValue::Bytes(bytes) => Some(bytes.clone()),
+                        _ => None,
+                    }
+                });
+                if let (Some(kind), Some(data)) = (type_of("type"), data) {
+                    let kind = u32::try_from(kind).unwrap_or(0);
+                    dict.set_item("sysvar_type", blf_core::sysvar_type_name(kind))?;
+                    dict.set_item("sysvar_value", blf_core::sysvar_value_text(kind, &data))?;
+                }
+            }
             let fields = PyDict::new(py);
             for (name, field) in &value.fields {
                 let field_value = field_value_to_py(py, field)?;

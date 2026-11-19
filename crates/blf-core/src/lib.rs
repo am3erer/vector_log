@@ -33,10 +33,12 @@ pub use ethernet::{
     EthernetField, EthernetHeader,
 };
 pub use events::{
-    can_driver_error_name, can_error_code_name, can_error_direction_name, ethernet_rx_error_name,
-    ethernet_sqi_name, lin_checksum_model_name, lin_disturbance_type_name,
-    lin_long_dom_signal_type_name, lin_sleep_flags_text, lin_sleep_reason_name,
-    lin_spike_origin_name, lin_wakeup_length_name,
+    app_text_channel_info, app_text_source_name, app_text_text, app_text_trace_line,
+    can_driver_error_name, can_error_code_name, can_error_direction_name, can_fd_flags_text,
+    can_message_direction_name, can_message_flags_text, ethernet_rx_error_name, ethernet_sqi_name,
+    lin_checksum_model_name, lin_disturbance_type_name, lin_long_dom_signal_type_name,
+    lin_sleep_flags_text, lin_sleep_reason_name, lin_spike_origin_name, lin_wakeup_length_name,
+    sysvar_type_name, sysvar_value_text, trace_line_source_name,
 };
 pub use ldf::{
     decode_lin_frame, decode_lin_object, decode_lin_signal, protected_identifier,

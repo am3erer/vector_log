@@ -33,6 +33,20 @@ diagnostic objects, including:
   appear in the Ethernet view with their channel and hardware channel, for
   example `ch 4.12 · PHY normal state · wakeup received`, and their values keep
   the names from the BLF Ethernet format document.
+- Application texts are decoded by purpose: measurement comment (CANoe writes
+  it as UTF-16LE), channel info (packed version/channel/bus-type/CAN-FD word),
+  metadata (the XML is split every 2048 bytes, so the fragments are joined back
+  into documents and are readable, searchable and scrollable in the inspector),
+  attachment and trace line.
+- System variables are shown with their value rendered by type (`long`,
+  `double`, `string`, arrays), so a trace reads `::VTS::M7::RelayComRef78 = 0`
+  instead of an opaque byte string.
+- CAN frames report the properties the format defines beyond the identifier:
+  remote, wakeup and no-error bits plus the CAN FD `BRS` and `ESI` flags, in a
+  dedicated column.
+- A capture that reports lost objects says so in the list header
+  (`⚠ LOST n objects`), because `DataLostEnd` and `OverrunError` mean the trace
+  is incomplete.
 - Records that are not frames are decoded as well, with the names from the
   logging format documents: CAN driver errors (`chip state bus off`, `receive
   queue overrun`, ...), CAN error frames (Vector CAN core codes such as `CRC
