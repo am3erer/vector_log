@@ -4441,7 +4441,19 @@ fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
                 .done(),
         ),
         blf_core::ObjectType::EthernetStatus | blf_core::ObjectType::EthernetPhyState => {
-            let where_ = where_(field("hardwareChannel"));
+            // The flags say which fields carry information: bit 2 is the
+            // hardware channel in a PHY state record, bit 8 in a status record.
+            let flags = field("flags").unwrap_or(0);
+            let hardware = if object.object_type == blf_core::ObjectType::EthernetPhyState {
+                flags & 0b100 != 0
+            } else {
+                flags & 0x0100 != 0
+            };
+            let where_ = if hardware {
+                where_(field("hardwareChannel"))
+            } else {
+                where_(None)
+            };
             let mut parts = vec![where_];
             if object.object_type == blf_core::ObjectType::EthernetStatus {
                 if let Some(link) = field("linkStatus") {

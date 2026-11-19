@@ -96,7 +96,17 @@ fn real_capture_object_counts_match_the_reference_reader() {
         let actual = counts.get(name).copied().unwrap_or(0);
         assert_eq!(actual, *expected, "{name} count");
     }
+    // The trace body holds 442_597 objects. We additionally surface the seven
+    // `RestorePointContainer` records and the trailing "Comment" `AppText`, which
+    // CANoe's own reader treats as file trailer and hides.
+    assert_eq!(counts.get("RestorePointContainer").copied(), Some(7));
     assert_eq!(counts.values().sum::<i64>(), 442_605, "total objects");
+    let body: i64 = counts
+        .iter()
+        .filter(|(name, _)| **name != "RestorePointContainer")
+        .map(|(_, count)| *count)
+        .sum();
+    assert_eq!(body, 442_598, "objects outside the restore points");
 }
 
 #[test]

@@ -43,6 +43,12 @@ diagnostic objects, including:
   receive errors (`invalid CRC`, FCS, frame length). Each one is a single
   decoded line and belongs to its bus, so the CAN, LIN and Ethernet views show
   errors and statistics instead of hiding them.
+- Every documented CAN, LIN and Ethernet object type is decoded, and the
+  layouts are checked against Vector's own `binlog` library: a fixture written
+  through its `BLWriteObject` API holds one instance of each type, and
+  `crates/blf-core/tests/official_fixture.rs` asserts every field against the
+  value that was written. The 442 425 records of the sample capture also match
+  that library field for field.
 - Objects that straddle a container boundary are stitched back together: a
   container holds exactly 128 KiB, so Vector cuts the last object in half, and
   the reader joins it with the following container instead of dropping it.

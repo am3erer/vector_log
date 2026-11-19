@@ -1848,6 +1848,9 @@ fn structured_schema(object_type: ObjectType) -> &'static [FieldSpec] {
             DynamicString("path", "pathLength"),
             DynamicBytes("data", "dataLength"),
         ],
+        ObjectType::DistributedObjectChange => {
+            &[U32("dataLength"), DynamicBytes("data", "dataLength")]
+        }
         ObjectType::AttributeEvent => &[
             U32("mainAttributableObjectPathLength"),
             U32("memberPathLength"),

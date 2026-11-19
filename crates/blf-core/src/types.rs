@@ -138,8 +138,11 @@ pub enum ObjectType {
     CanSettingChanged = 129,
     DistributedObjectMember = 130,
     AttributeEvent = 131,
+    /// Communication setup change, from the official binlog header.
+    DistributedObjectChange = 132,
     /// Ethernet PHY state event, `VBLEthernetPhyState`; the value is not in the
-    /// public document, it was confirmed against a captured log.
+    /// public document, it was confirmed against a captured log and the
+    /// official binlog header.
     EthernetPhyState = 133,
 }
 
@@ -277,6 +280,7 @@ impl ObjectType {
             129 => Self::CanSettingChanged,
             130 => Self::DistributedObjectMember,
             131 => Self::AttributeEvent,
+            132 => Self::DistributedObjectChange,
             133 => Self::EthernetPhyState,
             _ => Self::Unknown,
         }
@@ -417,6 +421,7 @@ pub fn object_type_name(value: u32) -> &'static str {
         129 => "CanSettingChanged",
         130 => "DistributedObjectMember",
         131 => "AttributeEvent",
+        132 => "DistributedObjectChange",
         133 => "EthernetPhyState",
         _ => "UnknownObject",
     }
