@@ -1139,3 +1139,84 @@ fn ethernet_status_values_have_names() {
     assert_eq!(blf_core::ethernet_phy_type_name(4), "other");
     assert_eq!(blf_core::ethernet_phy_state_name(9), "reserved");
 }
+
+#[test]
+fn stitches_an_object_cut_by_a_container_boundary() {
+    // Vector fills a container completely, so an object can continue in the
+    // next one; the reader has to join the two halves instead of dropping the
+    // tail (which used to lose one object per container).
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("container-boundary.blf");
+
+    let first = can_message();
+    let second = can_message2();
+    let third = can_fd_message64();
+    // Split the second object three bytes into its body.
+    let split = first.len() + 35;
+    let mut stream = Vec::new();
+    stream.extend_from_slice(&first);
+    stream.extend_from_slice(&second);
+    stream.extend_from_slice(&third);
+
+    let mut file = file_statistics(stream.len() as u64, 3);
+    file.extend_from_slice(&log_container(&stream[..split]));
+    file.extend_from_slice(&log_container(&stream[split..]));
+    fs::write(&path, file).unwrap();
+
+    let mut reader = File::open(&path).unwrap();
+    assert_eq!(
+        reader.read().unwrap().unwrap().object_type(),
+        ObjectType::CanMessage
+    );
+    let joined = reader.read().unwrap().unwrap();
+    assert_eq!(joined.object_type(), ObjectType::CanMessage2);
+    match joined {
+        Object::CanMessage2(frame) => {
+            assert_eq!(frame.id, 0x456);
+            assert_eq!(frame.data, vec![1, 2, 3, 4]);
+            assert_eq!(frame.header.object_time_stamp, 200);
+        }
+        _ => panic!("wrong object"),
+    }
+    assert_eq!(
+        reader.read().unwrap().unwrap().object_type(),
+        ObjectType::CanFdMessage64
+    );
+    assert!(reader.read().unwrap().is_none());
+    assert_eq!(reader.skipped_object_count, 0);
+}
+
+#[test]
+fn a_damaged_tail_is_still_reported_rather_than_carried_forever() {
+    // Bytes that never complete an object must not turn into an infinite carry:
+    // the reader drops them, counts a skip, and still reaches the end.
+    let dir = std::env::temp_dir().join("blf-core-tests");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("damaged-tail.blf");
+
+    let mut first = log_container(&can_message());
+    // A container whose payload starts like an object but never completes it.
+    let mut broken = Vec::new();
+    push_u32(&mut broken, 0x4A42_4F4C);
+    push_u16(&mut broken, 32);
+    push_u16(&mut broken, 1);
+    push_u32(&mut broken, 512);
+    push_u32(&mut broken, 1);
+    broken.extend_from_slice(&[0; 8]);
+    first.extend_from_slice(&log_container(&broken));
+
+    let mut file = file_statistics(2, 2);
+    file.extend_from_slice(&first);
+    fs::write(&path, file).unwrap();
+
+    let mut reader = File::open(&path).unwrap();
+    assert_eq!(
+        reader.read().unwrap().unwrap().object_type(),
+        ObjectType::CanMessage
+    );
+    // A file that ends inside an object is truncated; the reader says so instead
+    // of pretending it reached a clean end.
+    assert!(reader.read().is_err());
+    assert!(reader.skipped_object_count >= 1);
+}

@@ -33,6 +33,9 @@ diagnostic objects, including:
   appear in the Ethernet view with their channel and hardware channel, for
   example `ch 4.12 · PHY normal state · wakeup received`, and their values keep
   the names from the BLF Ethernet format document.
+- Objects that straddle a container boundary are stitched back together: a
+  container holds exactly 128 KiB, so Vector cuts the last object in half, and
+  the reader joins it with the following container instead of dropping it.
 - Parsing a whole capture stays cheap: the load pass keeps only a summary and a
   per-flow interned search text, and the detail pane dissects the selected
   frame again. A 200 000-frame Ethernet capture loads in about 0.7 s and holds

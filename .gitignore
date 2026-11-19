@@ -11,3 +11,6 @@ __pycache__/
 /yes.pub
 /doc/*.pdf
 *.signals.csv
+
+# Local BLF/ASC captures used for manual verification
+/blf/

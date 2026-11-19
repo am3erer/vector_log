@@ -104,6 +104,14 @@ pub struct File {
     outer_pos: usize,
     decompressed: Vec<u8>,
     decompressed_pos: usize,
+    /// Bytes of an object that continues in the next log container.
+    ///
+    /// Vector fills a container to exactly 128 KiB, so the last object of a
+    /// container can be cut in half; the reference reader stitches it from the
+    /// following container, and so do we.
+    carry: Vec<u8>,
+    /// Consecutive container loads that failed to complete the carried object.
+    carry_attempts: u8,
     pub file_statistics: FileStatistics,
     pub current_uncompressed_file_size: u64,
     pub current_object_count: u32,
@@ -159,6 +167,8 @@ impl File {
             outer_pos: statistics_size,
             decompressed: Vec::new(),
             decompressed_pos: 0,
+            carry: Vec::new(),
+            carry_attempts: 0,
             current_uncompressed_file_size: file_statistics.statistics_size as u64,
             current_object_count: 0,
             skipped_object_count: 0,
@@ -183,6 +193,8 @@ impl File {
             outer_pos: self.file_statistics.statistics_size as usize,
             decompressed: Vec::new(),
             decompressed_pos: 0,
+            carry: Vec::new(),
+            carry_attempts: 0,
             file_statistics: self.file_statistics.clone(),
             current_uncompressed_file_size: self.file_statistics.statistics_size as u64,
             current_object_count: 0,
@@ -249,6 +261,20 @@ impl File {
                     let has_corrupt_tail = !remaining.is_empty()
                         && !(remaining.len() <= 3 && remaining.iter().all(|byte| *byte == 0));
                     if has_corrupt_tail {
+                        // A container can end inside an object: keep the bytes
+                        // and prepend them to the next container.
+                        if self.carry_cut_object() {
+                            if !self.load_next_log_container()? {
+                                // The file itself ends mid-object: that is a
+                                // truncation, not something to hide.
+                                self.carry.clear();
+                                self.skipped_object_count =
+                                    self.skipped_object_count.saturating_add(1);
+                                self.eof = true;
+                                return Err(BlfError::Truncated);
+                            }
+                            continue;
+                        }
                         if self.recover_corrupt_object() {
                             self.skipped_object_count = self.skipped_object_count.saturating_add(1);
                             continue;
@@ -533,6 +559,13 @@ impl File {
             self.decompressed = self.decompressed.split_off(self.decompressed_pos);
             self.decompressed_pos = 0;
         }
+        if !self.carry.is_empty() {
+            // The previous container ended inside an object; the rest of it is
+            // at the start of this one.
+            let mut stitched = std::mem::take(&mut self.carry);
+            stitched.append(&mut decompressed);
+            decompressed = stitched;
+        }
         self.decompressed.append(&mut decompressed);
         Ok(true)
     }
@@ -558,6 +591,46 @@ impl File {
     /// concrete raw header are all readable. This lets tolerant readers skip a
     /// damaged record while keeping strict readers and unrecoverable tails
     /// lossless and explicit.
+    /// Park a partially read object for the next container, when it looks cut.
+    ///
+    /// The tail is only carried when its header is readable and its declared
+    /// size exceeds the bytes left in this container; anything else really is a
+    /// damaged record and keeps the recovery path.
+    fn carry_cut_object(&mut self) -> bool {
+        let remaining = &self.decompressed[self.decompressed_pos..];
+        if remaining.is_empty() || remaining.len() > self.options.max_object_size as usize {
+            return false;
+        }
+        // A cut object starts with its signature, or with as much of it as the
+        // container had room for; the header itself may be cut too.
+        let signature_prefix =
+            remaining.starts_with(&LOBJ_BYTES) || LOBJ_BYTES.starts_with(remaining);
+        if !signature_prefix {
+            return false;
+        }
+        if let Ok(base) = parse_object_header_base(&self.decompressed, self.decompressed_pos) {
+            let declared = usize::try_from(base.object_size).unwrap_or(0);
+            if declared != 0 && declared <= remaining.len() {
+                return false;
+            }
+        }
+        // Give up after a few containers in a row bring no complete object, so
+        // a damaged stream cannot keep the reader spinning.
+        if self.carry == remaining {
+            self.carry_attempts = self.carry_attempts.saturating_add(1);
+            if self.carry_attempts > 3 {
+                self.carry_attempts = 0;
+                return false;
+            }
+        } else {
+            self.carry_attempts = 0;
+        }
+        self.carry = remaining.to_vec();
+        self.decompressed.clear();
+        self.decompressed_pos = 0;
+        true
+    }
+
     fn recover_corrupt_object(&mut self) -> bool {
         let Ok(signature_pos) = find_lobj(
             &self.decompressed,

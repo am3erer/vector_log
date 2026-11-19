@@ -1,0 +1,643 @@
+# Extracted from CANoe's ASC export of Logging2026-11-18_15-46-55.blf.
+# stat <ts> <ch> <hw|-| -> link <Mbit/s> <physical> <duplex> <clockMode> <pairs>
+# phy  <ts> <ch> <hw|-> <state> <event>
+stat 0.001921 1 - Link_down 0 - - - -
+stat 0.003921 2 7 Link_down 0 - - - -
+stat 0.005921 3 9 Link_down 0 - - - -
+stat 0.007921 4 11 Link_down 0 - - - -
+stat 0.009921 5 13 Link_down 0 - - - -
+stat 0.010560 1 - Link_down 0 - - - -
+stat 0.011199 2 8 Link_down 0 - - - -
+stat 0.011822 3 10 Link_down 0 - - - -
+stat 0.011921 6 15 Link_down 0 - - - -
+stat 0.012420 4 12 Link_down 0 - - - -
+stat 0.012922 5 14 Link_down 0 - - - -
+stat 0.013559 6 16 Link_down 0 - - - -
+stat 0.013848 7 17 Link_down 0 - - - -
+stat 0.014097 8 18 Link_down 0 - - - -
+stat 0.014347 9 19 Link_down 0 - - - -
+stat 0.014573 10 3 Link_down 0 - - - -
+stat 0.014821 11 4 Link_down 0 - - - -
+stat 0.014961 12 5 Link_up 0 - - - -
+stat 0.015275 13 6 Link_up 0 - - - -
+stat 0.330124 9 19 Link_down 0 - - - -
+stat 0.330293 10 3 Link_down 0 - - - -
+stat 0.330763 11 4 Link_down 0 - - - -
+stat 0.330968 7 17 Link_down 0 - - - -
+stat 0.331185 8 18 Link_down 0 - - - -
+stat 0.830216 9 19 Link_down 0 - - - -
+stat 0.830438 10 3 Link_down 0 - - - -
+stat 0.830799 11 4 Link_down 0 - - - -
+stat 0.831019 7 17 Link_down 0 - - - -
+stat 0.831337 8 18 Link_down 0 - - - -
+stat 1.330294 9 19 Link_down 0 - - - -
+stat 1.330465 10 3 Link_down 0 - - - -
+stat 1.330905 11 4 Link_down 0 - - - -
+stat 1.331105 7 17 Link_down 0 - - - -
+stat 1.331469 8 18 Link_down 0 - - - -
+stat 1.830341 9 19 Link_down 0 - - - -
+stat 1.830522 10 3 Link_down 0 - - - -
+stat 1.830944 11 4 Link_down 0 - - - -
+stat 1.831045 7 17 Link_down 0 - - - -
+stat 1.831505 8 18 Link_down 0 - - - -
+stat 2.330372 9 19 Link_down 0 - - - -
+stat 2.330553 10 3 Link_down 0 - - - -
+stat 2.330915 11 4 Link_down 0 - - - -
+stat 2.331210 7 17 Link_down 0 - - - -
+stat 2.331429 8 18 Link_down 0 - - - -
+stat 2.830349 9 19 Link_down 0 - - - -
+stat 2.830649 10 3 Link_down 0 - - - -
+stat 2.830988 11 4 Link_down 0 - - - -
+stat 2.831230 7 17 Link_down 0 - - - -
+stat 2.831509 8 18 Link_down 0 - - - -
+stat 3.330462 9 19 Link_down 0 - - - -
+stat 3.330630 10 3 Link_down 0 - - - -
+stat 3.331065 11 4 Link_down 0 - - - -
+stat 3.331312 7 17 Link_down 0 - - - -
+stat 3.331560 8 18 Link_down 0 - - - -
+stat 3.830512 9 19 Link_down 0 - - - -
+stat 3.830726 10 3 Link_down 0 - - - -
+stat 3.831104 11 4 Link_down 0 - - - -
+stat 3.831250 7 17 Link_down 0 - - - -
+stat 3.831711 8 18 Link_down 0 - - - -
+stat 4.330521 9 19 Link_down 0 - - - -
+stat 4.330818 10 3 Link_down 0 - - - -
+stat 4.331155 11 4 Link_down 0 - - - -
+stat 4.331382 7 17 Link_down 0 - - - -
+stat 4.331664 8 18 Link_down 0 - - - -
+stat 4.614915 5 13 Link_up 100 BroadR-Reach Full Master 1-pair
+stat 4.615876 5 14 Link_up 100 BroadR-Reach Full Master 1-pair
+stat 4.616915 1 - Link_up 100 BroadR-Reach Full Master 1-pair
+stat 4.617191 1 - Link_up 100 BroadR-Reach Full Master 1-pair
+stat 4.618915 3 9 Link_up 100 BroadR-Reach Full Master 1-pair
+stat 4.619899 3 10 Link_up 100 BroadR-Reach Full Master 1-pair
+stat 4.630915 2 7 Link_up 100 BroadR-Reach Full Slave 1-pair
+stat 4.631009 2 8 Link_up 100 BroadR-Reach Full Slave 1-pair
+stat 4.639915 6 15 Link_up 100 BroadR-Reach Full Slave 1-pair
+stat 4.640274 6 16 Link_up 100 BroadR-Reach Full Slave 1-pair
+stat 4.649915 4 11 Link_up 100 BroadR-Reach Full Slave 1-pair
+stat 4.650410 4 12 Link_up 100 BroadR-Reach Full Slave 1-pair
+phy 4.658317 4 12 normal wakeup_recv
+phy 4.659155 6 16 normal wakeup_recv
+phy 4.659921 2 8 normal wakeup_recv
+stat 4.670915 1 - Link_down 0 - - - -
+stat 4.671037 1 - Link_down 0 - - - -
+stat 4.680675 3 10 Link_down 0 - - - -
+stat 4.680914 3 9 Link_down 0 - - - -
+stat 4.701914 5 13 Link_down 0 - - - -
+stat 4.702643 5 14 Link_down 0 - - - -
+stat 4.744914 1 - Link_up 100 BroadR-Reach Full Master 1-pair
+stat 4.745675 1 - Link_up 100 BroadR-Reach Full Master 1-pair
+phy 4.746322 4 12 normal wakeup_recv
+phy 4.747160 6 16 normal wakeup_recv
+phy 4.748062 2 8 normal wakeup_recv
+stat 4.748914 3 9 Link_up 100 BroadR-Reach Full Master 1-pair
+stat 4.749183 3 10 Link_up 100 BroadR-Reach Full Master 1-pair
+stat 4.770914 5 13 Link_up 100 BroadR-Reach Full Master 1-pair
+stat 4.771284 5 14 Link_up 100 BroadR-Reach Full Master 1-pair
+phy 4.795278 4 12 normal wakeup_recv
+phy 4.795979 6 16 normal wakeup_recv
+phy 4.796893 2 8 normal wakeup_recv
+phy 4.821040 1 - normal wakeup_recv
+phy 4.821067 5 14 normal wakeup_recv
+stat 4.830629 9 19 Link_down 0 - - - -
+stat 4.830808 10 3 Link_down 0 - - - -
+stat 4.831266 11 4 Link_down 0 - - - -
+stat 4.831466 7 17 Link_down 0 - - - -
+stat 4.831686 8 18 Link_down 0 - - - -
+phy 4.894277 3 10 normal wakeup_recv
+phy 5.124799 4 12 normal wakeup_recv
+phy 5.125629 6 16 normal wakeup_recv
+phy 5.126397 2 8 normal wakeup_recv
+phy 5.210088 4 12 normal wakeup_recv
+phy 5.210921 6 16 normal wakeup_recv
+phy 5.211829 2 8 normal wakeup_recv
+phy 5.260118 4 12 normal wakeup_recv
+phy 5.260964 6 16 normal wakeup_recv
+phy 5.261881 2 8 normal wakeup_recv
+phy 5.310022 4 12 normal wakeup_recv
+phy 5.310995 6 16 normal wakeup_recv
+phy 5.311789 2 8 normal wakeup_recv
+stat 5.330667 9 19 Link_down 0 - - - -
+stat 5.330881 10 3 Link_down 0 - - - -
+stat 5.331302 11 4 Link_down 0 - - - -
+stat 5.331405 7 17 Link_down 0 - - - -
+stat 5.331865 8 18 Link_down 0 - - - -
+stat 5.359440 9 19 Link_up 1000 - Full Slave 1-pair
+stat 5.380156 10 3 Link_up 100 BroadR-Reach Full Slave 1-pair
+stat 5.382737 11 4 Link_up 100 BroadR-Reach Full Slave 1-pair
+phy 5.394371 4 12 normal wakeup_recv
+phy 5.394400 6 16 normal wakeup_recv
+phy 5.394422 2 8 normal wakeup_recv
+stat 5.400193 7 17 Link_up 1000 - Full Slave 1-pair
+phy 5.410101 4 12 normal wakeup_recv
+phy 5.410938 6 16 normal wakeup_recv
+phy 5.411731 2 8 normal wakeup_recv
+stat 5.427278 8 18 Link_up 1000 - Full Slave 1-pair
+phy 5.460138 4 12 normal wakeup_recv
+phy 5.460977 6 16 normal wakeup_recv
+phy 5.461743 2 8 normal wakeup_recv
+phy 5.510180 4 12 normal wakeup_recv
+phy 5.511014 6 16 normal wakeup_recv
+phy 5.511793 2 8 normal wakeup_recv
+phy 5.560072 4 12 normal wakeup_recv
+phy 5.560912 6 16 normal wakeup_recv
+phy 5.561823 2 8 normal wakeup_recv
+phy 5.610111 4 12 normal wakeup_recv
+phy 5.611083 6 16 normal wakeup_recv
+phy 5.611854 2 8 normal wakeup_recv
+phy 5.660146 4 12 normal wakeup_recv
+phy 5.660985 6 16 normal wakeup_recv
+phy 5.661895 2 8 normal wakeup_recv
+phy 5.710182 4 12 normal wakeup_recv
+phy 5.711029 6 16 normal wakeup_recv
+phy 5.711794 2 8 normal wakeup_recv
+phy 5.760221 4 12 normal wakeup_recv
+phy 5.761060 6 16 normal wakeup_recv
+phy 5.761831 2 8 normal wakeup_recv
+phy 5.810126 4 12 normal wakeup_recv
+phy 5.810962 6 16 normal wakeup_recv
+phy 5.811765 2 8 normal wakeup_recv
+stat 63.577803 5 13 Link_down 0 - - - -
+phy 63.578395 5 14 sleep sleep_recv
+stat 63.578463 5 14 Link_down 0 - - - -
+stat 63.580803 3 9 Link_down 0 - - - -
+phy 63.581195 3 10 sleep sleep_recv
+stat 63.581285 3 10 Link_down 0 - - - -
+stat 63.581803 1 - Link_down 0 - - - -
+phy 63.582346 1 - sleep sleep_recv
+stat 63.582443 1 - Link_down 0 - - - -
+stat 73.183784 4 11 Link_down 0 - - - -
+stat 73.184352 4 12 Link_down 0 - - - -
+phy 73.184453 4 12 sleep sleep_recv
+stat 73.184784 6 15 Link_down 0 - - - -
+stat 73.184784 2 7 Link_down 0 - - - -
+phy 73.185101 6 16 sleep sleep_recv
+stat 73.185200 6 16 Link_down 0 - - - -
+phy 73.185867 2 8 sleep sleep_recv
+stat 73.185970 2 8 Link_down 0 - - - -
+stat 73.199270 8 18 Link_down 0 - - - -
+stat 73.199349 11 4 Link_down 0 - - - -
+stat 73.199350 9 19 Link_down 0 - - - -
+stat 73.199395 10 3 Link_down 0 - - - -
+stat 73.199411 7 17 Link_down 0 - - - -
+stat 73.199704 8 18 Link_down 0 - - - -
+stat 73.199884 9 19 Link_down 0 - - - -
+stat 73.200150 11 4 Link_down 0 - - - -
+stat 73.200274 10 3 Link_down 0 - - - -
+stat 73.200478 7 17 Link_down 0 - - - -
+stat 73.699999 8 18 Link_down 0 - - - -
+stat 73.700217 9 19 Link_down 0 - - - -
+stat 73.700324 11 4 Link_down 0 - - - -
+stat 73.700546 10 3 Link_down 0 - - - -
+stat 73.700765 7 17 Link_down 0 - - - -
+stat 74.200081 8 18 Link_down 0 - - - -
+stat 74.200306 9 19 Link_down 0 - - - -
+stat 74.200454 11 4 Link_down 0 - - - -
+stat 74.200694 10 3 Link_down 0 - - - -
+stat 74.200850 7 17 Link_down 0 - - - -
+stat 74.700175 8 18 Link_down 0 - - - -
+stat 74.700290 9 19 Link_down 0 - - - -
+stat 74.700526 11 4 Link_down 0 - - - -
+stat 74.700649 10 3 Link_down 0 - - - -
+stat 74.700949 7 17 Link_down 0 - - - -
+stat 75.200225 8 18 Link_down 0 - - - -
+stat 75.200438 9 19 Link_down 0 - - - -
+stat 75.200617 11 4 Link_down 0 - - - -
+stat 75.200739 10 3 Link_down 0 - - - -
+stat 75.200872 7 17 Link_down 0 - - - -
+stat 75.700237 8 18 Link_down 0 - - - -
+stat 75.700463 9 19 Link_down 0 - - - -
+stat 75.700712 11 4 Link_down 0 - - - -
+stat 75.700817 10 3 Link_down 0 - - - -
+stat 75.701003 7 17 Link_down 0 - - - -
+stat 76.200223 8 18 Link_down 0 - - - -
+stat 76.200485 9 19 Link_down 0 - - - -
+stat 76.200733 11 4 Link_down 0 - - - -
+stat 76.200944 10 3 Link_down 0 - - - -
+stat 76.201122 7 17 Link_down 0 - - - -
+stat 76.700379 8 18 Link_down 0 - - - -
+stat 76.700591 9 19 Link_down 0 - - - -
+stat 76.700770 11 4 Link_down 0 - - - -
+stat 76.701040 10 3 Link_down 0 - - - -
+stat 76.701239 7 17 Link_down 0 - - - -
+stat 77.200331 8 18 Link_down 0 - - - -
+stat 77.200679 9 19 Link_down 0 - - - -
+stat 77.200858 11 4 Link_down 0 - - - -
+stat 77.201123 10 3 Link_down 0 - - - -
+stat 77.201291 7 17 Link_down 0 - - - -
+stat 77.700410 8 18 Link_down 0 - - - -
+stat 77.700663 9 19 Link_down 0 - - - -
+stat 77.700914 11 4 Link_down 0 - - - -
+stat 77.701144 10 3 Link_down 0 - - - -
+stat 77.701312 7 17 Link_down 0 - - - -
+stat 78.200391 8 18 Link_down 0 - - - -
+stat 78.200749 9 19 Link_down 0 - - - -
+stat 78.200993 11 4 Link_down 0 - - - -
+stat 78.201219 10 3 Link_down 0 - - - -
+stat 78.201459 7 17 Link_down 0 - - - -
+stat 78.700485 8 18 Link_down 0 - - - -
+stat 78.700831 9 19 Link_down 0 - - - -
+stat 78.701012 11 4 Link_down 0 - - - -
+stat 78.701249 10 3 Link_down 0 - - - -
+stat 78.701443 7 17 Link_down 0 - - - -
+stat 79.200574 8 18 Link_down 0 - - - -
+stat 79.200820 9 19 Link_down 0 - - - -
+stat 79.201035 11 4 Link_down 0 - - - -
+stat 79.201165 10 3 Link_down 0 - - - -
+stat 79.201542 7 17 Link_down 0 - - - -
+stat 79.700581 8 18 Link_down 0 - - - -
+stat 79.700936 9 19 Link_down 0 - - - -
+stat 79.701181 11 4 Link_down 0 - - - -
+stat 79.701276 10 3 Link_down 0 - - - -
+stat 79.701512 7 17 Link_down 0 - - - -
+stat 80.200695 8 18 Link_down 0 - - - -
+stat 80.200920 9 19 Link_down 0 - - - -
+stat 80.201186 11 4 Link_down 0 - - - -
+stat 80.201401 10 3 Link_down 0 - - - -
+stat 80.201630 7 17 Link_down 0 - - - -
+stat 80.700789 8 18 Link_down 0 - - - -
+stat 80.701003 9 19 Link_down 0 - - - -
+stat 80.701222 11 4 Link_down 0 - - - -
+stat 80.701356 10 3 Link_down 0 - - - -
+stat 80.701685 7 17 Link_down 0 - - - -
+stat 81.200723 8 18 Link_down 0 - - - -
+stat 81.201019 9 19 Link_down 0 - - - -
+stat 81.201196 11 4 Link_down 0 - - - -
+stat 81.201458 10 3 Link_down 0 - - - -
+stat 81.201686 7 17 Link_down 0 - - - -
+stat 81.700849 8 18 Link_down 0 - - - -
+stat 81.701073 9 19 Link_down 0 - - - -
+stat 81.701334 11 4 Link_down 0 - - - -
+stat 81.701592 10 3 Link_down 0 - - - -
+stat 81.701751 7 17 Link_down 0 - - - -
+stat 82.200838 8 18 Link_down 0 - - - -
+stat 82.201102 9 19 Link_down 0 - - - -
+stat 82.201349 11 4 Link_down 0 - - - -
+stat 82.201560 10 3 Link_down 0 - - - -
+stat 82.201836 7 17 Link_down 0 - - - -
+stat 82.700995 8 18 Link_down 0 - - - -
+stat 82.701209 9 19 Link_down 0 - - - -
+stat 82.701388 11 4 Link_down 0 - - - -
+stat 82.701657 10 3 Link_down 0 - - - -
+stat 82.701967 7 17 Link_down 0 - - - -
+stat 83.200929 8 18 Link_down 0 - - - -
+stat 83.201227 9 19 Link_down 0 - - - -
+stat 83.201406 11 4 Link_down 0 - - - -
+stat 83.201651 10 3 Link_down 0 - - - -
+stat 83.201891 7 17 Link_down 0 - - - -
+stat 83.700989 8 18 Link_down 0 - - - -
+stat 83.701347 9 19 Link_down 0 - - - -
+stat 83.701466 11 4 Link_down 0 - - - -
+stat 83.701668 10 3 Link_down 0 - - - -
+stat 83.702027 7 17 Link_down 0 - - - -
+stat 84.201041 8 18 Link_down 0 - - - -
+stat 84.201394 9 19 Link_down 0 - - - -
+stat 84.201638 11 4 Link_down 0 - - - -
+stat 84.201877 10 3 Link_down 0 - - - -
+stat 84.201974 7 17 Link_down 0 - - - -
+stat 84.701183 8 18 Link_down 0 - - - -
+stat 84.701349 9 19 Link_down 0 - - - -
+stat 84.701581 11 4 Link_down 0 - - - -
+stat 84.701939 10 3 Link_down 0 - - - -
+stat 84.702146 7 17 Link_down 0 - - - -
+stat 85.201190 8 18 Link_down 0 - - - -
+stat 85.201437 9 19 Link_down 0 - - - -
+stat 85.201619 11 4 Link_down 0 - - - -
+stat 85.201891 10 3 Link_down 0 - - - -
+stat 85.202223 7 17 Link_down 0 - - - -
+stat 85.701195 8 18 Link_down 0 - - - -
+stat 85.701551 9 19 Link_down 0 - - - -
+stat 85.701797 11 4 Link_down 0 - - - -
+stat 85.702037 10 3 Link_down 0 - - - -
+stat 85.702227 7 17 Link_down 0 - - - -
+stat 86.201310 8 18 Link_down 0 - - - -
+stat 86.201573 9 19 Link_down 0 - - - -
+stat 86.201738 11 4 Link_down 0 - - - -
+stat 86.202113 10 3 Link_down 0 - - - -
+stat 86.202313 7 17 Link_down 0 - - - -
+stat 86.701445 8 18 Link_down 0 - - - -
+stat 86.701697 9 19 Link_down 0 - - - -
+stat 86.701879 11 4 Link_down 0 - - - -
+stat 86.702013 10 3 Link_down 0 - - - -
+stat 86.702275 7 17 Link_down 0 - - - -
+stat 87.201338 8 18 Link_down 0 - - - -
+stat 87.201634 9 19 Link_down 0 - - - -
+stat 87.201946 11 4 Link_down 0 - - - -
+stat 87.202075 10 3 Link_down 0 - - - -
+stat 87.202301 7 17 Link_down 0 - - - -
+stat 87.701500 8 18 Link_down 0 - - - -
+stat 87.701636 9 19 Link_down 0 - - - -
+stat 87.701924 11 4 Link_down 0 - - - -
+stat 87.702135 10 3 Link_down 0 - - - -
+stat 87.702398 7 17 Link_down 0 - - - -
+stat 88.201451 8 18 Link_down 0 - - - -
+stat 88.201807 9 19 Link_down 0 - - - -
+stat 88.202056 11 4 Link_down 0 - - - -
+stat 88.202271 10 3 Link_down 0 - - - -
+stat 88.202483 7 17 Link_down 0 - - - -
+stat 88.701609 8 18 Link_down 0 - - - -
+stat 88.701823 9 19 Link_down 0 - - - -
+stat 88.702136 11 4 Link_down 0 - - - -
+stat 88.702272 10 3 Link_down 0 - - - -
+stat 88.702582 7 17 Link_down 0 - - - -
+stat 89.201543 8 18 Link_down 0 - - - -
+stat 89.201843 9 19 Link_down 0 - - - -
+stat 89.202075 11 4 Link_down 0 - - - -
+stat 89.202320 10 3 Link_down 0 - - - -
+stat 89.202506 7 17 Link_down 0 - - - -
+stat 89.701642 8 18 Link_down 0 - - - -
+stat 89.701866 9 19 Link_down 0 - - - -
+stat 89.702250 11 4 Link_down 0 - - - -
+stat 89.702343 10 3 Link_down 0 - - - -
+stat 89.702637 7 17 Link_down 0 - - - -
+stat 90.201657 8 18 Link_down 0 - - - -
+stat 90.202012 9 19 Link_down 0 - - - -
+stat 90.202257 11 4 Link_down 0 - - - -
+stat 90.202497 10 3 Link_down 0 - - - -
+stat 90.202722 7 17 Link_down 0 - - - -
+stat 90.701797 8 18 Link_down 0 - - - -
+stat 90.701960 9 19 Link_down 0 - - - -
+stat 90.702360 11 4 Link_down 0 - - - -
+stat 90.702573 10 3 Link_down 0 - - - -
+stat 90.702761 7 17 Link_down 0 - - - -
+stat 91.201767 8 18 Link_down 0 - - - -
+stat 91.202016 9 19 Link_down 0 - - - -
+stat 91.202332 11 4 Link_down 0 - - - -
+stat 91.202616 10 3 Link_down 0 - - - -
+stat 91.202725 7 17 Link_down 0 - - - -
+stat 91.701811 8 18 Link_down 0 - - - -
+stat 91.702168 9 19 Link_down 0 - - - -
+stat 91.702412 11 4 Link_down 0 - - - -
+stat 91.702653 10 3 Link_down 0 - - - -
+stat 91.702875 7 17 Link_down 0 - - - -
+stat 92.201961 8 18 Link_down 0 - - - -
+stat 92.202234 9 19 Link_down 0 - - - -
+stat 92.202391 11 4 Link_down 0 - - - -
+stat 92.202607 10 3 Link_down 0 - - - -
+stat 92.202861 7 17 Link_down 0 - - - -
+stat 92.702053 8 18 Link_down 0 - - - -
+stat 92.702209 9 19 Link_down 0 - - - -
+stat 92.702522 11 4 Link_down 0 - - - -
+stat 92.702658 10 3 Link_down 0 - - - -
+stat 92.702866 7 17 Link_down 0 - - - -
+stat 93.201953 8 18 Link_down 0 - - - -
+stat 93.202250 9 19 Link_down 0 - - - -
+stat 93.202561 11 4 Link_down 0 - - - -
+stat 93.202691 10 3 Link_down 0 - - - -
+stat 93.203029 7 17 Link_down 0 - - - -
+stat 93.702114 8 18 Link_down 0 - - - -
+stat 93.702389 9 19 Link_down 0 - - - -
+stat 93.702554 11 4 Link_down 0 - - - -
+stat 93.702770 10 3 Link_down 0 - - - -
+stat 93.703014 7 17 Link_down 0 - - - -
+stat 94.202030 8 18 Link_down 0 - - - -
+stat 94.202389 9 19 Link_down 0 - - - -
+stat 94.202636 11 4 Link_down 0 - - - -
+stat 94.202866 10 3 Link_down 0 - - - -
+stat 94.203098 7 17 Link_down 0 - - - -
+stat 94.702222 8 18 Link_down 0 - - - -
+stat 94.702436 9 19 Link_down 0 - - - -
+stat 94.702747 11 4 Link_down 0 - - - -
+stat 94.702881 10 3 Link_down 0 - - - -
+stat 94.703196 7 17 Link_down 0 - - - -
+stat 95.202274 8 18 Link_down 0 - - - -
+stat 95.202488 9 19 Link_down 0 - - - -
+stat 95.202750 11 4 Link_down 0 - - - -
+stat 95.202982 10 3 Link_down 0 - - - -
+stat 95.203233 7 17 Link_down 0 - - - -
+stat 95.702218 8 18 Link_down 0 - - - -
+stat 95.702577 9 19 Link_down 0 - - - -
+stat 95.702825 11 4 Link_down 0 - - - -
+stat 95.703040 10 3 Link_down 0 - - - -
+stat 95.703217 7 17 Link_down 0 - - - -
+stat 96.202270 8 18 Link_down 0 - - - -
+stat 96.202626 9 19 Link_down 0 - - - -
+stat 96.202871 11 4 Link_down 0 - - - -
+stat 96.203109 10 3 Link_down 0 - - - -
+stat 96.203335 7 17 Link_down 0 - - - -
+stat 96.702310 8 18 Link_down 0 - - - -
+stat 96.702607 9 19 Link_down 0 - - - -
+stat 96.702867 11 4 Link_down 0 - - - -
+stat 96.703076 10 3 Link_down 0 - - - -
+stat 96.703274 7 17 Link_down 0 - - - -
+stat 97.202380 8 18 Link_down 0 - - - -
+stat 97.202632 9 19 Link_down 0 - - - -
+stat 97.202946 11 4 Link_down 0 - - - -
+stat 97.203229 10 3 Link_down 0 - - - -
+stat 97.203338 7 17 Link_down 0 - - - -
+stat 97.702424 8 18 Link_down 0 - - - -
+stat 97.702780 9 19 Link_down 0 - - - -
+stat 97.703024 11 4 Link_down 0 - - - -
+stat 97.703264 10 3 Link_down 0 - - - -
+stat 97.703488 7 17 Link_down 0 - - - -
+stat 98.202577 8 18 Link_down 0 - - - -
+stat 98.202748 9 19 Link_down 0 - - - -
+stat 98.203040 11 4 Link_down 0 - - - -
+stat 98.203254 10 3 Link_down 0 - - - -
+stat 98.203441 7 17 Link_down 0 - - - -
+stat 98.702634 8 18 Link_down 0 - - - -
+stat 98.702879 9 19 Link_down 0 - - - -
+stat 98.703063 11 4 Link_down 0 - - - -
+stat 98.703342 10 3 Link_down 0 - - - -
+stat 98.703592 7 17 Link_down 0 - - - -
+stat 99.202567 8 18 Link_down 0 - - - -
+stat 99.202864 9 19 Link_down 0 - - - -
+stat 99.203178 11 4 Link_down 0 - - - -
+stat 99.203307 10 3 Link_down 0 - - - -
+stat 99.203644 7 17 Link_down 0 - - - -
+stat 99.702730 8 18 Link_down 0 - - - -
+stat 99.702902 9 19 Link_down 0 - - - -
+stat 99.703190 11 4 Link_down 0 - - - -
+stat 99.703403 10 3 Link_down 0 - - - -
+stat 99.703628 7 17 Link_down 0 - - - -
+stat 100.202678 8 18 Link_down 0 - - - -
+stat 100.203036 9 19 Link_down 0 - - - -
+stat 100.203285 11 4 Link_down 0 - - - -
+stat 100.203497 10 3 Link_down 0 - - - -
+stat 100.203680 7 17 Link_down 0 - - - -
+stat 100.702738 8 18 Link_down 0 - - - -
+stat 100.703084 9 19 Link_down 0 - - - -
+stat 100.703262 11 4 Link_down 0 - - - -
+stat 100.703544 10 3 Link_down 0 - - - -
+stat 100.703711 7 17 Link_down 0 - - - -
+stat 101.202889 8 18 Link_down 0 - - - -
+stat 101.203103 9 19 Link_down 0 - - - -
+stat 101.203400 11 4 Link_down 0 - - - -
+stat 101.203606 10 3 Link_down 0 - - - -
+stat 101.203735 7 17 Link_down 0 - - - -
+stat 101.702798 8 18 Link_down 0 - - - -
+stat 101.703156 9 19 Link_down 0 - - - -
+stat 101.703401 11 4 Link_down 0 - - - -
+stat 101.703630 10 3 Link_down 0 - - - -
+stat 101.703833 7 17 Link_down 0 - - - -
+stat 102.202917 8 18 Link_down 0 - - - -
+stat 102.203139 9 19 Link_down 0 - - - -
+stat 102.203513 11 4 Link_down 0 - - - -
+stat 102.203615 10 3 Link_down 0 - - - -
+stat 102.203851 7 17 Link_down 0 - - - -
+stat 102.703044 8 18 Link_down 0 - - - -
+stat 102.703259 9 19 Link_down 0 - - - -
+stat 102.703568 11 4 Link_down 0 - - - -
+stat 102.703740 10 3 Link_down 0 - - - -
+stat 102.704001 7 17 Link_down 0 - - - -
+stat 103.203125 8 18 Link_down 0 - - - -
+stat 103.203339 9 19 Link_down 0 - - - -
+stat 103.203523 11 4 Link_down 0 - - - -
+stat 103.203799 10 3 Link_down 0 - - - -
+stat 103.204053 7 17 Link_down 0 - - - -
+stat 103.703039 8 18 Link_down 0 - - - -
+stat 103.703395 9 19 Link_down 0 - - - -
+stat 103.703639 11 4 Link_down 0 - - - -
+stat 103.703879 10 3 Link_down 0 - - - -
+stat 103.704104 7 17 Link_down 0 - - - -
+stat 104.203091 8 18 Link_down 0 - - - -
+stat 104.203441 9 19 Link_down 0 - - - -
+stat 104.203728 11 4 Link_down 0 - - - -
+stat 104.203954 10 3 Link_down 0 - - - -
+stat 104.204089 7 17 Link_down 0 - - - -
+phy 104.435476 6 16 normal wakeup_sent
+phy 104.485491 6 16 normal wakeup_sent
+phy 104.532739 2 8 normal wakeup_recv
+phy 104.532767 4 12 normal wakeup_recv
+phy 104.535241 6 16 normal wakeup_sent
+phy 104.585392 6 16 normal wakeup_sent
+stat 104.617726 2 7 Link_up 100 BroadR-Reach Full Slave 1-pair
+stat 104.618101 2 8 Link_up 100 BroadR-Reach Full Slave 1-pair
+phy 104.635547 6 16 normal wakeup_sent
+stat 104.636726 6 15 Link_up 100 BroadR-Reach Full Slave 1-pair
+stat 104.637301 6 16 Link_up 100 BroadR-Reach Full Slave 1-pair
+phy 104.639201 2 8 normal wakeup_recv
+stat 104.641726 4 11 Link_up 100 BroadR-Reach Full Slave 1-pair
+stat 104.642384 4 12 Link_up 100 BroadR-Reach Full Slave 1-pair
+phy 104.644320 4 12 normal wakeup_recv
+phy 104.649331 4 12 normal wakeup_recv
+phy 104.650213 6 16 normal wakeup_recv
+phy 104.650950 2 8 normal wakeup_recv
+phy 104.685171 6 16 normal wakeup_sent
+phy 104.685268 2 8 normal wakeup_recv
+phy 104.688794 4 12 normal wakeup_recv
+stat 104.703248 8 18 Link_down 0 - - - -
+stat 104.703461 9 19 Link_down 0 - - - -
+stat 104.703776 11 4 Link_down 0 - - - -
+stat 104.703913 10 3 Link_down 0 - - - -
+stat 104.704206 7 17 Link_down 0 - - - -
+stat 104.756882 9 19 Link_up 1000 - Full Slave 1-pair
+phy 104.767191 6 16 normal wakeup_sent
+phy 104.767235 4 12 normal wakeup_recv
+phy 104.767294 6 16 normal wakeup_recv
+phy 104.767317 2 8 normal wakeup_recv
+stat 104.767853 8 18 Link_up 1000 - Full Slave 1-pair
+phy 104.770844 4 12 normal wakeup_recv
+stat 104.778219 11 4 Link_up 100 BroadR-Reach Full Slave 1-pair
+stat 104.780990 10 3 Link_up 100 BroadR-Reach Full Slave 1-pair
+phy 104.785205 6 16 normal wakeup_sent
+phy 104.785461 2 8 normal wakeup_recv
+phy 104.788732 4 12 normal wakeup_recv
+phy 104.799928 4 12 normal wakeup_recv
+phy 104.799957 6 16 normal wakeup_recv
+phy 104.799999 2 8 normal wakeup_recv
+stat 104.800046 7 17 Link_up 1000 - Full Slave 1-pair
+phy 104.835531 6 16 normal wakeup_sent
+phy 104.835694 2 8 normal wakeup_recv
+phy 104.839042 4 12 normal wakeup_recv
+phy 104.885547 6 16 normal wakeup_sent
+phy 104.885742 2 8 normal wakeup_recv
+phy 104.889211 4 12 normal wakeup_recv
+phy 104.895192 4 12 normal wakeup_recv
+phy 104.895880 6 16 normal wakeup_recv
+phy 104.896660 2 8 normal wakeup_recv
+phy 104.935292 6 16 normal wakeup_sent
+phy 104.935514 2 8 normal wakeup_recv
+phy 104.938853 4 12 normal wakeup_recv
+phy 104.945222 4 12 normal wakeup_recv
+phy 104.946174 6 16 normal wakeup_recv
+phy 104.947238 2 8 normal wakeup_recv
+phy 104.985486 6 16 normal wakeup_sent
+phy 104.985700 2 8 normal wakeup_recv
+phy 104.989017 4 12 normal wakeup_recv
+phy 105.002180 4 12 normal wakeup_recv
+phy 105.003251 6 16 normal wakeup_recv
+phy 105.004058 2 8 normal wakeup_recv
+phy 105.035342 6 16 normal wakeup_sent
+phy 105.035431 2 8 normal wakeup_recv
+phy 105.040006 4 12 normal wakeup_recv
+phy 105.052083 4 12 normal wakeup_recv
+phy 105.053000 6 16 normal wakeup_recv
+phy 105.053825 2 8 normal wakeup_recv
+phy 105.085359 6 16 normal wakeup_sent
+phy 105.085455 2 8 normal wakeup_recv
+phy 105.088957 4 12 normal wakeup_recv
+phy 105.102253 4 12 normal wakeup_recv
+phy 105.103153 6 16 normal wakeup_recv
+phy 105.103997 2 8 normal wakeup_recv
+phy 105.135546 6 16 normal wakeup_sent
+phy 105.135634 2 8 normal wakeup_recv
+phy 105.138993 4 12 normal wakeup_recv
+phy 105.152021 4 12 normal wakeup_recv
+phy 105.152930 6 16 normal wakeup_recv
+phy 105.153758 2 8 normal wakeup_recv
+phy 105.185293 6 16 normal wakeup_sent
+phy 105.185382 2 8 normal wakeup_recv
+phy 105.188901 4 12 normal wakeup_recv
+phy 105.202056 4 12 normal wakeup_recv
+phy 105.202948 6 16 normal wakeup_recv
+phy 105.203800 2 8 normal wakeup_recv
+phy 105.235444 6 16 normal wakeup_sent
+phy 105.235543 2 8 normal wakeup_recv
+phy 105.238801 4 12 normal wakeup_recv
+phy 105.252095 4 12 normal wakeup_recv
+phy 105.252964 6 16 normal wakeup_recv
+phy 105.253704 2 8 normal wakeup_recv
+phy 105.285502 6 16 normal wakeup_sent
+phy 105.285593 2 8 normal wakeup_recv
+phy 105.288973 4 12 normal wakeup_recv
+phy 105.302134 4 12 normal wakeup_recv
+phy 105.302994 6 16 normal wakeup_recv
+phy 105.303735 2 8 normal wakeup_recv
+phy 105.335356 6 16 normal wakeup_sent
+phy 105.335555 2 8 normal wakeup_recv
+phy 105.338736 4 12 normal wakeup_recv
+phy 105.352168 4 12 normal wakeup_recv
+phy 105.353012 6 16 normal wakeup_recv
+phy 105.353914 2 8 normal wakeup_recv
+phy 105.385511 6 16 normal wakeup_sent
+phy 105.385753 2 8 normal wakeup_recv
+phy 105.388915 4 12 normal wakeup_recv
+phy 105.402209 4 12 normal wakeup_recv
+phy 105.403044 6 16 normal wakeup_recv
+phy 105.403949 2 8 normal wakeup_recv
+phy 105.452244 4 12 normal wakeup_recv
+phy 105.453065 6 16 normal wakeup_recv
+phy 105.453851 2 8 normal wakeup_recv
+phy 105.502145 4 12 normal wakeup_recv
+phy 105.502966 6 16 normal wakeup_recv
+phy 105.503750 2 8 normal wakeup_recv
+phy 105.552049 4 12 normal wakeup_recv
+phy 105.553006 6 16 normal wakeup_recv
+phy 105.553790 2 8 normal wakeup_recv
+phy 105.602084 4 12 normal wakeup_recv
+phy 105.603045 6 16 normal wakeup_recv
+phy 105.603826 2 8 normal wakeup_recv
+phy 105.652120 4 12 normal wakeup_recv
+phy 105.652946 6 16 normal wakeup_recv
+phy 105.653728 2 8 normal wakeup_recv
+phy 105.702158 4 12 normal wakeup_recv
+phy 105.703123 6 16 normal wakeup_recv
+phy 105.703903 2 8 normal wakeup_recv
+phy 105.752061 4 12 normal wakeup_recv
+phy 105.753018 6 16 normal wakeup_recv
+phy 105.753800 2 8 normal wakeup_recv
+phy 105.802099 4 12 normal wakeup_recv
+phy 105.803057 6 16 normal wakeup_recv
+phy 105.803978 2 8 normal wakeup_recv
+phy 105.852146 4 12 normal wakeup_recv
+phy 105.852964 6 16 normal wakeup_recv
+phy 105.853745 2 8 normal wakeup_recv
+phy 105.902035 4 12 normal wakeup_recv
+phy 105.902995 6 16 normal wakeup_recv
+phy 105.903914 2 8 normal wakeup_recv
+phy 255.936204 6 16 sleep_request sleep_sent
+stat 255.944333 6 16 Link_down 0 - - - -
+phy 255.944420 6 16 sleep sleep_ack_recv
+stat 255.944438 6 15 Link_down 0 - - - -

@@ -757,7 +757,8 @@ pub fn ethernet_phy_type_name(value: u8) -> &'static str {
         0 => "unknown",
         1 => "100BASE-TX/1000BASE-T",
         2 => "100BASE-T1 (OABR)",
-        // Newer firmware reports further types; keep the raw value visible.
+        // Firmware also reports `4` (CANoe prints no physical layer for it) and
+        // further values; keep them distinguishable from "unknown".
         _ => "other",
     }
 }
