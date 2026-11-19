@@ -1187,6 +1187,8 @@ fn parse_structured_object(data: &[u8], base: ObjectHeaderBase) -> Result<Struct
     let header = parse_raw_header(data, base)?;
     let (fields, offset) = if base.object_type == ObjectType::SerialEvent {
         parse_serial_event(data, usize::from(base.header_size))?
+    } else if base.object_type == ObjectType::DataLostEnd {
+        parse_data_lost_end(data, usize::from(base.header_size))?
     } else {
         let schema = structured_schema(base.object_type);
         parse_schema(data, usize::from(base.header_size), schema)?
@@ -1199,6 +1201,25 @@ fn parse_structured_object(data: &[u8], base: ObjectHeaderBase) -> Result<Struct
         extensions: data.get(offset..).ok_or(BlfError::Truncated)?.to_vec(),
         data: data.to_vec(),
     })
+}
+
+/// `VBLDataLostEnd` mixes a 32-bit and a 64-bit field, so a writer that casts
+/// the C struct into the file leaves four bytes of padding in front of the
+/// timestamp. The documented layout is packed; accept both, keyed on the
+/// declared object size.
+fn parse_data_lost_end(data: &[u8], start: usize) -> Result<(Vec<(String, FieldValue)>, usize)> {
+    let padded = data.len() >= start + 24;
+    let mut reader = StructuredReader::new(data, start);
+    reader.u32("queueIdentifier")?;
+    let mut fields = std::mem::take(&mut reader.fields);
+    if padded {
+        // Padding before the 64-bit timestamp keeps it eight-byte aligned.
+        reader.offset = start + 8;
+    }
+    reader.u64("firstObjectLostTimeStamp")?;
+    reader.u32("numberOfLostEvents")?;
+    fields.append(&mut reader.fields);
+    Ok((fields, reader.offset))
 }
 
 fn parse_serial_event(data: &[u8], start: usize) -> Result<(Vec<(String, FieldValue)>, usize)> {
@@ -2907,12 +2928,23 @@ fn parse_lin_object(data: &[u8], base: ObjectHeaderBase) -> Result<LinObject> {
             push_u16_field(data, &mut offset, &mut fields, "channel")?;
             push_u8_field(data, &mut offset, &mut fields, "oldMode")?;
             push_u8_field(data, &mut offset, &mut fields, "newMode")?;
-            push_u32_field(
-                data,
-                &mut offset,
-                &mut fields,
-                "reservedLinSchedulerModeChange",
-            )?;
+            // Object version 1 and 2 extend the record with the schedule table
+            // slots, version 2 also flags the first event after a wakeup.
+            if header.object_version >= 1 && data.len().saturating_sub(offset) >= 3 {
+                push_u8_field(data, &mut offset, &mut fields, "oldSlot")?;
+                push_u8_field(data, &mut offset, &mut fields, "newSlot")?;
+                if data.len().saturating_sub(offset) >= 1 {
+                    push_u8_field(data, &mut offset, &mut fields, "firstEventAfterWakeUp")?;
+                }
+            }
+            if data.len().saturating_sub(offset) >= 4 {
+                push_u32_field(
+                    data,
+                    &mut offset,
+                    &mut fields,
+                    "reservedLinSchedulerModeChange",
+                )?;
+            }
         }
         ObjectType::LinSynError => {
             push_u16_field(data, &mut offset, &mut fields, "channel")?;
@@ -3176,4 +3208,51 @@ fn parse_lin_object(data: &[u8], base: ObjectHeaderBase) -> Result<LinObject> {
         extensions: data.get(offset..).ok_or(BlfError::Truncated)?.to_vec(),
         raw_data: data.to_vec(),
     })
+}
+
+#[cfg(test)]
+mod schema_coverage {
+    use super::*;
+
+    /// Every object type the enum knows must map to a parsing path: either a
+    /// typed struct, a LIN record, the serial-event union, or a field schema.
+    #[test]
+    fn every_object_type_has_a_parsing_path() {
+        for raw in 0..=133u32 {
+            let object_type = ObjectType::from_raw(raw);
+            // The log container is the framing record, not an object a caller
+            // ever receives.
+            if matches!(
+                object_type,
+                ObjectType::Unknown | ObjectType::LogContainer | ObjectType::Unknown115
+            ) {
+                continue;
+            }
+            let schema = structured_schema(object_type);
+            let typed = matches!(
+                object_type,
+                ObjectType::CanMessage
+                    | ObjectType::CanMessage2
+                    | ObjectType::CanFdMessage
+                    | ObjectType::CanFdMessage64
+                    | ObjectType::CanError
+                    | ObjectType::CanErrorExt
+                    | ObjectType::CanFdError64
+                    | ObjectType::AppText
+                    | ObjectType::Unknown115
+            );
+            let lin = is_lin_type(object_type);
+            // Reserved ids are named but deliberately carry no layout.
+            let reserved = object_type.name() == "Reserved";
+            if reserved {
+                continue;
+            }
+            assert!(
+                typed || lin || !schema.is_empty(),
+                "type {} ({}) has no parser",
+                raw,
+                object_type.name()
+            );
+        }
+    }
 }

@@ -1,0 +1,91 @@
+# Written by Vector's binlog library (blf_dump/Libs/Linux/libbinlog.so) through
+# BLWriteObject. Each record holds one object type with every scalar field set
+# to a distinctive value; length/count fields stay 0 so no variable payload is
+# implied. Format: <type id> <official type name> field=value ...
+1 CAN_MESSAGE mChannel=1000 mFlags=11 mDLC=12 mID=100003 mData=array:14
+2 CAN_ERROR mChannel=1000 mLength=0
+3 CAN_OVERLOAD mChannel=1000 mDummy=1001
+4 CAN_STATISTIC mChannel=1000 mBusLoad=1001 mStandardDataFrames=100002 mExtendedDataFrames=100003 mStandardRemoteFrames=100004 mExtendedRemoteFrames=100005 mErrorFrames=100006 mOverloadFrames=100007
+5 APP_TRIGGER mPreTriggerTime=1000000 mPostTriggerTime=1000001 mChannel=1002 mFlags=1003 mAppSecific2=100004
+11 LIN_MESSAGE mChannel=1000 mID=11 mDLC=12 mData=array:13 mFSMId=14 mFSMState=15 mHeaderTime=16 mFullTime=17 mCRC=1008 mDir=19 mReserved=20
+12 LIN_CRC_ERROR mChannel=1000 mID=11 mDLC=12 mData=array:13 mFSMId=14 mFSMState=15 mHeaderTime=16 mFullTime=17 mCRC=1008 mDir=19 mReserved=20
+13 LIN_DLC_INFO mChannel=1000 mID=11 mDLC=12
+14 LIN_RCV_ERROR mChannel=1000 mID=11 mDLC=12 mFSMId=13 mFSMState=14 mHeaderTime=15 mFullTime=16 mStateReason=17 mOffendingByte=18 mShortError=19 mTimeoutDuringDlcDetection=20
+15 LIN_SND_ERROR mChannel=1000 mID=11 mDLC=12 mFSMId=13 mFSMState=14 mHeaderTime=15 mFullTime=16
+16 LIN_SLV_TIMEOUT mChannel=1000 mSlaveID=11 mStateID=12 mFollowStateID=100003
+17 LIN_SCHED_MODCH mChannel=1000 mOldMode=11 mNewMode=12 mOldSlot=13 mNewSlot=14 mFirstEventAfterWakeUp=15
+18 LIN_SYN_ERROR mChannel=1000 mDummy=1001 mTimeDiff=array:1002
+19 LIN_BAUDRATE mChannel=1000 mDummy=1001 mBaudrate=100002
+20 LIN_SLEEP mChannel=1000 mReason=11 mFlags=12
+21 LIN_WAKEUP mChannel=1000 mSignal=11 mExternal=12
+22 MOST_SPY mChannel=1000 mDir=11 mDummy1=12 mSourceAdr=100003 mDestAdr=100004 mMsg=array:15 mDummy2=16 mRTyp=1007 mRTypAdr=18 mState=19 mDummy3=20 mAckNack=21 mCRC=100012
+23 MOST_CTRL mChannel=1000 mDir=11 mDummy1=12 mSourceAdr=100003 mDestAdr=100004 mMsg=array:15 mDummy2=16 mRTyp=1007 mRTypAdr=18 mState=19 mDummy3H=20 mAckNack=21
+24 MOST_LIGHTLOCK mChannel=1000 mState=1001
+25 MOST_STATISTIC mChannel=1000 mPktCnt=1001 mFrmCnt=100002 mLightCnt=100003 mBufferLevel=100004
+29 FLEXRAY_DATA mChannel=1000 mMUX=11 mLen=0 mMessageID=1003 mCRC=1004 mDir=15 mDummy1=16 mDummy2=1007 mDataBytes=array:18
+30 FLEXRAY_SYNC mChannel=1000 mMUX=11 mLen=0 mMessageID=1003 mCRC=1004 mDir=15 mDummy1=16 mDummy2=1007 mDataBytes=array:18 mCycle=19
+31 CAN_DRIVER_ERROR mChannel=1000 mTXErrors=11 mRXErrors=12 mErrorCode=100003
+34 MOST_HWMODE mChannel=1000 mDummy1=1001 mHWMode=1002 mHWModeMask=1003
+35 MOST_REG mChannel=1000 mSubType=11 mDummy1=12 mHandle=100003 mOffset=100004 mChip=1005 mRegDataLen=0 mRegData=array:17
+36 MOST_GENREG mChannel=1000 mSubType=11 mDummy1=12 mHandle=100003 mRegId=1004 mDummy2=1005 mDummy3=100006 mRegValue=1000007
+37 MOST_NETSTATE mChannel=1000 mStateNew=1001 mStateOld=1002 mDummy1=1003
+38 MOST_DATALOST mChannel=1000 mDummy1=1001 mInfo=100002 mLostMsgsCtrl=100003 mLostMsgsAsync=100004 mLastGoodTimeStampNS=1000005 mNextGoodTimeStampNS=1000006
+39 MOST_TRIGGER mChannel=1000 mDummy1=1001 mMode=1002 mHW=1003 mPreviousTriggerValue=100004 mCurrentTriggerValue=100005
+40 FLEXRAY_CYCLE mChannel=1000 mDir=11 mLowTime=12 mFPGATick=100003 mFPGATickOverflow=100004 mClientIndex=100005 mClusterTime=100006 mDataBytes=array:17 mReserved=1008
+41 FLEXRAY_MESSAGE mChannel=1000 mDir=11 mLowTime=12 mFPGATick=100003 mFPGATickOverflow=100004 mClientIndex=100005 mClusterTime=100006 mFrameId=1007 mHeaderCRC=1008 mFrameState=1009 mLength=0 mCycle=21 mHeaderBitMask=22 mReserved1=23 mReserved2=1014 mDataBytes=array:25
+42 LIN_CHECKSUM_INFO mChannel=1000 mID=11 mChecksumModel=12
+43 LIN_SPIKE_EVENT mChannel=1000 mWidth=100001
+44 CAN_DRIVER_SYNC mChannel=1000 mFlags=11 mDummy=12
+45 FLEXRAY_STATUS mChannel=1000 mVersion=1001 mStatusType=1002 mInfoMask1=1003 mInfoMask2=1004 mInfoMask3=1005 mReserved=array:1006
+46 GPS_EVENT mFlags=100000 mChannel=1001 mReserved=1002 mLatitude=5.5 mLongitude=6.5 mAltitude=7.5 mSpeed=8.5 mCourse=9.5
+47 FR_ERROR mChannel=1000 mVersion=1001 mChannelMask=1002 mCycle=13 mClientIndex=100004 mClusterNo=100005 mTag=100006 mData=array:100007 mReserved=1008
+48 FR_STATUS mChannel=1000 mVersion=1001 mChannelMask=1002 mCycle=13 mClientIndex=100004 mClusterNo=100005 mWus=100006 mCcSyncState=100007 mTag=100008 mData=array:100009 mReserved=array:1010
+49 FR_STARTCYCLE mChannel=1000 mVersion=1001 mChannelMask=1002 mDir=13 mCycle=14 mClientIndex=100005 mClusterNo=100006 mNmSize=0 mDataBytes=array:18 mTag=100009 mData=array:100010 mReserved=1011
+50 FR_RCVMESSAGE mChannel=1000 mVersion=1001 mChannelMask=1002 mDir=13 mClientIndex=100004 mClusterNo=100005 mFrameId=1006 mHeaderCRC1=1007 mHeaderCRC2=1008 mByteCount=0 mDataCount=0 mCycle=21 mTag=100012 mData=100013 mFrameFlags=100014 mAppParameter=100015 mDataBytes=array:26
+51 REALTIMECLOCK mTime=1000000 mLoggingOffset=1000001
+54 LIN_STATISTIC mChannel=1000 mBusLoad=3.5 mBurstsTotal=100002 mBurstsOverrun=100003 mFramesSent=100004 mFramesReceived=100005 mFramesUnanswered=100006
+55 J1708_MESSAGE mChannel=1000 mDir=11 mError=1002 mSize=0 mData=array:14
+56 J1708_VIRTUAL_MSG mChannel=1000 mDir=11 mError=1002 mSize=0 mData=array:14
+57 LIN_MESSAGE2 mData=array:10 mCRC=1001 mDir=12 mSimulated=13 mIsETF=14 mETFAssocIndex=15 mETFAssocETFId=16 mFSMId=17 mFSMState=18 mReserved=array:19 mRespBaudrate=100010 mExactHeaderBaudrate=13.5 mEarlyStopbitOffset=100012 mEarlyStopbitOffsetResponse=100013
+58 LIN_SND_ERROR2 mEOH=1000000 mIsETF=11 mFSMId=12 mFSMState=13 mReserved=14 mReserved2=array:15 mExactHeaderBaudrate=8.5 mEarlyStopbitOffset=100007
+59 LIN_SYN_ERROR2 mTimeDiff=array:1000
+60 LIN_CRC_ERROR2 mData=array:10 mCRC=1001 mDir=12 mFSMId=13 mFSMState=14 mSimulated=15 mReserved=array:16 mRespBaudrate=100007 mReserved2=array:18 mExactHeaderBaudrate=11.5 mEarlyStopbitOffset=100010 mEarlyStopbitOffsetResponse=100011
+61 LIN_RCV_ERROR2 mData=array:10 mFSMId=11 mFSMState=12 mStateReason=13 mOffendingByte=14 mShortError=15 mTimeoutDuringDlcDetection=16 mIsETF=17 mHasDatabytes=18 mRespBaudrate=100009 mReserved=array:20 mExactHeaderBaudrate=13.5 mEarlyStopbitOffset=100012 mEarlyStopbitOffsetResponse=100013
+62 LIN_WAKEUP2 mLengthInfo=10 mSignal=11 mExternal=12 mReserved=13
+63 LIN_SPIKE_EVENT2 mWidth=100000 mInternal=11 mReserved=array:12
+64 LIN_LONG_DOM_SIG mType=10 mReserved=array:11
+66 FR_RCVMESSAGE_EX mChannel=1000 mVersion=1001 mChannelMask=1002 mDir=1003 mClientIndex=100004 mClusterNo=100005 mFrameId=1006 mHeaderCRC1=1007 mHeaderCRC2=1008 mByteCount=0 mDataCount=0 mCycle=1011 mTag=100012 mData=100013 mFrameFlags=100014 mAppParameter=100015 mFrameCRC=100016 mFrameLengthNS=100017 mFrameId1=1018 mPDUOffset=1019 mBlfLogMask=1020 mReservedW=1021 mReserved=array:100022 mDataBytes=array:33
+67 MOST_STATISTICEX mChannel=1000 mDummy1=1001 mCodingErrors=100002 mFrameCounter=100003
+68 MOST_TXLIGHT mChannel=1000 mState=1001
+70 MOST_STRESS mChannel=1000 mState=1001 mMode=1002 mDummy1=1003
+73 CAN_ERROR_EXT mChannel=1000 mLength=0 mFlags=100002 mECC=13 mPosition=14 mDLC=15 mReserved1=16 mFrameLengthInNS=100007 mID=100008 mFlagsExt=1009 mReserved2=1010 mData=array:21
+74 CAN_DRIVER_ERROR_EXT mChannel=1000 mTXErrors=11 mRXErrors=12 mErrorCode=100003 mFlags=100004 mState=15 mReserved1=16 mReserved2=1007 mReserved3=array:100008
+75 LIN_LONG_DOM_SIG2 mType=10 mReserved=array:11 mLength=0
+82 MOST_SYSTEM_EVENT mChannel=1000 mId=1001 mValue=100002 mValueOld=100003
+86 CAN_MESSAGE2 mChannel=1000 mFlags=11 mDLC=12 mID=100003 mData=array:14 mFrameLength=0 mBitCount=0 mReserved1=17 mReserved2=1008
+87 LIN_UNEXPECTED_WAKEUP mWidth=1000000 mSignal=11 mReserved=array:12
+88 LIN_SHORT_OR_SLOW_RESPONSE mNumberOfRespBytes=100000 mRespBytes=array:11 mSlowResponse=12 mInterruptedByBreak=13 mReserved=array:14
+89 LIN_DISTURBANCE_EVENT mChannel=1000 mID=11 mDisturbingFrameID=12 mDisturbanceType=100003 mByteIndex=100004 mBitIndex=100005 mBitOffsetInSixteenthBits=100006 mDisturbanceLengthInSixteenthBits=100007
+91 OVERRUN_ERROR mBusType=100000 mChannel=1001 mDummy=1002
+94 WLAN_STATISTIC mChannel=1000 mFlags=1001 mRxPacketCount=0 mRxByteCount=0 mTxPacketCount=0 mTxByteCount=0 mCollisionCount=0 mErrorCount=0
+95 MOST_ECL mChannel=1000 mMode=1001 mEclState=1002 mDummy2=1003
+98 AFDX_STATISTIC mChannel=1000 mFlags=1001 mRxPacketCount=0 mRxByteCount=0 mTxPacketCount=0 mTxByteCount=0 mCollisionCount=0 mErrorCount=0 mStatDroppedRedundantPacketCount=0 mStatRedundantErrorPacketCount=0 mStatIntegrityErrorPacketCount=0 mStatAvrgPeriodMsec=100011 mStatAvrgJitterMysec=100012 mVLId=100013 mStatDuration=100014
+99 KLINE_STATUSEVENT mType=1000 mDataLen=0 mPort=100002 mReserved=100003 mData=array:1000004
+100 CAN_FD_MESSAGE mChannel=1000 mFlags=11 mDLC=12 mID=100003 mFrameLength=0 mArbBitCount=0 mCANFDFlags=16 mValidDataBytes=17 mReserved1=18 mReserved2=100009 mData=array:20
+101 CAN_FD_MESSAGE_64 mChannel=10 mDLC=11 mValidDataBytes=12 mTxCount=0 mID=100004 mFrameLength=0 mFlags=100006 mBtrCfgArb=100007 mBtrCfgData=100008 mTimeOffsetBrsNs=100009 mTimeOffsetCrcDelNs=100010 mBitCount=0 mDir=22 mExtDataOffset=23 mCRC=100014 mData=array:25
+103 ETHERNET_STATUS mChannel=1000 mFlags=1001 mLinkStatus=12 mEthernetPhy=13 mDuplex=14 mMdi=15 mConnector=16 mClockMode=17 mPairs=18 mHardwareChannel=19 mBitrate=100010 mLinkUpDuration=1000011
+104 CAN_FD_ERROR_64 mChannel=10 mDLC=11 mValidDataBytes=12 mECC=13 mFlags=1004 mErrorCodeExt=1005 mExtFlags=1006 mExtDataOffset=17 mID=100008 mFrameLength=0 mBtrCfgArb=100010 mBtrCfgData=100011 mTimeOffsetBrsNs=100012 mTimeOffsetCrcDelNs=100013 mCRC=100014 mErrorPosition=1015 mReserved2=1016 mData=array:27
+105 LIN_SHORT_OR_SLOW_RESPONSE2 mNumberOfRespBytes=100000 mRespBytes=array:11 mSlowResponse=12 mInterruptedByBreak=13 mReserved=array:14 mExactHeaderBaudrate=7.5 mEarlyStopbitOffset=100006
+106 AFDX_STATUS mChannel=1000
+107 AFDX_BUS_STATISTIC mChannel=1000 mFlags=1001 mStatDuration=100002 mStatRxPacketCountHW=100003 mStatTxPacketCountHW=100004 mStatRxErrorCountHW=100005 mStatTxErrorCountHW=100006 mStatRxBytesHW=100007 mStatTxBytesHW=100008 mStatRxPacketCount=0 mStatTxPacketCount=0 mStatDroppedPacketCount=0 mStatInvalidPacketCount=0 mStatLostPacketCount=0 mLine=24 mLinkStatus=25 mLinkSpeed=1016 mLinkLost=1017
+109 AFDX_ERROR_EVENT mChannel=1000 mErrorLevel=1001 mSourceIdentifier=100002
+110 A429_ERROR mChannel=1000 mErrorType=1001 mSourceIdentifier=100002 mErrReason=100003
+111 A429_STATUS mChannel=1000 mDir=11 mParity=1002 mMinGap=100003 mBitrate=100004 mMinBitrate=100005 mMaxBitrate=100006
+112 A429_BUS_STATISTIC mChannel=1000 mDir=11 mBusLoad=100002 mDataTotal=100003 mErrorTotal=100004 mBitrate=100005 mParityErrors=1006 mBitrateErrors=1007 mGapErrors=1008 mLineErrors=1009 mFormatErrors=1010 mDutyFactorErrors=1011 mWordLenErrors=1012 mCodingErrors=1013 mIdleErrors=1014 mLevelErrors=1015 mLabelCount=0
+113 A429_MESSAGE mA429Data=array:10 mChannel=1001 mDir=12 mReserved=13 mBitrate=100004 mErrReason=100005 mErrPosition=1006 mFrameGap=1000007 mFrameLength=0 mMsgCtrl=1009 mCycleTime=100010 mError=100011 mBitLenOfLastBit=100012
+114 ETHERNET_STATISTIC mChannel=1000 mRcvOk_HW=1000001 mXmitOk_HW=1000002 mRcvError_HW=1000003 mXmitError_HW=1000004 mRcvBytes_HW=1000005 mXmitBytes_HW=1000006 mRcvNoBuffer_HW=1000007 mSQI=1008 mHardwareChannel=1009
+125 DATA_LOST_BEGIN mQueueIdentifier=100000
+126 DATA_LOST_END mQueueIdentifier=100000 mFirstObjectLostTimeStamp=1000001 mNumberOfLostEvents=100002
+127 WATER_MARK_EVENT mQueueState=100000
+129 CAN_SETTING_CHANGED mChannel=1000 mChangedType=11
+133 ETHERNET_PHY_STATE mChannel=1000 mFlags=1001 mPhyState=12 mPhyEvent=13 mHardwareChannel=14

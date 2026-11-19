@@ -1003,3 +1003,38 @@ pub(crate) fn read_system_time(data: &[u8], offset: usize) -> Result<SystemTime>
         milliseconds: read_u16(data, at(14)?)?,
     })
 }
+
+#[cfg(test)]
+mod name_coverage {
+    use super::*;
+
+    #[test]
+    fn every_object_type_has_a_name_and_a_number() {
+        for raw in 0..=200u32 {
+            let name = object_type_name(raw);
+            assert!(!name.is_empty(), "type {raw}");
+            let parsed = ObjectType::from_raw(raw);
+            if raw <= 133 {
+                assert!(!parsed.name().is_empty(), "type {raw}");
+            } else {
+                assert_eq!(parsed, ObjectType::Unknown, "type {raw} should be unknown");
+            }
+            assert_eq!(ObjectType::from_raw(parsed.as_u32()), parsed);
+        }
+    }
+
+    #[test]
+    fn ethernet_value_names_cover_every_byte() {
+        for value in 0..=255u8 {
+            assert!(!ethernet_link_status_name(value).is_empty());
+            assert!(!ethernet_phy_type_name(value).is_empty());
+            assert!(!ethernet_duplex_name(value).is_empty());
+            assert!(!ethernet_mdi_name(value).is_empty());
+            assert!(!ethernet_connector_name(value).is_empty());
+            assert!(!ethernet_clock_mode_name(value).is_empty());
+            assert!(!ethernet_pairs_name(value).is_empty());
+            assert!(!ethernet_phy_state_name(value).is_empty());
+            assert!(!ethernet_phy_event_name(value).is_empty());
+        }
+    }
+}

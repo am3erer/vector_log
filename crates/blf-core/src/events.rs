@@ -222,3 +222,57 @@ mod tests {
         assert_eq!(ethernet_sqi_name(9), "unknown");
     }
 }
+
+#[cfg(test)]
+mod exhaustive {
+    use super::*;
+
+    /// Every table must answer for every byte value a file can hold.
+    #[test]
+    fn all_name_tables_cover_every_input() {
+        for value in 0..=255u8 {
+            assert!(!can_error_code_name(value).is_empty());
+            assert!(!can_error_direction_name(value).is_empty());
+            assert!(!lin_sleep_reason_name(value).is_empty());
+            assert!(!lin_wakeup_length_name(value).is_empty());
+            assert!(!lin_checksum_model_name(value).is_empty());
+            assert!(!lin_long_dom_signal_type_name(value).is_empty());
+            assert!(!lin_spike_origin_name(value).is_empty());
+            assert!(!lin_sleep_flags_text(value).is_empty());
+            assert!(!ethernet_sqi_name(i16::from(value)).is_empty());
+        }
+        for value in 0..=300u32 {
+            assert!(!can_driver_error_name(value).is_empty());
+            assert!(!lin_disturbance_type_name(value).is_empty());
+            assert!(!ethernet_rx_error_name(value).is_empty());
+        }
+    }
+
+    #[test]
+    fn documented_tables_name_every_listed_value() {
+        // The comments in `events.rs` quote these tables, so a duplicate or a
+        // silent gap would show up as an unlisted value.
+        let driver: Vec<u32> = vec![
+            0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 14, 100, 101, 102, 103, 104, 105, 106, 107, 108,
+            109, 110, 111, 112, 113, 114, 115, 217, 218, 219, 220, 221, 222, 232, 248, 249, 250,
+            251, 252, 455,
+        ];
+        for value in driver {
+            let name = can_driver_error_name(value);
+            assert_ne!(name, "unlisted driver error", "code {value}");
+        }
+        for value in [0, 1, 2, 3, 4, 5, 7] {
+            assert_ne!(can_error_code_name(value), "unknown error", "code {value}");
+        }
+        for value in [0, 1, 2, 3, 9, 10, 11, 18] {
+            assert_ne!(lin_sleep_reason_name(value), "unknown reason", "{value}");
+        }
+        for value in [0, 1, 2, 3, 4] {
+            assert_ne!(
+                lin_disturbance_type_name(value),
+                "unknown disturbance",
+                "{value}"
+            );
+        }
+    }
+}

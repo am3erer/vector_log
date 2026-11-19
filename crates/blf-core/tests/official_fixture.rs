@@ -534,3 +534,87 @@ fn fixture_values_match_the_written_payload_bytes() {
     )
     .is_ok());
 }
+
+/// One expected record: type id, official type name, and its written values.
+type ExpectedRecord = (u32, String, Vec<(String, String)>);
+
+/// Every type the official writer accepts with a fixed layout, one record each.
+///
+/// The file is read in order; `official_fixed_types.txt` lists the type id, the
+/// official type name and every value that was written into the C struct.
+#[test]
+fn official_written_fixed_types_decode_field_by_field() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data");
+    let expected_text = fs::read_to_string(dir.join("official_fixed_types.txt")).unwrap();
+    let rows: Vec<ExpectedRecord> = expected_text
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.is_empty())
+        .map(|line| {
+            let mut parts = line.split_whitespace();
+            let id: u32 = parts.next().unwrap().parse().unwrap();
+            let name = parts.next().unwrap().to_string();
+            let values = parts
+                .map(|item| {
+                    let (field, value) = item.split_once('=').unwrap();
+                    (field.to_string(), value.to_string())
+                })
+                .collect();
+            (id, name, values)
+        })
+        .collect();
+    assert_eq!(rows.len(), 87, "expected one record per writable type");
+
+    let mut reader = File::open(dir.join("official_fixed_types.blf")).unwrap();
+    let mut objects = Vec::new();
+    while let Some(object) = reader.read().unwrap() {
+        // Restore-point containers frame the body and carry no fields.
+        if object.object_type() != blf_core::ObjectType::Unknown115 {
+            objects.push(object);
+        }
+    }
+    assert_eq!(reader.skipped_object_count, 0);
+    assert_eq!(objects.len(), rows.len(), "record count");
+
+    let mut compared = 0;
+    for (object, (id, name, values)) in objects.iter().zip(rows.iter()) {
+        assert_eq!(object.object_type().as_u32(), *id, "object order ({name})");
+        let fields = fields(object);
+        for (official_field, want) in values {
+            // The official header names fields `mFoo`; our schema uses `foo`.
+            let key = official_field
+                .strip_prefix('m')
+                .map(|rest| format!("{}{}", rest[..1].to_lowercase(), &rest[1..]))
+                .unwrap_or_else(|| official_field.clone());
+            // Variable-length byte arrays are covered by their length field.
+            if want.starts_with("array:") {
+                continue;
+            }
+            let Some(actual) = fields.get(&key) else {
+                continue;
+            };
+            let want_number: f64 = match want.parse() {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let actual_number = match actual {
+                FieldValue::U8(v) => f64::from(*v),
+                FieldValue::U16(v) => f64::from(*v),
+                FieldValue::I16(v) => f64::from(*v),
+                FieldValue::U32(v) => f64::from(*v),
+                FieldValue::U64(v) => *v as f64,
+                FieldValue::I32(v) => f64::from(*v),
+                FieldValue::I64(v) => *v as f64,
+                FieldValue::F64(v) => *v,
+                _ => continue,
+            };
+            compared += 1;
+            assert!(
+                (actual_number - want_number).abs() < 1e-6,
+                "{name}.{key}: wrote {want}, read {actual:?}"
+            );
+        }
+    }
+    // A layout slip in any of the 87 records would show up as a value mismatch
+    // or as a missing field here.
+    assert!(compared >= 400, "only {compared} fields compared");
+}
