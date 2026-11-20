@@ -86,6 +86,11 @@ diagnostic objects, including:
   (`axis=shared` or `axis=per-signal`).
 - The help overlay has its own filter: `/` then a word narrows the key list and
   keeps the matching section headings.
+- The attributes inspector scrolls with the mouse wheel like every other view,
+  and the help overlay documents each new key so `?` stays accurate.
+- A record with neither an event nor a payload shows its class name (`<…>`)
+  instead of a row of dashes; restore-point containers say how many bytes they
+  hold and whether the table inside was decodable.
 - The database browser keeps two panes below 80 columns instead of splitting a
   narrow terminal three ways, which left the details column zero wide; `Tab`
   then opens the details at full width.

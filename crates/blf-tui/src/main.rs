@@ -5075,6 +5075,27 @@ fn bus_event(object: &Object) -> Option<BusEvent> {
             )
         }
         // ---- application text: measurement comment, channel info, metadata ----
+        Object::RestorePointContainer(value) => {
+            // A restore-point container carries no frame, only a table of
+            // positions the reader can jump back to.
+            // The payload is either the documented restore-point table or an
+            // opaque block the writer leaves here; the reader already tells the
+            // two apart, so the row says which one this is instead of guessing.
+            let detail = match &value.restore_points {
+                Some(table) => format!(
+                    "{} restore point{} in {} bytes",
+                    table.restore_points.len(),
+                    if table.restore_points.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                    value.data_length
+                ),
+                None => format!("{} bytes, table not decoded", value.data_length),
+            };
+            Some(BusEvent::new("-", "restore").text(detail).done())
+        }
         Object::AppText(value) => {
             let source = blf_core::app_text_source_name(value.source);
             let text = blf_core::app_text_text(&value.text);
@@ -5100,8 +5121,10 @@ fn bus_event(object: &Object) -> Option<BusEvent> {
                 ])),
                 _ => preview,
             };
+            // The bus column says `txt` rather than a dash: an `AppText` record
+            // belongs to no bus, but a bare dash reads as missing data.
             Some(
-                BusEvent::new("-", "text")
+                BusEvent::new("txt", "text")
                     .text(format!("{source}: {detail}"))
                     .done(),
             )
@@ -7103,6 +7126,9 @@ fn summary_line(summary: &MessageSummary, axis: TimeAxis, pool: &TextPool, width
     let payload = match (&summary.ethernet, &summary.event) {
         (Some(info), _) => short_summary(pool.get(info.summary)),
         (None, Some(event)) => format!("{}: {}", event.kind, event.summary),
+        // A record with neither an event nor a payload still has a class, and
+        // naming it beats a row of dashes that says nothing at all.
+        (None, None) if summary.payload.is_empty() => format!("<{}>", summary.class_name),
         (None, None) => hex_bytes(&summary.payload),
     };
     // Each column keeps its own colour so the list stays scannable; the width
@@ -8130,11 +8156,13 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     binding("Esc", "clear the message filter and the time range"),
     binding("q", "quit"),
     heading("Detail (needs a trace)"),
-    binding("j / Down", "next signal"),
-    binding("k / Up", "previous signal"),
+    binding("Tab", "switch between attributes and signals"),
+    binding("j / Down", "next signal, or scroll the focused pane"),
+    binding("k / Up", "previous signal, or scroll the focused pane"),
     binding("PageUp/PageDown", "move one screen"),
-    binding("Home / End", "first / last signal"),
+    binding("Home / End", "first / last entry"),
     binding("p", "curve for the selected numeric signal"),
+    binding("a", "add the selected signal to the open curve"),
     binding("b", "bind a DBC or LDF database"),
     binding("e", "export filtered messages to CSV"),
     binding("Esc / Left", "back to the message list"),
@@ -8144,6 +8172,8 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     binding("+ / = / -", "zoom in / out"),
     binding("PageUp/PageDown", "zoom in / out"),
     binding("Home / End", "first / last sample"),
+    binding("n", "scale each signal to its own range"),
+    binding("x", "remove the last added signal"),
     binding("Esc", "back to the message detail"),
     binding("q", "quit"),
     heading("Frame statistics"),
@@ -8167,10 +8197,22 @@ const HELP_ENTRIES: &[HelpEntry] = &[
     binding("b", "bind a DBC or LDF database"),
     binding("Esc", "back to the message list (trace only)"),
     binding("q", "quit"),
+    heading("Attributes (i)"),
+    binding("j / k", "scroll the attribute list"),
+    binding("PageUp/PageDown", "move one screen"),
+    binding("Home / End", "first / last line"),
+    binding("e", "export filtered messages to CSV"),
+    binding("P", "export the visible frames to pcapng"),
+    binding("Esc / Left", "back to the message list"),
+    heading("Help"),
+    binding("/", "search the key list"),
+    binding("f", "clear the search"),
+    binding("j / k", "scroll"),
     heading("Global"),
     binding("Ctrl-C", "quit the viewer"),
     binding("?", "open or close this help"),
     binding("Mouse", "click to select, wheel to scroll"),
+    binding("--theme", "light, dark or auto colour set"),
 ];
 
 /// Render the help table for `width` cells as `(is_heading, line)` rows. A
@@ -13370,6 +13412,70 @@ mod database_pane_tests {
                 .max()
                 .unwrap_or(0);
             assert_eq!(dividers, 2, "width {width}: expected three panes");
+        }
+    }
+}
+
+#[cfg(test)]
+mod help_coverage_tests {
+    use super::*;
+
+    /// Every key the views react to has to be listed, or the help lies.
+    #[test]
+    fn the_help_lists_the_keys_the_views_use() {
+        let text = help_lines(120)
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for expected in [
+            // Messages
+            "filter messages",
+            "limit to a time range",
+            // Detail
+            "switch between attributes and signals",
+            "curve for the selected numeric signal",
+            "add the selected signal to the open curve",
+            // Curve
+            "pan the sample window",
+            "scale each signal to its own range",
+            "remove the last added signal",
+            // Databases
+            "focus the tree, object or details pane",
+            // Attributes
+            "export the visible frames to pcapng",
+            // Help
+            "search the key list",
+            // Global
+            "open or close this help",
+            "light, dark or auto colour set",
+        ] {
+            assert!(text.contains(expected), "help does not mention: {expected}");
+        }
+    }
+
+    #[test]
+    fn the_help_has_a_section_for_every_view() {
+        let headings: Vec<String> = help_lines(120)
+            .into_iter()
+            .filter(|(heading, _)| *heading)
+            .map(|(_, line)| line)
+            .collect();
+        for expected in [
+            "Messages",
+            "Detail",
+            "Curve",
+            "Frame statistics",
+            "Databases",
+            "Attributes",
+            "Help",
+            "Global",
+        ] {
+            assert!(
+                headings.iter().any(|heading| heading.contains(expected)),
+                "no help section for {expected}: {headings:?}"
+            );
         }
     }
 }
