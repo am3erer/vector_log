@@ -19,3 +19,4 @@ __pycache__/
 /blf_dump/
 /.venv-m/
 /.venv-ref/
+/.venv-q/

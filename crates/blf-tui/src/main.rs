@@ -5,6 +5,7 @@ use std::fs::{File as StdFile, OpenOptions};
 use std::io::{self, BufWriter, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -36,24 +37,120 @@ const STATS_FIRST_ROW: u16 = HEADER_ROWS + 3;
 /// Status for a trace-only action in a database-only session.
 const NO_TRACE_STATUS: &str = "No trace loaded";
 
-// Match the vivid ANSI palette used by the other terminal tools in this workspace.
+// Colour strategy
+// --------------
+// Plain text carries no escape code at all, so it takes the terminal's own
+// foreground: black on a light theme, white on a dark one. Accents use the
+// mid-luminance ANSI colours (31-36), which keep contrast on either background.
+//
+// A dark terminal benefits from the bright variants, and a light one must avoid
+// them: `\x1b[93m` on white is nearly invisible. `--theme` picks the set, and
+// `auto` reads the `COLORFGBG` variable most terminals export.
 const ANSI_RESET: &str = "\x1b[0m";
 const ANSI_BOLD: &str = "\x1b[1m";
-const ANSI_RED: &str = "\x1b[31m";
-const ANSI_MAGENTA: &str = "\x1b[35m";
-const ANSI_CYAN: &str = "\x1b[36m";
-const ANSI_WHITE: &str = "\x1b[37m";
-const ANSI_GREEN: &str = "\x1b[32m";
-const ANSI_YELLOW: &str = "\x1b[33m";
-const ANSI_BRIGHT_RED: &str = "\x1b[91m";
-const ANSI_BRIGHT_GREEN: &str = "\x1b[92m";
-const ANSI_BRIGHT_CYAN: &str = "\x1b[96m";
-const ANSI_BRIGHT_YELLOW: &str = "\x1b[93m";
-const ANSI_BRIGHT_BLUE: &str = "\x1b[94m";
-const ANSI_BRIGHT_MAGENTA: &str = "\x1b[95m";
-const ANSI_SELECTED: &str = "\x1b[1;97;44m";
+/// Follow the terminal foreground: readable on both themes.
+const ANSI_PLAIN: &str = "";
+/// Reverse video: inverts the theme, so a selected row reads on both.
+const ANSI_SELECTED: &str = "\x1b[7m";
+
+/// Whether the terminal has a light background.
+static LIGHT_BACKGROUND: AtomicBool = AtomicBool::new(true);
+
+/// Which colour set to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Theme {
+    /// Pick from `COLORFGBG`, defaulting to light (the safer choice: bright
+    /// colours on white are the ones that disappear).
+    Auto,
+    /// Dark background: the bright variants stay legible and look vivid.
+    Dark,
+    /// Light background: the mid-luminance variants keep contrast.
+    Light,
+}
+
+impl Theme {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "auto" => Some(Self::Auto),
+            "dark" => Some(Self::Dark),
+            "light" => Some(Self::Light),
+            _ => None,
+        }
+    }
+
+    /// Resolve `Auto` against the environment.
+    fn resolve(self) -> bool {
+        match self {
+            Self::Light => true,
+            Self::Dark => false,
+            Self::Auto => detect_light_background(),
+        }
+    }
+}
+
+/// Read `COLORFGBG`, which terminals set to `foreground;background`.
+///
+/// A background index of 7 or 15 (and the `default` keyword) means light. When
+/// the variable is missing the answer is "light", because that is the case where
+/// a wrong guess hides text.
+fn detect_light_background() -> bool {
+    let Some(value) = std::env::var_os("COLORFGBG") else {
+        return true;
+    };
+    let value = value.to_string_lossy();
+    let Some(background) = value.rsplit(';').next() else {
+        return true;
+    };
+    match background.trim().parse::<u8>() {
+        // 7 is the light grey, 15 the bright white.
+        Ok(index) => !matches!(index, 0..=6),
+        Err(_) => true,
+    }
+}
+
+fn set_theme(theme: Theme) {
+    LIGHT_BACKGROUND.store(theme.resolve(), Ordering::Relaxed);
+}
+
+fn light_background() -> bool {
+    LIGHT_BACKGROUND.load(Ordering::Relaxed)
+}
+
+/// Colour slot: the meaning stays the same, the exact code follows the theme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+}
+
+fn slot_color(slot: Slot) -> &'static str {
+    match (slot, light_background()) {
+        // Light background: mid-luminance ANSI colours.
+        (Slot::Red, true) => "\x1b[31m",
+        (Slot::Green, true) => "\x1b[32m",
+        (Slot::Yellow, true) => "\x1b[33m",
+        (Slot::Blue, true) => "\x1b[34m",
+        (Slot::Magenta, true) => "\x1b[35m",
+        (Slot::Cyan, true) => "\x1b[36m",
+        // Dark background: the bright variants are vivid without washing out.
+        (Slot::Red, false) => "\x1b[91m",
+        (Slot::Green, false) => "\x1b[92m",
+        (Slot::Yellow, false) => "\x1b[93m",
+        (Slot::Blue, false) => "\x1b[94m",
+        (Slot::Magenta, false) => "\x1b[95m",
+        (Slot::Cyan, false) => "\x1b[96m",
+    }
+}
 
 fn paint(value: impl AsRef<str>, color: &str) -> String {
+    if color.is_empty() {
+        // Plain text: let the terminal pick the foreground for its theme.
+        return value.as_ref().to_string();
+    }
     format!("{color}{}{ANSI_RESET}", value.as_ref())
 }
 
@@ -153,6 +250,9 @@ struct SignalRow {
     choice: Option<String>,
     error: Option<String>,
 }
+
+/// Rows below the body: the status line with the key hints.
+const STATUS_ROWS: usize = 1;
 
 /// Below this width a two-pane layout leaves neither half readable.
 const PREVIEW_MIN_WIDTH: usize = 100;
@@ -295,16 +395,22 @@ struct CurveData {
     window_end: u64,
 }
 
-/// Symbols and colours handed to the series of a curve, in plot order.
+/// Symbols handed to the series of a curve, in plot order.
 const CURVE_SYMBOLS: [char; 6] = ['*', 'o', '+', 'x', '#', '@'];
-const CURVE_COLORS: [&str; 6] = [
-    ANSI_BRIGHT_GREEN,
-    ANSI_MAGENTA,
-    ANSI_BRIGHT_YELLOW,
-    ANSI_CYAN,
-    ANSI_WHITE,
-    ANSI_RED,
+/// Colour slots for the same series; resolved per theme at render time so the
+/// lines stay visible on both light and dark backgrounds.
+const CURVE_SLOTS: [Slot; 6] = [
+    Slot::Green,
+    Slot::Magenta,
+    Slot::Yellow,
+    Slot::Cyan,
+    Slot::Blue,
+    Slot::Red,
 ];
+
+fn curve_color(index: usize) -> &'static str {
+    slot_color(CURVE_SLOTS[index % CURVE_SLOTS.len()])
+}
 
 /// Smallest window the zoom keeps, so a curve cannot collapse to nothing.
 const MIN_CURVE_WINDOW_NS: u64 = 1_000_000;
@@ -2139,7 +2245,7 @@ impl App {
             error,
             truncated,
             symbol: CURVE_SYMBOLS[index],
-            color: CURVE_COLORS[index],
+            color: curve_color(index),
         });
         // The first series always seeds the window, also when it arrives by `a`.
         if !append || curve.series.len() == 1 {
@@ -2370,7 +2476,7 @@ impl App {
         let width = self.viewport_width;
         let height = self.viewport_height;
         let mut lines = Vec::new();
-        lines.push(paint_bold(self.title_line(), ANSI_BRIGHT_CYAN));
+        lines.push(paint_bold(self.title_line(), slot_color(Slot::Cyan)));
         let databases = if self.bindings.is_empty() {
             "none".to_string()
         } else {
@@ -2387,8 +2493,11 @@ impl App {
                 .collect::<Vec<_>>()
                 .join("  ")
         };
-        lines.push(paint(format!(" databases: {databases}"), ANSI_CYAN));
-        lines.push(paint("─".repeat(width), ANSI_BRIGHT_CYAN));
+        lines.push(paint(
+            format!(" databases: {databases}"),
+            slot_color(Slot::Cyan),
+        ));
+        lines.push(paint("─".repeat(width), slot_color(Slot::Cyan)));
         if self.help.is_some() {
             self.render_help(&mut lines, width, height);
         } else {
@@ -2404,10 +2513,10 @@ impl App {
                 Mode::Inspector => self.render_inspector(&mut lines, width, height),
             }
         }
-        lines.push(paint("─".repeat(width), ANSI_BRIGHT_CYAN));
+        lines.push(paint("─".repeat(width), slot_color(Slot::Cyan)));
         lines.push(paint_bold(
             footer_line(self.input, &self.input_buffer, &self.status, self.mode),
-            ANSI_BRIGHT_YELLOW,
+            slot_color(Slot::Yellow),
         ));
         let mut output = String::from("\x1b[H");
         for line in lines.into_iter().take(height) {
@@ -2435,13 +2544,13 @@ impl App {
                 end,
                 entries.len()
             ),
-            ANSI_BRIGHT_CYAN,
+            slot_color(Slot::Cyan),
         ));
         for (is_heading, line) in &entries[offset..end] {
             lines.push(if *is_heading {
-                paint_bold(line, ANSI_BRIGHT_YELLOW)
+                paint_bold(line, slot_color(Slot::Yellow))
             } else {
-                paint(line, ANSI_WHITE)
+                paint(line, ANSI_PLAIN)
             });
         }
     }
@@ -2490,7 +2599,7 @@ impl App {
             } else {
                 truncate(&heading, width)
             },
-            ANSI_BRIGHT_CYAN,
+            slot_color(Slot::Cyan),
         ));
         // Column header for the current view; the selection marker keeps the
         // alignment with the rows below.
@@ -2502,7 +2611,7 @@ impl App {
                     split.saturating_sub(2)
                 )
             ),
-            ANSI_CYAN,
+            slot_color(Slot::Cyan),
         ));
         lines.push(paint(
             if show_preview {
@@ -2514,7 +2623,7 @@ impl App {
             } else {
                 "─".repeat(width)
             },
-            ANSI_CYAN,
+            slot_color(Slot::Cyan),
         ));
         let available = height.saturating_sub(7);
         let preview = self
@@ -2573,12 +2682,19 @@ impl App {
             } else {
                 pad_to_width(&truncate(&left, width), width)
             };
+            // A selected row is reverse video over plain text: the per-column
+            // colours would reset the attribute mid-row, so they are dropped
+            // first. A record that failed to decode keeps one alarming colour.
             lines.push(if selected {
-                paint_selected(line)
+                paint_selected(strip_ansi(&line))
             } else if let Some(summary) = summary {
-                message_color(summary, line)
+                if summary.status == "ok" {
+                    line
+                } else {
+                    message_color(summary, strip_ansi(&line))
+                }
             } else {
-                paint(line, ANSI_WHITE)
+                line
             });
         }
     }
@@ -2656,9 +2772,9 @@ impl App {
             lines.push(if signal_selected {
                 paint_selected(line)
             } else if row == 0 {
-                paint_bold(line, ANSI_BRIGHT_CYAN)
+                paint_bold(line, slot_color(Slot::Cyan))
             } else {
-                paint(line, ANSI_WHITE)
+                paint(line, ANSI_PLAIN)
             });
         }
     }
@@ -2676,7 +2792,7 @@ impl App {
             "Details".to_string()
         };
         lines.push(paint_cell(header, CellStyle::PaneHeader));
-        lines.push(paint("─".repeat(width), ANSI_CYAN));
+        lines.push(paint("─".repeat(width), slot_color(Slot::Cyan)));
         for row in 0..rows {
             let (text, style) = details
                 .get(offset + row)
@@ -2708,14 +2824,14 @@ impl App {
                     ""
                 }
             ),
-            ANSI_BRIGHT_CYAN,
+            slot_color(Slot::Cyan),
         ));
         let mut legend = 0;
         for series in &curve.series {
             if legend >= MAX_CURVE_LEGEND {
                 lines.push(paint(
                     format!("  … {} more", curve.series.len() - legend),
-                    ANSI_WHITE,
+                    ANSI_PLAIN,
                 ));
                 break;
             }
@@ -2730,16 +2846,24 @@ impl App {
                 series.color,
             ));
             if let Some(error) = &series.error {
-                lines.push(paint(format!("    note: {error}"), ANSI_RED));
+                lines.push(paint(format!("    note: {error}"), slot_color(Slot::Red)));
             }
             legend += 1;
         }
         if curve.series.iter().all(|series| series.samples.is_empty()) {
-            lines.push(paint("No numeric samples available", ANSI_BRIGHT_YELLOW));
+            lines.push(paint(
+                "No numeric samples available",
+                slot_color(Slot::Yellow),
+            ));
             return;
         }
         lines.push(String::new());
-        let rows = height.saturating_sub(3 + legend);
+        // The title, database line and separator above already used three rows,
+        // and the status line takes one more; the plot needs two of its own for
+        // the axes. Reserving only `3 + legend` pushed the axes off-screen.
+        let rows = height
+            .saturating_sub(usize::from(HEADER_ROWS) + STATUS_ROWS + 1 + legend + 1)
+            .max(3);
         lines.extend(plot_series(curve, window, width.saturating_sub(1), rows));
     }
 
@@ -2805,9 +2929,9 @@ impl App {
                 self.inspector_offset + 1,
                 body.len().max(1)
             ),
-            ANSI_BRIGHT_CYAN,
+            slot_color(Slot::Cyan),
         ));
-        lines.push(paint("─".repeat(width), ANSI_CYAN));
+        lines.push(paint("─".repeat(width), slot_color(Slot::Cyan)));
         for row in 0..page {
             let line = body
                 .get(self.inspector_offset + row)
@@ -2825,17 +2949,17 @@ impl App {
                 self.filtered.len(),
                 self.stats_sort.label()
             ),
-            ANSI_BRIGHT_CYAN,
+            slot_color(Slot::Cyan),
         ));
         lines.push(paint(
             stat_header_row(width, stat_unit(&self.stats, self.view)),
-            ANSI_BRIGHT_CYAN,
+            slot_color(Slot::Cyan),
         ));
-        lines.push(paint("─".repeat(width), ANSI_CYAN));
+        lines.push(paint("─".repeat(width), slot_color(Slot::Cyan)));
         if self.stats.is_empty() {
             lines.push(paint(
                 "No frames in the visible list (clear the filter with Esc)",
-                ANSI_BRIGHT_YELLOW,
+                slot_color(Slot::Yellow),
             ));
             return;
         }
@@ -2850,7 +2974,7 @@ impl App {
             lines.push(if selected {
                 paint_selected(pad_to_width(&text, width))
             } else {
-                paint(text, ANSI_WHITE)
+                paint(text, ANSI_PLAIN)
             });
         }
     }
@@ -2906,13 +3030,8 @@ impl App {
             width,
         ));
         lines.push(paint(
-            format!(
-                "{}─┼{}─┼{}",
-                "─".repeat(left),
-                "─".repeat(middle),
-                "─".repeat(width.saturating_sub(left + middle + 6))
-            ),
-            ANSI_CYAN,
+            three_column_separator(left, middle, right, width),
+            slot_color(Slot::Cyan),
         ));
         for row in 0..rows {
             let (tree_text, tree_style) = if row == 0 {
@@ -3054,19 +3173,36 @@ fn pane_header_style(focused: bool) -> CellStyle {
 
 fn paint_cell(value: impl AsRef<str>, style: CellStyle) -> String {
     match style {
-        CellStyle::Normal => paint(value, ANSI_WHITE),
+        CellStyle::Normal => paint(value, ANSI_PLAIN),
         CellStyle::Selected => paint_selected(value),
-        CellStyle::Dim => paint(value, ANSI_CYAN),
-        CellStyle::PaneHeader => paint_bold(value, ANSI_BRIGHT_CYAN),
-        CellStyle::PaneHeaderIdle => paint(value, ANSI_BRIGHT_CYAN),
-        CellStyle::DatabaseHeader => paint_bold(value, ANSI_BRIGHT_YELLOW),
-        CellStyle::DetailHeading => paint_bold(value, ANSI_BRIGHT_CYAN),
-        CellStyle::DetailItem => paint(value, ANSI_WHITE),
+        CellStyle::Dim => paint(value, slot_color(Slot::Cyan)),
+        CellStyle::PaneHeader => paint_bold(value, slot_color(Slot::Cyan)),
+        CellStyle::PaneHeaderIdle => paint(value, slot_color(Slot::Cyan)),
+        CellStyle::DatabaseHeader => paint_bold(value, slot_color(Slot::Yellow)),
+        CellStyle::DetailHeading => paint_bold(value, slot_color(Slot::Cyan)),
+        CellStyle::DetailItem => paint(value, ANSI_PLAIN),
     }
 }
 
 /// Render three padded columns, styling each cell independently so one pane's
 /// selection never changes how the neighbouring pane is drawn.
+/// Separator row that puts `┼` exactly under the `│` of the rows above.
+///
+/// A row is `left │ middle │ right`, so the dividers sit at `left + 1` and
+/// `left + middle + 4`; the filler has to match those offsets, not the raw
+/// column widths.
+fn three_column_separator(left: usize, middle: usize, _right: usize, width: usize) -> String {
+    let left = left.min(width.saturating_sub(6));
+    let middle = middle.min(width.saturating_sub(left + 6));
+    let right = width.saturating_sub(left + middle + 6);
+    format!(
+        "{}┼{}┼{}",
+        "─".repeat(left + 1),
+        "─".repeat(middle + 2),
+        "─".repeat(right + 1)
+    )
+}
+
 fn styled_three_column(
     left: (&str, CellStyle),
     middle: (&str, CellStyle),
@@ -6387,6 +6523,45 @@ fn view_header(view: View, width: usize) -> String {
 }
 
 /// One frame rendered in the columns of `view`.
+/// Colour of a timestamp: the least important column, so it stays subdued.
+fn color_time() -> &'static str {
+    slot_color(Slot::Blue)
+}
+/// Colour of the bus label, so a mixed trace is scannable at a glance.
+fn color_bus() -> &'static str {
+    slot_color(Slot::Cyan)
+}
+/// Colour of an identifier or EtherType.
+fn color_id() -> &'static str {
+    slot_color(Slot::Yellow)
+}
+/// Colour of a payload: the terminal foreground.
+const COLOR_DATA: &str = ANSI_PLAIN;
+/// Colour of a secondary attribute such as DLC or a flag word.
+const COLOR_ATTRIBUTE: &str = ANSI_PLAIN;
+
+fn color_direction(direction: Option<&str>) -> &'static str {
+    match direction {
+        Some("Rx") => slot_color(Slot::Green),
+        Some("Tx") => slot_color(Slot::Magenta),
+        Some("TxRq") => slot_color(Slot::Blue),
+        _ => ANSI_PLAIN,
+    }
+}
+
+/// Pad a value to `width`, then colour it.
+///
+/// The padding has to happen before the escape codes are added, otherwise
+/// `format!` would count the escape bytes as visible width.
+fn colored_cell(value: &str, width: usize, align_right: bool, color: &str) -> String {
+    let padded = if align_right {
+        format!("{value:>width$}")
+    } else {
+        format!("{value:<width$}")
+    };
+    paint(padded, color)
+}
+
 fn view_row(
     summary: &MessageSummary,
     view: View,
@@ -6404,34 +6579,57 @@ fn view_row(
             if summary.event.is_some() {
                 return event_row(summary, View::Can, axis);
             }
+            let id = summary
+                .frame_id
+                .map_or_else(|| "-".to_string(), |id| format!("0x{id:X}"));
+            let direction = summary.direction.unwrap_or("-");
+            let dlc = summary
+                .dlc
+                .map_or_else(|| "-".to_string(), |value| value.to_string());
             format!(
-                "{time:>12} {channel:>3} {:<6} {:<3} {:>3} {:<9}  {}",
-                summary
-                    .frame_id
-                    .map_or_else(|| "-".to_string(), |id| format!("0x{id:X}")),
-                summary.direction.unwrap_or("-"),
-                summary
-                    .dlc
-                    .map_or_else(|| "-".to_string(), |value| value.to_string()),
-                can_flag_label(summary.can_flags),
-                hex_bytes(&summary.payload)
+                "{} {} {} {} {} {}  {}",
+                colored_cell(&time, 12, true, color_time()),
+                colored_cell(&channel, 3, true, color_bus()),
+                colored_cell(&id, 6, false, color_id()),
+                colored_cell(direction, 3, false, color_direction(summary.direction)),
+                colored_cell(&dlc, 3, true, COLOR_ATTRIBUTE),
+                colored_cell(
+                    &can_flag_label(summary.can_flags),
+                    9,
+                    false,
+                    slot_color(Slot::Yellow)
+                ),
+                paint(hex_bytes(&summary.payload), COLOR_DATA)
             )
         }
         View::Lin => {
             if summary.event.is_some() {
                 return event_row(summary, View::Lin, axis);
             }
+            let id = summary
+                .frame_id
+                .map_or_else(|| "-".to_string(), |id| format!("0x{id:X}"));
+            let direction = summary.direction.unwrap_or("-");
+            let dlc = summary
+                .dlc
+                .map_or_else(|| "-".to_string(), |value| value.to_string());
+            let crc = lin_crc_label(summary.status);
+            let crc_color = if summary.status == "response" {
+                slot_color(Slot::Green)
+            } else if summary.status == "header_only" || summary.status == "no_response" {
+                slot_color(Slot::Yellow)
+            } else {
+                slot_color(Slot::Red)
+            };
             format!(
-                "{time:>12} {channel:>3} {:<6} {:<3} {:>3} {:<8}  {}",
-                summary
-                    .frame_id
-                    .map_or_else(|| "-".to_string(), |id| format!("0x{id:X}")),
-                summary.direction.unwrap_or("-"),
-                summary
-                    .dlc
-                    .map_or_else(|| "-".to_string(), |value| value.to_string()),
-                lin_crc_label(summary.status),
-                hex_bytes(&summary.payload)
+                "{} {} {} {} {} {}  {}",
+                colored_cell(&time, 12, true, color_time()),
+                colored_cell(&channel, 3, true, color_bus()),
+                colored_cell(&id, 6, false, color_id()),
+                colored_cell(direction, 3, false, color_direction(summary.direction)),
+                colored_cell(&dlc, 3, true, COLOR_ATTRIBUTE),
+                colored_cell(crc, 8, false, crc_color),
+                paint(hex_bytes(&summary.payload), COLOR_DATA)
             )
         }
         View::Ethernet => {
@@ -6603,29 +6801,52 @@ fn summary_line(summary: &MessageSummary, axis: TimeAxis, pool: &TextPool) -> St
         (None, Some(event)) => format!("{}: {}", event.kind, event.summary),
         (None, None) => hex_bytes(&summary.payload),
     };
-    let text = format!("{time:>12} {bus:<3} {channel:>3} {id:>6} {direction:<3} {payload}");
-    if display_width(&text) > 120 {
-        return truncate(&text, 120);
+    // Each column keeps its own colour so the list stays scannable; the width
+    // check runs on the visible text, before the escape codes are added.
+    let plain = format!("{time:>12} {bus:<3} {channel:>3} {id:>6} {direction:<3} {payload}");
+    if display_width(&plain) > 120 {
+        return truncate(&plain, 120);
     }
-    text
+    format!(
+        "{} {} {} {} {} {}",
+        colored_cell(&time, 12, true, color_time()),
+        colored_cell(bus, 3, false, color_bus()),
+        colored_cell(&channel, 3, true, color_bus_channel(bus)),
+        colored_cell(&id, 6, true, color_id()),
+        colored_cell(direction, 3, false, color_direction(summary.direction)),
+        paint(&payload, COLOR_DATA)
+    )
+}
+
+/// The channel number follows the bus colour, so a column of mixed buses reads
+/// as blocks instead of a wall of digits.
+fn color_bus_channel(bus: &str) -> &'static str {
+    match bus {
+        "can" => slot_color(Slot::Green),
+        "lin" => slot_color(Slot::Magenta),
+        "eth" => slot_color(Slot::Blue),
+        "most" => slot_color(Slot::Magenta),
+        "flexray" => slot_color(Slot::Yellow),
+        _ => COLOR_ATTRIBUTE,
+    }
 }
 
 fn message_color(summary: &MessageSummary, text: String) -> String {
     if summary.status == "ok" {
         return match summary.bus {
-            Some(BusKind::Can) => paint(text, ANSI_BRIGHT_GREEN),
-            Some(BusKind::Lin) => paint(text, ANSI_MAGENTA),
+            Some(BusKind::Can) => paint(text, slot_color(Slot::Green)),
+            Some(BusKind::Lin) => paint(text, slot_color(Slot::Magenta)),
             None => match summary.bus_label {
-                "eth" => paint(text, ANSI_BRIGHT_BLUE),
+                "eth" => paint(text, slot_color(Slot::Blue)),
                 // The remaining buses each get their own hue so a mixed trace
                 // stays scannable without reading every label.
-                "most" => paint(text, ANSI_BRIGHT_MAGENTA),
-                "flexray" => paint(text, ANSI_BRIGHT_YELLOW),
-                "afdx" => paint(text, ANSI_CYAN),
-                "a429" => paint(text, ANSI_BRIGHT_CYAN),
-                "wlan" => paint(text, ANSI_GREEN),
-                "kline" | "j1708" => paint(text, ANSI_YELLOW),
-                _ => paint(text, ANSI_WHITE),
+                "most" => paint(text, slot_color(Slot::Magenta)),
+                "flexray" => paint(text, slot_color(Slot::Yellow)),
+                "afdx" => paint(text, slot_color(Slot::Cyan)),
+                "a429" => paint(text, slot_color(Slot::Cyan)),
+                "wlan" => paint(text, slot_color(Slot::Green)),
+                "kline" | "j1708" => paint(text, slot_color(Slot::Yellow)),
+                _ => paint(text, ANSI_PLAIN),
             },
         };
     }
@@ -6637,11 +6858,11 @@ fn message_color(summary: &MessageSummary, text: String) -> String {
                 Some("LOST" | "OVERRUN")
             ) =>
         {
-            paint(text, ANSI_BRIGHT_RED)
+            paint(text, slot_color(Slot::Red))
         }
-        "event" => paint(text, ANSI_CYAN),
-        "header_only" | "no_response" | "unsupported" => paint(text, ANSI_BRIGHT_YELLOW),
-        _ => paint(text, ANSI_RED),
+        "event" => paint(text, slot_color(Slot::Cyan)),
+        "header_only" | "no_response" | "unsupported" => paint(text, slot_color(Slot::Yellow)),
+        _ => paint(text, slot_color(Slot::Red)),
     }
 }
 
@@ -6751,50 +6972,202 @@ fn timing_stats(timestamps: &[u64]) -> Option<TimingStats> {
 /// Each series is normalised by its own value range so unrelated scales can be
 /// compared; the legend carries the real ranges. A series keeps one symbol, and
 /// the later series wins a cell two of them share.
-fn plot_series(curve: &CurveData, window: (u64, u64), width: usize, height: usize) -> Vec<String> {
-    let plot_width = width.max(1);
-    let plot_height = height.max(1);
-    let span = window.1.saturating_sub(window.0).max(1) as f64;
-    let mut grid = vec![vec![None::<usize>; plot_width]; plot_height];
-    for (index, series) in curve.series.iter().enumerate() {
-        let mut min = f64::INFINITY;
-        let mut max = f64::NEG_INFINITY;
-        for (_, value) in &series.samples {
-            min = min.min(*value);
-            max = max.max(*value);
+/// Value-axis label width: enough for `-1234.5` plus a tick mark.
+const PLOT_AXIS_WIDTH: usize = 9;
+
+/// Round a span up to a "nice" step of 1, 2 or 5 times a power of ten.
+fn nice_step(raw: f64) -> f64 {
+    if !raw.is_finite() || raw <= 0.0 {
+        return 1.0;
+    }
+    let exponent = raw.log10().floor();
+    let scale = 10_f64.powf(exponent);
+    let fraction = raw / scale;
+    let nice = if fraction <= 1.0 {
+        1.0
+    } else if fraction <= 2.0 {
+        2.0
+    } else if fraction <= 5.0 {
+        5.0
+    } else {
+        10.0
+    };
+    nice * scale
+}
+
+/// Tick values that cover `[min, max]` with roughly `target` intervals.
+fn axis_ticks(min: f64, max: f64, target: usize) -> Vec<f64> {
+    let span = (max - min).max(f64::EPSILON);
+    let step = nice_step(span / target.max(1) as f64);
+    let first = (min / step).floor() * step;
+    let mut ticks = Vec::new();
+    let mut value = first;
+    // A generous bound keeps a pathological range from looping forever.
+    while value <= max + step && ticks.len() < 64 {
+        if value >= min - step {
+            ticks.push(value);
         }
-        if !min.is_finite() || !max.is_finite() {
-            continue;
-        }
-        let range = (max - min).max(f64::EPSILON);
-        for (timestamp, value) in &series.samples {
-            if *timestamp < window.0 || *timestamp >= window.1 {
-                continue;
+        value += step;
+    }
+    if ticks.is_empty() {
+        ticks.push(min);
+    }
+    ticks
+}
+
+/// Format a tick value without trailing zeros in the fractional part.
+///
+/// Only the decimals may be trimmed: `3600` must stay `3600`, not become `36`.
+fn tick_label(value: f64) -> String {
+    if value == 0.0 {
+        return "0".to_string();
+    }
+    let magnitude = value.abs();
+    if !(1e-3..1e7).contains(&magnitude) {
+        return format!("{value:.1e}");
+    }
+    let decimals = if magnitude >= 1000.0 {
+        0
+    } else if magnitude >= 10.0 {
+        1
+    } else if magnitude >= 1.0 {
+        2
+    } else {
+        3
+    };
+    if decimals == 0 {
+        return format!("{value:.0}");
+    }
+    let text = format!("{value:.decimals$}");
+    match text.split_once('.') {
+        Some((whole, fraction)) => {
+            let fraction = fraction.trim_end_matches('0');
+            if fraction.is_empty() {
+                whole.to_string()
+            } else {
+                format!("{whole}.{fraction}")
             }
-            let column =
-                (((timestamp - window.0) as f64 / span) * (plot_width - 1) as f64).round() as usize;
-            let row = (((max - value) / range) * (plot_height - 1) as f64).round() as usize;
-            if let Some(cell) = grid
-                .get_mut(row.min(plot_height - 1))
-                .and_then(|row| row.get_mut(column.min(plot_width - 1)))
-            {
-                *cell = Some(index);
+        }
+        None => text,
+    }
+}
+
+/// Draw the selected series with a value axis, a time axis and connected points.
+///
+/// Every series shares one value axis, so two signals keep their real
+/// proportions instead of each being normalised into the same band.
+fn plot_series(curve: &CurveData, window: (u64, u64), width: usize, height: usize) -> Vec<String> {
+    // Two rows go to the time labels, one to the axis line.
+    let plot_height = height.saturating_sub(2).max(1);
+    let axis_width = PLOT_AXIS_WIDTH.min(width / 2);
+    let plot_width = width.saturating_sub(axis_width + 2).max(1);
+    let span = window.1.saturating_sub(window.0).max(1) as f64;
+
+    // One shared value range across every series.
+    let mut value_min = f64::INFINITY;
+    let mut value_max = f64::NEG_INFINITY;
+    for series in &curve.series {
+        for (_, value) in &series.samples {
+            if value.is_finite() {
+                value_min = value_min.min(*value);
+                value_max = value_max.max(*value);
             }
         }
     }
-    let mut lines = Vec::with_capacity(plot_height);
-    for row in grid {
-        let mut line = String::new();
+    if !value_min.is_finite() || !value_max.is_finite() {
+        return vec!["No numeric samples available".to_string()];
+    }
+    // Give a flat signal some height so it does not sit on the axis.
+    if (value_max - value_min).abs() < f64::EPSILON {
+        value_min -= 0.5;
+        value_max += 0.5;
+    }
+    let value_span = value_max - value_min;
+
+    let column_of = |timestamp: u64| -> Option<usize> {
+        if timestamp < window.0 || timestamp > window.1 {
+            return None;
+        }
+        let ratio = (timestamp - window.0) as f64 / span;
+        Some(((ratio * (plot_width - 1) as f64).round() as usize).min(plot_width - 1))
+    };
+    let row_of = |value: f64| -> usize {
+        let ratio = (value_max - value) / value_span;
+        ((ratio * (plot_height - 1) as f64).round() as usize).min(plot_height - 1)
+    };
+
+    // A column takes the last sample that falls in it, so the line follows the
+    // signal instead of drawing every sample on top of itself.
+    let mut grid = vec![vec![None::<usize>; plot_width]; plot_height];
+    for (index, series) in curve.series.iter().enumerate() {
+        let mut columns: Vec<Option<f64>> = vec![None; plot_width];
+        for (timestamp, value) in &series.samples {
+            if !value.is_finite() {
+                continue;
+            }
+            if let Some(column) = column_of(*timestamp) {
+                columns[column] = Some(*value);
+            }
+        }
+        // Connect neighbouring columns so the samples read as a line.
+        let mut previous: Option<(usize, usize)> = None;
+        for (column, value) in columns.iter().enumerate() {
+            let Some(value) = value else {
+                continue;
+            };
+            let row = row_of(*value);
+            if let Some((last_column, last_row)) = previous {
+                let gap = column - last_column;
+                if gap > 1 {
+                    for step in 1..gap {
+                        let ratio = step as f64 / gap as f64;
+                        let interpolated = last_row as f64 + (row as f64 - last_row as f64) * ratio;
+                        let bridge = interpolated.round() as usize;
+                        if let Some(cell) = grid
+                            .get_mut(bridge.min(plot_height - 1))
+                            .and_then(|line| line.get_mut(last_column + step))
+                        {
+                            *cell = Some(index);
+                        }
+                    }
+                }
+            }
+            if let Some(cell) = grid.get_mut(row).and_then(|line| line.get_mut(column)) {
+                *cell = Some(index);
+            }
+            previous = Some((column, row));
+        }
+    }
+
+    let ticks = axis_ticks(value_min, value_max, plot_height.saturating_sub(1).max(2));
+    // Which grid row each tick sits on, so the axis can label it.
+    let mut tick_rows: Vec<(usize, String)> = ticks
+        .iter()
+        .map(|tick| (row_of(*tick), tick_label(*tick)))
+        .filter(|(row, _)| *row < plot_height)
+        .collect();
+    tick_rows.sort_by_key(|(row, _)| *row);
+    tick_rows.dedup_by_key(|(row, _)| *row);
+
+    let mut lines = Vec::with_capacity(plot_height + 2);
+    for (row, grid_row) in grid.iter().enumerate() {
+        let label = tick_rows
+            .iter()
+            .find(|(tick_row, _)| *tick_row == row)
+            .map(|(_, text)| text.clone())
+            .unwrap_or_default();
+        let mut line = format!("{label:>axis_width$} ┤");
         let mut current: Option<usize> = None;
-        for cell in row {
+        for cell in grid_row {
             match cell {
                 Some(index) => {
-                    if current != Some(index) {
+                    if current != Some(*index) {
                         line.push_str(ANSI_RESET);
-                        line.push_str(curve.series[index].color);
-                        current = Some(index);
+                        line.push_str(curve.series[*index].color);
+                        current = Some(*index);
                     }
-                    line.push(curve.series[index].symbol);
+                    // A body character keeps the line continuous.
+                    line.push('━');
                 }
                 None => {
                     if current.is_some() {
@@ -6810,7 +7183,45 @@ fn plot_series(curve: &CurveData, window: (u64, u64), width: usize, height: usiz
         }
         lines.push(line);
     }
+
+    // Time axis: an axis rule plus labels at the two ends.
+    let axis_line = paint(
+        format!("{:>axis_width$} ┴{}", "", "─".repeat(plot_width)),
+        slot_color(Slot::Cyan),
+    );
+    lines.push(axis_line);
+    // Two labels only: a narrow plot cannot fit more without them colliding.
+    let first = curve_time_label(window.0, window);
+    let last = curve_time_label(window.1, window);
+    let mut labels = vec![' '; plot_width];
+    for (offset, character) in first.chars().enumerate() {
+        if let Some(slot) = labels.get_mut(offset) {
+            *slot = character;
+        }
+    }
+    let start = plot_width.saturating_sub(last.chars().count());
+    for (offset, character) in last.chars().enumerate() {
+        if let Some(slot) = labels.get_mut(start + offset) {
+            *slot = character;
+        }
+    }
+    lines.push(format!(
+        "{} {}",
+        " ".repeat(axis_width),
+        paint(
+            labels.into_iter().collect::<String>(),
+            slot_color(Slot::Blue)
+        )
+    ));
     lines
+}
+
+/// Time label for the axis: the timestamp in seconds.
+///
+/// Both ends of the window use the same scale, so the labels stay comparable
+/// however far into the capture the window sits.
+fn curve_time_label(timestamp: u64, _window: (u64, u64)) -> String {
+    format!("{:.3}s", (timestamp as f64) / 1e9)
 }
 
 fn format_timestamp(timestamp: Option<u64>) -> String {
@@ -7504,6 +7915,7 @@ fn field_u8(object: &blf_core::LinObject, name: &str) -> Option<u8> {
 struct Args {
     trace: Option<PathBuf>,
     specs: Vec<BindingSpec>,
+    theme: Theme,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, String> {
@@ -7514,8 +7926,16 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         Some(trace) => (Some(PathBuf::from(trace)), 1),
     };
     let mut specs = Vec::new();
+    let mut theme = Theme::Auto;
     while index < args.len() {
         let option = args[index].as_str();
+        if option == "--theme" {
+            let value = args.get(index + 1).ok_or_else(usage)?;
+            theme = Theme::from_name(value)
+                .ok_or_else(|| format!("invalid theme: {value} (auto, light or dark)"))?;
+            index += 2;
+            continue;
+        }
         let bus = match option {
             "--dbc" => BusKind::Can,
             "--ldf" => BusKind::Lin,
@@ -7532,11 +7952,16 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     if trace.is_none() && specs.is_empty() {
         return Err(usage());
     }
-    Ok(Args { trace, specs })
+    Ok(Args {
+        trace,
+        specs,
+        theme,
+    })
 }
 
 fn usage() -> String {
     "usage: vector-log-tui TRACE.blf [--dbc CHANNEL=FILE] [--ldf CHANNEL=FILE]\n       \
+     [--theme auto|light|dark]\n       \
      vector-log-tui --dbc CHANNEL=FILE [--ldf CHANNEL=FILE] …\n       \
      (without a trace, at least one --dbc/--ldf opens the database browser alone)"
         .to_string()
@@ -7940,6 +8365,30 @@ fn three_column(
 }
 
 /// Copy ANSI escapes verbatim while counting only visible cells.
+/// Drop the escape sequences, leaving the visible text.
+///
+/// Used where a row is re-coloured as a whole: the per-column colours would
+/// reset an outer attribute mid-row.
+fn strip_ansi(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(character) = chars.next() {
+        if character != '\x1b' {
+            output.push(character);
+            continue;
+        }
+        if chars.next() != Some('[') {
+            continue;
+        }
+        for code in chars.by_ref() {
+            if ('@'..='~').contains(&code) {
+                break;
+            }
+        }
+    }
+    output
+}
+
 fn ansi_prefix(value: &str, width: usize) -> (String, bool) {
     let mut output = String::new();
     let mut used = 0;
@@ -7997,6 +8446,7 @@ fn main() {
             return;
         }
     };
+    set_theme(args.theme);
     let app = match args.trace {
         Some(path) => App::open(path, args.specs),
         None => App::open_databases(args.specs),
@@ -8354,7 +8804,7 @@ Schedule_tables {
             error: None,
             truncated: false,
             symbol: '*',
-            color: ANSI_BRIGHT_GREEN,
+            color: slot_color(Slot::Green),
         };
         let label = series_range_label(&series);
         assert!(label.contains("-10.000"), "got {label}");
@@ -8371,7 +8821,7 @@ Schedule_tables {
                     error: None,
                     truncated: false,
                     symbol: '*',
-                    color: ANSI_BRIGHT_GREEN,
+                    color: slot_color(Slot::Green),
                 },
                 CurveSeries {
                     title: "Gear".to_string(),
@@ -8379,7 +8829,7 @@ Schedule_tables {
                     error: None,
                     truncated: false,
                     symbol: 'o',
-                    color: ANSI_MAGENTA,
+                    color: slot_color(Slot::Magenta),
                 },
             ],
             window_start: 0,
@@ -8387,8 +8837,17 @@ Schedule_tables {
         };
         let lines = plot_series(&curve, (0, 10), 20, 6);
         let painted = lines.join("\n");
-        assert!(painted.contains(CURVE_SYMBOLS[0]), "first series missing");
-        assert!(painted.contains(CURVE_SYMBOLS[1]), "second series missing");
+        // The lines are drawn as `━`; the colour separates the series, so check
+        // that both colours appear rather than the legend symbols.
+        assert!(
+            painted.contains(slot_color(Slot::Green)),
+            "first series missing"
+        );
+        assert!(
+            painted.contains(slot_color(Slot::Magenta)),
+            "second series missing"
+        );
+        assert!(painted.matches('━').count() >= 4, "too few plotted cells");
     }
 
     #[test]
@@ -8874,9 +9333,9 @@ Schedule_tables {
 
         let heading = paint_cell("message", CellStyle::DetailHeading);
         assert!(heading.starts_with(ANSI_BOLD));
-        assert!(heading.contains(ANSI_BRIGHT_CYAN));
+        assert!(heading.contains(slot_color(Slot::Cyan)));
         let item = paint_cell("  name: VehicleStatus", CellStyle::DetailItem);
-        assert!(item.contains(ANSI_WHITE));
+        assert!(item.contains(ANSI_PLAIN));
         assert!(!item.contains(ANSI_BOLD));
     }
 
@@ -9437,9 +9896,9 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
 
     #[test]
     fn truncates_ansi_by_visible_width_and_keeps_reset() {
-        let value = paint("abcdef", ANSI_BRIGHT_GREEN);
+        let value = paint("abcdef", slot_color(Slot::Green));
         let truncated = truncate_ansi(&value, 5);
-        assert!(truncated.starts_with(ANSI_BRIGHT_GREEN));
+        assert!(truncated.starts_with(slot_color(Slot::Green)));
         assert!(truncated.ends_with(ANSI_RESET));
         assert!(truncated.contains("ab..."));
         assert!(!truncated.contains("cdef"));
@@ -9524,7 +9983,7 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
     fn ansi_columns_stay_aligned_after_painting() {
         let line = paint(
             two_column("信号 0x344", "preview", 20, 40),
-            ANSI_BRIGHT_GREEN,
+            slot_color(Slot::Green),
         );
         let visible = strip_ansi(&line);
         let (left, _) = visible.split_once(" │ ").unwrap();
@@ -10580,13 +11039,13 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
                 error: None,
                 truncated: false,
                 symbol: '*',
-                color: ANSI_BRIGHT_GREEN,
+                color: slot_color(Slot::Green),
             }],
             window_start: 0,
             window_end: 200,
         };
         let lines = plot_series(&curve, (0, 200), 30, 8);
-        let painted = lines.iter().filter(|line| line.contains('*')).count();
+        let painted = lines.iter().filter(|line| line.contains('━')).count();
         assert!(painted > 2, "expected a painted span, got {painted} rows");
     }
 
@@ -10600,7 +11059,7 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
                 error: None,
                 truncated: false,
                 symbol: '*',
-                color: ANSI_BRIGHT_GREEN,
+                color: slot_color(Slot::Green),
             }],
             window_start: 0,
             window_end: 0,
@@ -11523,5 +11982,375 @@ mod bus_family_tests {
             .map(|line| strip_ansi(line))
             .collect::<Vec<_>>();
         assert!(plain.iter().any(|line| line.contains("Preview")));
+    }
+}
+
+#[cfg(test)]
+mod layout_alignment {
+    use super::*;
+
+    fn strip_ansi(value: &str) -> String {
+        let mut out = String::with_capacity(value.len());
+        let mut chars = value.chars();
+        while let Some(character) = chars.next() {
+            if character != '\x1b' {
+                out.push(character);
+                continue;
+            }
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    fn bar_columns(line: &str) -> Vec<usize> {
+        strip_ansi(line)
+            .chars()
+            .enumerate()
+            .filter(|(_, c)| matches!(c, '│' | '┼'))
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    #[test]
+    fn two_column_separator_lines_up_with_the_divider() {
+        for width in [60usize, 80, 100, 120, 160] {
+            for split in [20usize, 24, 34, 44, 55, 66] {
+                if split >= width.saturating_sub(3) {
+                    continue;
+                }
+                let row = two_column("left", "right", split, width);
+                let separator = format!(
+                    "{}─┼{}",
+                    "─".repeat(split),
+                    "─".repeat(width.saturating_sub(split + 1))
+                );
+                assert_eq!(
+                    bar_columns(&row),
+                    bar_columns(&separator),
+                    "width {width} split {split}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn three_column_separator_lines_up_with_the_dividers() {
+        for width in [80usize, 100, 120, 160] {
+            for (left, middle) in [(20usize, 30usize), (26, 31), (30, 40)] {
+                let row = styled_three_column(
+                    ("a", CellStyle::Normal),
+                    ("b", CellStyle::Normal),
+                    ("c", CellStyle::Normal),
+                    left,
+                    middle,
+                    width,
+                );
+                let separator = three_column_separator(left, middle, width, width);
+                assert_eq!(
+                    bar_columns(&row),
+                    bar_columns(&separator),
+                    "width {width} left {left} middle {middle}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod plot_axis_tests {
+    use super::*;
+
+    #[test]
+    fn tick_labels_keep_integer_trailing_zeros() {
+        assert_eq!(tick_label(3600.0), "3600");
+        assert_eq!(tick_label(3000.0), "3000");
+        assert_eq!(tick_label(100.0), "100");
+        assert_eq!(tick_label(10.0), "10");
+        // Fractional ticks drop their trailing zeros only.
+        assert_eq!(tick_label(1.5), "1.5");
+        assert_eq!(tick_label(1.25), "1.25");
+        assert_eq!(tick_label(0.5), "0.5");
+        assert_eq!(tick_label(0.0), "0");
+        assert_eq!(tick_label(-1200.0), "-1200");
+        // Very large and very small values switch to exponent form.
+        assert_eq!(tick_label(1.0e9), "1.0e9");
+        assert_eq!(tick_label(1.0e-5), "1.0e-5");
+    }
+
+    #[test]
+    fn axis_ticks_cover_the_range_with_nice_steps() {
+        let ticks = axis_ticks(0.0, 3500.0, 5);
+        assert!(ticks.first().is_some_and(|first| *first <= 0.0));
+        assert!(ticks.last().is_some_and(|last| *last >= 3500.0));
+        assert!(ticks.len() >= 2, "{ticks:?}");
+        // The step is uniform.
+        let step = ticks[1] - ticks[0];
+        for pair in ticks.windows(2) {
+            assert!((pair[1] - pair[0] - step).abs() < 1e-6, "{ticks:?}");
+        }
+        // A degenerate range still yields at least one tick.
+        assert!(!axis_ticks(5.0, 5.0, 4).is_empty());
+        assert!(!axis_ticks(-1.0, 1.0, 4).is_empty());
+    }
+
+    #[test]
+    fn nice_step_uses_one_two_or_five() {
+        for (raw, expected) in [
+            (1.0, 1.0),
+            (1.5, 2.0),
+            (3.0, 5.0),
+            (7.0, 10.0),
+            (700.0, 1000.0),
+            (0.3, 0.5),
+        ] {
+            assert_eq!(nice_step(raw), expected, "raw {raw}");
+        }
+        // A zero or negative span must not loop forever.
+        assert_eq!(nice_step(0.0), 1.0);
+        assert_eq!(nice_step(-1.0), 1.0);
+    }
+
+    #[test]
+    fn the_plot_draws_axes_and_a_connected_line() {
+        let series = CurveSeries {
+            title: "EngineSpeed".to_string(),
+            samples: vec![
+                (0, 0.0),
+                (100_000_000, 1000.0),
+                (200_000_000, 2000.0),
+                (300_000_000, 3000.0),
+            ],
+            error: None,
+            truncated: false,
+            symbol: '*',
+            color: slot_color(Slot::Green),
+        };
+        let curve = CurveData {
+            series: vec![series],
+            window_start: 0,
+            window_end: 400_000_000,
+        };
+        let lines = plot_series(&curve, (0, 400_000_000), 80, 20);
+        assert!(lines.len() >= 4, "{lines:?}");
+        let plain: Vec<String> = lines.iter().map(|line| strip_ansi(line)).collect();
+        // A value axis with tick marks, an axis corner and a time label.
+        assert!(plain.iter().any(|line| line.contains('┤')), "{plain:?}");
+        assert!(plain.iter().any(|line| line.contains('┴')), "{plain:?}");
+        assert!(plain.iter().any(|line| line.contains('━')), "{plain:?}");
+        let last = plain.last().unwrap();
+        assert!(last.contains('s'), "time label: {last:?}");
+        // The line spans several rows, so the samples are not a flat row.
+        let rows_with_line = plain.iter().filter(|line| line.contains('━')).count();
+        assert!(
+            rows_with_line >= 3,
+            "connected line spans {rows_with_line} rows"
+        );
+    }
+}
+
+#[cfg(test)]
+mod plot_fit_tests {
+    use super::*;
+
+    fn sample_curve() -> CurveData {
+        CurveData {
+            series: vec![CurveSeries {
+                title: "Speed".to_string(),
+                samples: (0..20).map(|i| (i * 1_000_000, i as f64 * 100.0)).collect(),
+                error: None,
+                truncated: false,
+                symbol: '*',
+                color: slot_color(Slot::Green),
+            }],
+            window_start: 0,
+            window_end: 19_000_000,
+        }
+    }
+
+    #[test]
+    fn the_plot_returns_exactly_the_rows_it_is_given() {
+        // The caller reserves `rows` lines, so the plot must not overflow.
+        for rows in [6usize, 10, 20, 30] {
+            let curve = sample_curve();
+            let lines = plot_series(&curve, (0, 19_000_000), 80, rows);
+            assert_eq!(lines.len(), rows, "rows {rows}");
+        }
+    }
+
+    #[test]
+    fn the_plot_keeps_the_time_axis_even_when_short() {
+        let curve = sample_curve();
+        let lines = plot_series(&curve, (0, 19_000_000), 80, 8);
+        let plain: Vec<String> = lines.iter().map(|line| strip_ansi(line)).collect();
+        assert!(plain.iter().any(|line| line.contains('┴')), "{plain:?}");
+        let last = plain.last().unwrap();
+        assert!(last.contains('s'), "time label missing: {last:?}");
+    }
+}
+
+#[cfg(test)]
+mod plot_label_tests {
+    use super::*;
+
+    fn one_series() -> CurveData {
+        CurveData {
+            series: vec![CurveSeries {
+                title: "Speed".to_string(),
+                samples: (0..10).map(|i| (i * 2_000_000_000, i as f64)).collect(),
+                error: None,
+                truncated: false,
+                symbol: '*',
+                color: slot_color(Slot::Green),
+            }],
+            window_start: 0,
+            window_end: 19_200_820_000,
+        }
+    }
+
+    #[test]
+    fn both_ends_of_the_time_axis_are_labelled() {
+        let curve = one_series();
+        let lines = plot_series(&curve, (0, 19_200_820_000), 110, 20);
+        let plain: Vec<String> = lines.iter().map(|line| strip_ansi(line)).collect();
+        let axis_label = plain.last().expect("label row");
+        assert!(axis_label.contains("0.000s"), "start label: {axis_label:?}");
+        assert!(axis_label.contains("19.2"), "end label: {axis_label:?}");
+        // Labels must not run into each other.
+        let first_end = axis_label.find("0.000s").unwrap() + "0.000s".len();
+        let last_start = axis_label.rfind("19.2").unwrap();
+        assert!(last_start >= first_end, "labels overlap: {axis_label:?}");
+    }
+
+    #[test]
+    fn the_axis_label_row_is_not_wider_than_the_plot() {
+        for width in [40usize, 60, 80, 110, 160] {
+            let curve = one_series();
+            let lines = plot_series(&curve, (0, 19_200_820_000), width, 20);
+            let plain: Vec<String> = lines.iter().map(|line| strip_ansi(line)).collect();
+            for line in &plain {
+                assert!(
+                    display_width(line) <= width.max(20),
+                    "line wider than the plot: {} > {} ({line:?})",
+                    display_width(line),
+                    width
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod theme_tests {
+    use super::*;
+
+    /// The palette has to follow the background, and the light set must never
+    /// use a bright variant: those disappear on a white terminal.
+    #[test]
+    fn the_light_palette_avoids_bright_foregrounds() {
+        set_theme(Theme::Light);
+        for slot in [
+            Slot::Red,
+            Slot::Green,
+            Slot::Yellow,
+            Slot::Blue,
+            Slot::Magenta,
+            Slot::Cyan,
+        ] {
+            let code = slot_color(slot);
+            let number: u8 = code
+                .trim_start_matches("\x1b[")
+                .trim_end_matches('m')
+                .parse()
+                .unwrap();
+            assert!(
+                (30..=37).contains(&number),
+                "light theme used a bright colour: {code:?}"
+            );
+            assert_ne!(number, 30, "pure black on a dark terminal is invisible");
+        }
+        assert!(light_background());
+    }
+
+    #[test]
+    fn the_dark_palette_uses_bright_foregrounds() {
+        set_theme(Theme::Dark);
+        for slot in [Slot::Red, Slot::Green, Slot::Yellow, Slot::Cyan] {
+            let code = slot_color(slot);
+            let number: u8 = code
+                .trim_start_matches("\x1b[")
+                .trim_end_matches('m')
+                .parse()
+                .unwrap();
+            assert!(
+                (90..=97).contains(&number),
+                "dark theme should be vivid: {code:?}"
+            );
+        }
+        assert!(!light_background());
+    }
+
+    #[test]
+    fn plain_text_carries_no_colour_so_it_follows_the_terminal() {
+        set_theme(Theme::Light);
+        assert_eq!(paint("plain", ANSI_PLAIN), "plain");
+        assert_eq!(paint("plain", ""), "plain");
+        assert!(paint("coloured", slot_color(Slot::Cyan)).contains("\x1b["));
+    }
+
+    #[test]
+    fn theme_names_parse_and_rejects_are_reported() {
+        assert_eq!(Theme::from_name("auto"), Some(Theme::Auto));
+        assert_eq!(Theme::from_name("light"), Some(Theme::Light));
+        assert_eq!(Theme::from_name("dark"), Some(Theme::Dark));
+        assert_eq!(Theme::from_name("solarized"), None);
+    }
+
+    #[test]
+    fn auto_falls_back_to_light_when_the_variable_is_missing() {
+        // `COLORFGBG` is set by the terminal; without it the safe answer is
+        // light, because bright colours on white are the ones that vanish.
+        let previous = std::env::var_os("COLORFGBG");
+        std::env::remove_var("COLORFGBG");
+        assert!(detect_light_background());
+        std::env::set_var("COLORFGBG", "15;0");
+        assert!(!detect_light_background());
+        std::env::set_var("COLORFGBG", "0;15");
+        assert!(detect_light_background());
+        std::env::set_var("COLORFGBG", "0;default;7");
+        assert!(detect_light_background());
+        match previous {
+            Some(value) => std::env::set_var("COLORFGBG", value),
+            None => std::env::remove_var("COLORFGBG"),
+        }
+    }
+
+    #[test]
+    fn the_theme_option_is_parsed_from_the_command_line() {
+        let args: Vec<String> = ["trace.blf", "--theme", "dark"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(parse_args(&args).unwrap().theme, Theme::Dark);
+
+        let args: Vec<String> = ["trace.blf", "--dbc", "1=vehicle.dbc", "--theme", "light"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let parsed = parse_args(&args).unwrap();
+        assert_eq!(parsed.theme, Theme::Light);
+        assert_eq!(parsed.specs.len(), 1);
+
+        // A missing or unknown value is rejected with the accepted names.
+        let args: Vec<String> = ["trace.blf", "--theme", "neon"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let error = parse_args(&args).unwrap_err();
+        assert!(error.contains("invalid theme"), "{error}");
+        assert!(error.contains("light"), "{error}");
     }
 }

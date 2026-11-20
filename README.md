@@ -65,6 +65,17 @@ diagnostic objects, including:
   (line A/B link state, BAG, packet counters), A429 (parity, bitrate, word
   errors), WLAN, K-Line and J1708. A mixed trace therefore never shows a blank
   line, and each bus family has its own colour.
+- The palette is readable on both a dark and a light terminal. Plain text keeps
+  the terminal's own foreground, so it is black on white and white on black
+  without the viewer knowing; accents use the mid-luminance ANSI colours, which
+  keep contrast on either background. `--theme dark` switches to the bright
+  variants for a dark terminal, `--theme auto` (the default) reads `COLORFGBG`
+  and falls back to the light set because a bright colour on white is the case
+  that actually hides text.
+- Each column carries its own colour: timestamp blue, bus label cyan, identifier
+  yellow, direction green for `Rx` / magenta for `Tx`, payload in the terminal
+  foreground. A selected row is reverse video over plain text, so the per-column
+  colours cannot reset the highlight mid-row.
 - A narrow terminal drops the preview pane instead of squeezing both halves:
   below 100 columns the list takes the whole width, so the frame columns stay
   readable on an 80-column window.
@@ -104,6 +115,11 @@ diagnostic objects, including:
   per-flow interned search text, and the detail pane dissects the selected
   frame again. A 200 000-frame Ethernet capture loads in about 0.7 s and holds
   roughly 400 MB, most of which is the BLF objects themselves.
+- The signal curve has a value axis with round tick labels and a time axis
+  labelled at both ends, and the samples are joined into a continuous line
+  (`━`) instead of scattered dots. Every series shares one value axis, so two
+  signals keep their real proportions; the window, the value range and the
+  sample count of each series are listed in the legend above the plot.
 - CAN, CAN FD and LIN diagnostic payloads are reassembled before decoding:
   ISO-TP (ISO 15765-2) framing on CAN, and the LIN transport protocol of
   ISO 17987-2 on the LIN diagnostic frames `0x3c`/`0x3d`, keyed by bus,
