@@ -278,8 +278,8 @@ impl DetailPane {
     }
 }
 
-/// Rows below the body: the status line with the key hints.
-const STATUS_ROWS: usize = 1;
+/// Rows below the body: the rule and the status line with the key hints.
+const STATUS_ROWS: usize = 2;
 
 /// Below this width a two-pane layout leaves neither half readable.
 const PREVIEW_MIN_WIDTH: usize = 100;
@@ -2723,6 +2723,24 @@ impl App {
     fn render(&mut self, terminal: &mut RawTerminal) -> Result<(), String> {
         let width = self.viewport_width;
         let height = self.viewport_height;
+        let lines = self.render_lines(height);
+        let mut output = String::new();
+        for line in lines {
+            output.push_str(&truncate_ansi(&line, width));
+            output.push_str("\x1b[K");
+            output.push('\n');
+        }
+        output.push_str("\x1b[J");
+        terminal.write(&output).map_err(|error| error.to_string())
+    }
+
+    /// Build the rows of one frame.
+    ///
+    /// The count is exactly `height`: the loop that draws them stops at the
+    /// terminal height, so a view that asks for one row too many pushes the
+    /// status line off the bottom.
+    fn render_lines(&mut self, height: usize) -> Vec<String> {
+        let width = self.viewport_width;
         let mut lines = Vec::new();
         lines.push(paint_bold(self.title_line(), slot_color(Slot::Cyan)));
         let databases = if self.bindings.is_empty() {
@@ -2761,19 +2779,21 @@ impl App {
                 Mode::Inspector => self.render_inspector(&mut lines, width, height),
             }
         }
+        // The rule and the status line own the last two rows. A view that draws
+        // fewer rows than it was given (an empty curve, a blank pane) would
+        // otherwise leave them off the bottom, so the body is padded to fit and
+        // trimmed when a view overshoots.
+        let body_rows = height.saturating_sub(STATUS_ROWS);
+        lines.truncate(body_rows);
+        while lines.len() < body_rows {
+            lines.push(String::new());
+        }
         lines.push(paint("─".repeat(width), slot_color(Slot::Cyan)));
         lines.push(paint_bold(
             footer_line(self.input, &self.input_buffer, &self.status, self.mode),
             slot_color(Slot::Yellow),
         ));
-        let mut output = String::from("\x1b[H");
-        for line in lines.into_iter().take(height) {
-            output.push_str(&truncate_ansi(&line, width));
-            output.push_str("\x1b[K");
-            output.push('\n');
-        }
-        output.push_str("\x1b[J");
-        terminal.write(&output).map_err(|error| error.to_string())
+        lines
     }
 
     fn render_help(&self, lines: &mut Vec<String>, width: usize, height: usize) {
@@ -2877,7 +2897,9 @@ impl App {
             },
             slot_color(Slot::Cyan),
         ));
-        let available = height.saturating_sub(7);
+        // Header rows (3) + this view's heading, column names and rule (3) +
+        // rule and status line (2).
+        let available = height.saturating_sub(8);
         let preview = self
             .selected_summary()
             .map(|summary| {
@@ -13476,6 +13498,80 @@ mod help_coverage_tests {
                 headings.iter().any(|heading| heading.contains(expected)),
                 "no help section for {expected}: {headings:?}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod frame_height_tests {
+    use super::*;
+
+    fn app_with_data() -> App {
+        let mut app = App::new(None, Vec::new(), Vec::new()).expect("app");
+        for index in 0..40u64 {
+            app.summaries.push(MessageSummary {
+                object_index: index as usize,
+                timestamp_ns: Some(1_000_000_000 + index * 1_000_000),
+                timestamp_source: None,
+                bus: Some(BusKind::Can),
+                bus_label: "can",
+                ethernet: None,
+                event: None,
+                can_flags: 0,
+                channel: Some(1),
+                frame_id: Some(0x100 + index as u32),
+                object_type_raw: 1,
+                class_name: "CanMessage",
+                direction: Some("Tx"),
+                dlc: Some(2),
+                payload: vec![index as u8, 0],
+                status: "ok",
+            });
+        }
+        app.filtered = (0..40).collect();
+        app.selected = 0;
+        app
+    }
+
+    /// Every view has to fill the frame exactly: one row less and the status
+    /// line is pushed off the bottom, one row more and it is scrolled away.
+    #[test]
+    fn every_view_fills_the_frame_exactly() {
+        for height in [16usize, 24, 30, 40] {
+            for mode in [
+                Mode::Messages,
+                Mode::Detail,
+                Mode::Curve,
+                Mode::Statistics,
+                Mode::Inspector,
+                Mode::Databases,
+            ] {
+                let mut app = app_with_data();
+                app.viewport_width = 110;
+                app.viewport_height = height;
+                app.mode = mode;
+                app.curve = Some(CurveData {
+                    series: Vec::new(),
+                    window_start: 0,
+                    window_end: 1_000_000,
+                    normalize: false,
+                });
+                app.selected_signal = 0;
+                let lines = app.render_lines(height);
+                assert_eq!(
+                    lines.len(),
+                    height,
+                    "{mode:?} at height {height}: drew {} rows, so the draw loop \
+                     would cut the footer",
+                    lines.len()
+                );
+                // The last row drawn must be the status line, not content.
+                let last = strip_ansi(&lines[height - 1]);
+                assert!(
+                    !last.chars().all(|c| c == '─' || c == ' '),
+                    "{mode:?} at height {height}: the status line was pushed out"
+                );
+            }
         }
     }
 }

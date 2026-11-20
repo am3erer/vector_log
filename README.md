@@ -86,6 +86,9 @@ diagnostic objects, including:
   (`axis=shared` or `axis=per-signal`).
 - The help overlay has its own filter: `/` then a word narrows the key list and
   keeps the matching section headings.
+- Every view fills the frame exactly: the rule and the status line always sit on
+  the last two rows, so a mode that draws one row too many cannot push the key
+  hints off the bottom.
 - The attributes inspector scrolls with the mouse wheel like every other view,
   and the help overlay documents each new key so `?` stays accurate.
 - A record with neither an event nor a payload shows its class name (`<…>`)
