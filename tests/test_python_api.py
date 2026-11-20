@@ -1778,3 +1778,91 @@ def test_system_variable_exposes_the_typed_value(tmp_path):
     assert objects[2].sysvar_type == "string"
     assert objects[2].value.strip('"') == "hello"
     assert objects[3].value == "-5"
+
+
+def test_every_object_exposes_the_same_common_keys(tmp_path):
+    """Typed, LIN, structured and raw objects share one accessor surface."""
+
+    def can_message(channel, can_id, data):
+        object_size = 48
+        header = struct.pack(
+            "<IHHIIIHHQ", 0x4A424F4C, 32, 1, object_size, 1, 0, 0, 0, 1_000_000
+        )
+        body = struct.pack("<HBBL", channel, 1, len(data), can_id)
+        return header + body + bytes(data).ljust(8, b"\x00")
+
+    def lin_message(channel, frame_id, data):
+        object_size = 52
+        header = struct.pack(
+            "<IHHIIIHHQ", 0x4A424F4C, 32, 1, object_size, 11, 0, 0, 0, 2_000_000
+        )
+        body = struct.pack("<HBB", channel, frame_id, len(data))
+        body += bytes(data).ljust(8, b"\x00")
+        body += struct.pack("<BBBBHBB", 0, 0, 0, 0, 0, 0, 0)
+        return header + body
+
+    def app_text(source, text):
+        object_size = 48 + len(text)
+        header = struct.pack(
+            "<IHHIIIHHQ", 0x4A424F4C, 32, 1, object_size, 65, 0, 0, 0, 3_000_000
+        )
+        return header + struct.pack("<IIII", source, 0, len(text), 0) + text
+
+    inner = can_message(1, 0x123, [1, 2, 3])
+    inner += lin_message(2, 0x11, [4, 5])
+    inner += app_text(0, b"hello\x00")
+
+    path = tmp_path / "common-keys.blf"
+    _write_objects(path, inner, 3)
+
+    with open(str(path)) as reader:
+        objects = list(reader)
+    assert [type(obj).__name__ for obj in objects] == [
+        "CanMessage",
+        "LinMessage",
+        "AppText",
+    ]
+    for obj in objects:
+        # Every object, whatever its family, answers the same four questions.
+        assert obj.class_name == type(obj).__name__
+        assert isinstance(obj.fields, dict) and obj.fields
+        assert isinstance(obj.payload, (bytes, bytearray))
+        assert obj.object_type > 0
+
+    # The payload is the response bytes, cut to the documented length.
+    assert objects[0].payload == bytes([1, 2, 3])
+    assert objects[1].payload == bytes([4, 5])
+    assert objects[2].payload == b"hello\x00"
+
+
+def test_file_statistics_are_fully_exported(tmp_path):
+    """The file header keeps every documented field."""
+    inner = bytearray()
+    header = struct.pack(
+        "<IHHIIIHHQ", 0x4A424F4C, 32, 1, 48, 1, 0, 0, 0, 1_000_000
+    )
+    inner += header + struct.pack("<HBBL", 1, 1, 1, 0x10) + b"\x00" * 8
+    path = tmp_path / "statistics.blf"
+    _write_objects(path, bytes(inner), 1)
+
+    with open(str(path)) as reader:
+        list(reader)
+        statistics = reader.file_statistics
+        for name in (
+            "signature",
+            "statistics_size",
+            "api_number",
+            "application_id",
+            "compression_level",
+            "application_major",
+            "application_minor",
+            "file_size",
+            "uncompressed_file_size",
+            "object_count",
+            "application_build",
+            "measurement_start_time",
+            "last_object_time",
+            "restore_points_offset",
+        ):
+            assert hasattr(statistics, name), name
+        assert statistics.object_count == 1

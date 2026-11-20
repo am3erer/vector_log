@@ -81,6 +81,35 @@ pub fn can_flags_direction(flags: u8) -> u8 {
     flags & 0x0f
 }
 
+/// Response bytes of a LIN record, bounded by its documented DLC.
+///
+/// A LIN record stores the response in a `data` field that may be longer than
+/// the frame announced, so the payload has to be cut to the DLC.
+pub fn lin_payload(object: &LinObject) -> Option<Vec<u8>> {
+    let data = object.fields.iter().find_map(|(name, value)| {
+        if *name != "data" {
+            return None;
+        }
+        match value {
+            FieldValue::Bytes(bytes) => Some(bytes.clone()),
+            _ => None,
+        }
+    })?;
+    let dlc = object.fields.iter().find_map(|(name, value)| {
+        if *name != "dlc" {
+            return None;
+        }
+        match value {
+            FieldValue::U8(dlc) => Some(usize::from(*dlc)),
+            _ => None,
+        }
+    });
+    Some(match dlc {
+        Some(dlc) => data[..dlc.min(data.len())].to_vec(),
+        None => data,
+    })
+}
+
 /// Field names that hold the protocol payload of a structured object, with the
 /// field that bounds them.  The order matters: the first field present wins.
 const STRUCTURED_PAYLOAD_FIELDS: &[(&str, Option<&str>)] = &[

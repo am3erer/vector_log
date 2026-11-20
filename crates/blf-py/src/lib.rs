@@ -1344,6 +1344,14 @@ fn object_to_dict(py: Python<'_>, object: &blf_core::Object) -> PyResult<PyObjec
     match object {
         blf_core::Object::CanMessage(value) => {
             dict.set_item("class", "CanMessage")?;
+            dict.set_item("className", "CanMessage")?;
+            dict.set_item(
+                "payload",
+                PyBytes::new(
+                    py,
+                    &value.data[..usize::from(value.dlc).min(value.data.len())],
+                ),
+            )?;
             dict.set_item("channel", value.channel)?;
             dict.set_item("flags", value.flags)?;
             dict.set_item("dlc", value.dlc)?;
@@ -1359,6 +1367,14 @@ fn object_to_dict(py: Python<'_>, object: &blf_core::Object) -> PyResult<PyObjec
         }
         blf_core::Object::CanMessage2(value) => {
             dict.set_item("class", "CanMessage2")?;
+            dict.set_item("className", "CanMessage2")?;
+            dict.set_item(
+                "payload",
+                PyBytes::new(
+                    py,
+                    &value.data[..usize::from(value.dlc).min(value.data.len())],
+                ),
+            )?;
             dict.set_item("channel", value.channel)?;
             dict.set_item("flags", value.flags)?;
             dict.set_item("dlc", value.dlc)?;
@@ -1380,6 +1396,14 @@ fn object_to_dict(py: Python<'_>, object: &blf_core::Object) -> PyResult<PyObjec
         }
         blf_core::Object::CanFdMessage(value) => {
             dict.set_item("class", "CanFdMessage")?;
+            dict.set_item("className", "CanFdMessage")?;
+            dict.set_item(
+                "payload",
+                PyBytes::new(
+                    py,
+                    &value.data[..usize::from(value.valid_data_bytes).min(value.data.len())],
+                ),
+            )?;
             dict.set_item("channel", value.channel)?;
             dict.set_item("flags", value.flags)?;
             dict.set_item("canFdFlags", value.can_fd_flags)?;
@@ -1404,6 +1428,14 @@ fn object_to_dict(py: Python<'_>, object: &blf_core::Object) -> PyResult<PyObjec
         }
         blf_core::Object::CanFdMessage64(value) => {
             dict.set_item("class", "CanFdMessage64")?;
+            dict.set_item("className", "CanFdMessage64")?;
+            dict.set_item(
+                "payload",
+                PyBytes::new(
+                    py,
+                    &value.data[..usize::from(value.valid_data_bytes).min(value.data.len())],
+                ),
+            )?;
             dict.set_item("channel", value.channel)?;
             dict.set_item("dlc", value.dlc)?;
             dict.set_item("validDataBytes", value.valid_data_bytes)?;
@@ -1447,6 +1479,8 @@ fn object_to_dict(py: Python<'_>, object: &blf_core::Object) -> PyResult<PyObjec
         }
         blf_core::Object::CanErrorFrame(value) => {
             dict.set_item("class", "CanErrorFrame")?;
+            dict.set_item("className", "CanErrorFrame")?;
+            dict.set_item("payload", PyBytes::new(py, &Vec::new()))?;
             dict.set_item("channel", value.channel)?;
             dict.set_item("length", value.length)?;
             let fields = PyDict::new(py);
@@ -1457,6 +1491,8 @@ fn object_to_dict(py: Python<'_>, object: &blf_core::Object) -> PyResult<PyObjec
         }
         blf_core::Object::CanErrorFrameExt(value) => {
             dict.set_item("class", "CanErrorFrameExt")?;
+            dict.set_item("className", "CanErrorFrameExt")?;
+            dict.set_item("payload", PyBytes::new(py, &value.data.clone()))?;
             dict.set_item("channel", value.channel)?;
             dict.set_item("id", value.id)?;
             dict.set_item("data", PyBytes::new(py, &value.data))?;
@@ -1483,6 +1519,8 @@ fn object_to_dict(py: Python<'_>, object: &blf_core::Object) -> PyResult<PyObjec
         }
         blf_core::Object::CanFdErrorFrame64(value) => {
             dict.set_item("class", "CanFdErrorFrame64")?;
+            dict.set_item("className", "CanFdErrorFrame64")?;
+            dict.set_item("payload", PyBytes::new(py, &value.data.clone()))?;
             dict.set_item("channel", value.channel)?;
             dict.set_item("id", value.id)?;
             dict.set_item("data", PyBytes::new(py, &value.data))?;
@@ -1531,6 +1569,8 @@ fn object_to_dict(py: Python<'_>, object: &blf_core::Object) -> PyResult<PyObjec
         }
         blf_core::Object::AppText(value) => {
             dict.set_item("class", "AppText")?;
+            dict.set_item("className", "AppText")?;
+            dict.set_item("payload", PyBytes::new(py, &value.text.clone()))?;
             dict.set_item("source", value.source)?;
             // The purpose names the record, and `text` decodes both the plain
             // and the UTF-16 payloads CANoe writes.
@@ -1549,6 +1589,8 @@ fn object_to_dict(py: Python<'_>, object: &blf_core::Object) -> PyResult<PyObjec
         }
         blf_core::Object::RestorePointContainer(value) => {
             dict.set_item("class", "RestorePointContainer")?;
+            dict.set_item("className", "RestorePointContainer")?;
+            dict.set_item("payload", PyBytes::new(py, &value.data.clone()))?;
             dict.set_item("dataLength", value.data_length)?;
             dict.set_item("data", PyBytes::new(py, &value.data))?;
             if let Some(restore_points) = &value.restore_points {
@@ -1571,8 +1613,14 @@ fn object_to_dict(py: Python<'_>, object: &blf_core::Object) -> PyResult<PyObjec
             dict.set_item("fields", fields)?;
         }
         blf_core::Object::Lin(value) => {
-            dict.set_item("class", lin_class_name(value.object_type))?;
+            let class = lin_class_name(value.object_type);
+            dict.set_item("class", class)?;
+            dict.set_item("className", class)?;
             dict.set_item("objectType", value.object_type.as_u32())?;
+            // The response bytes live in the `data` field, bounded by the
+            // header DLC, which is what a caller means by "payload".
+            let payload = blf_core::lin_payload(value).unwrap_or_default();
+            dict.set_item("payload", PyBytes::new(py, &payload))?;
             let fields = PyDict::new(py);
             for (name, field) in &value.fields {
                 let field_value = field_value_to_py(py, field)?;
