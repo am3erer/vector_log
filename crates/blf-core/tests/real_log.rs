@@ -53,7 +53,7 @@ fn field_u64(object: &Object, name: &str) -> Option<u64> {
         return None;
     };
     value.fields.iter().find_map(|(field, value)| {
-        if field != name {
+        if *field != name {
             return None;
         }
         match value {

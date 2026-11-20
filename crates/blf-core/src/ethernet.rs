@@ -1207,21 +1207,21 @@ fn uds_protocol_name(service: &'static str) -> &'static str {
     }
 }
 
-fn field_value<'a>(fields: &'a [(String, FieldValue)], name: &str) -> Option<&'a FieldValue> {
+fn field_value<'a>(fields: &'a [(&'static str, FieldValue)], name: &str) -> Option<&'a FieldValue> {
     fields
         .iter()
-        .find(|(field, _)| field == name)
+        .find(|(field, _)| *field == name)
         .map(|(_, value)| value)
 }
 
-fn field_bytes(fields: &[(String, FieldValue)], name: &str) -> Option<Vec<u8>> {
+fn field_bytes(fields: &[(&'static str, FieldValue)], name: &str) -> Option<Vec<u8>> {
     match field_value(fields, name)? {
         FieldValue::Bytes(value) => Some(value.clone()),
         _ => None,
     }
 }
 
-fn field_u64(fields: &[(String, FieldValue)], name: &str) -> Option<u64> {
+fn field_u64(fields: &[(&'static str, FieldValue)], name: &str) -> Option<u64> {
     match field_value(fields, name)? {
         FieldValue::U8(value) => Some(u64::from(*value)),
         FieldValue::U16(value) => Some(u64::from(*value)),
@@ -1731,21 +1731,18 @@ mod tests {
             }),
             class_name: "EthernetFrame".to_string(),
             fields: vec![
+                ("sourceAddress", FieldValue::Bytes(vec![2, 0, 0, 0, 0, 1])),
                 (
-                    "sourceAddress".to_string(),
-                    FieldValue::Bytes(vec![2, 0, 0, 0, 0, 1]),
-                ),
-                (
-                    "destinationAddress".to_string(),
+                    "destinationAddress",
                     FieldValue::Bytes(vec![0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]),
                 ),
-                ("channel".to_string(), FieldValue::U16(2)),
-                ("dir".to_string(), FieldValue::U16(0)),
-                ("type".to_string(), FieldValue::U16(0x0806)),
-                ("tpid".to_string(), FieldValue::U16(0x8100)),
-                ("tci".to_string(), FieldValue::U16(0x200A)),
-                ("payLoadLength".to_string(), FieldValue::U16(28)),
-                ("payLoad".to_string(), FieldValue::Bytes(payload)),
+                ("channel", FieldValue::U16(2)),
+                ("dir", FieldValue::U16(0)),
+                ("type", FieldValue::U16(0x0806)),
+                ("tpid", FieldValue::U16(0x8100)),
+                ("tci", FieldValue::U16(0x200A)),
+                ("payLoadLength", FieldValue::U16(28)),
+                ("payLoad", FieldValue::Bytes(payload)),
             ],
             extensions: Vec::new(),
             data: Vec::new(),

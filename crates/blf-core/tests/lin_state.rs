@@ -3,7 +3,7 @@ use blf_core::{
     ObjectType,
 };
 
-fn object(object_type: ObjectType, fields: Vec<(&str, FieldValue)>) -> LinObject {
+fn object(object_type: ObjectType, fields: Vec<(&'static str, FieldValue)>) -> LinObject {
     LinObject {
         object_type,
         header: ObjectHeader {
@@ -20,10 +20,7 @@ fn object(object_type: ObjectType, fields: Vec<(&str, FieldValue)>) -> LinObject
             object_version: 0,
             object_time_stamp: 0,
         },
-        fields: fields
-            .into_iter()
-            .map(|(name, value)| (name.to_string(), value))
-            .collect(),
+        fields: fields.into_iter().collect(),
         extensions: Vec::new(),
         raw_data: Vec::new(),
     }

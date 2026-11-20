@@ -210,7 +210,7 @@ pub fn classify_lin_object(object: &LinObject) -> LinObservation {
 }
 
 fn bounded_payload(object: &LinObject, header_dlc: Option<u8>) -> Option<Vec<u8>> {
-    let data = match object.fields.iter().find(|(name, _)| name == "data") {
+    let data = match object.fields.iter().find(|(name, _)| *name == "data") {
         Some((_, FieldValue::Bytes(data))) => data,
         _ => return None,
     };
@@ -219,7 +219,7 @@ fn bounded_payload(object: &LinObject, header_dlc: Option<u8>) -> Option<Vec<u8>
 }
 
 fn field_u8(object: &LinObject, name: &str) -> Option<u8> {
-    match object.fields.iter().find(|(field, _)| field == name) {
+    match object.fields.iter().find(|(field, _)| *field == name) {
         Some((_, FieldValue::U8(value))) => Some(*value),
         _ => None,
     }
@@ -230,7 +230,7 @@ fn field_u8_any(object: &LinObject, names: &[&str]) -> Option<u8> {
 }
 
 fn field_u16(object: &LinObject, name: &str) -> Option<u16> {
-    match object.fields.iter().find(|(field, _)| field == name) {
+    match object.fields.iter().find(|(field, _)| *field == name) {
         Some((_, FieldValue::U16(value))) => Some(*value),
         Some((_, FieldValue::U8(value))) => Some(u16::from(*value)),
         _ => None,

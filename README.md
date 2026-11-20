@@ -88,6 +88,10 @@ diagnostic objects, including:
 - Objects that straddle a container boundary are stitched back together: a
   container holds exactly 128 KiB, so Vector cuts the last object in half, and
   the reader joins it with the following container instead of dropping it.
+- Field names in parsed objects are `&'static str` rather than owned strings:
+  a name always comes from a schema table, so a 440 000-object Ethernet trace
+  stores one pointer per field instead of one heap allocation. On the sample
+  capture that cut peak memory from 845 MB to 662 MB.
 - Parsing a whole capture stays cheap: the load pass keeps only a summary and a
   per-flow interned search text, and the detail pane dissects the selected
   frame again. A 200 000-frame Ethernet capture loads in about 0.7 s and holds

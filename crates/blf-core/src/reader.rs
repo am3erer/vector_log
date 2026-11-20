@@ -975,7 +975,7 @@ enum FieldSpec {
 struct StructuredReader<'a> {
     data: &'a [u8],
     offset: usize,
-    fields: Vec<(String, FieldValue)>,
+    fields: Vec<(&'static str, FieldValue)>,
 }
 
 impl<'a> StructuredReader<'a> {
@@ -991,7 +991,7 @@ impl<'a> StructuredReader<'a> {
         self.fields
             .iter()
             .rev()
-            .find(|(field, _)| field == name)
+            .find(|(field, _)| *field == name)
             .and_then(|(_, value)| match value {
                 FieldValue::U8(value) => Some(usize::from(*value)),
                 FieldValue::U16(value) => Some(usize::from(*value)),
@@ -1002,9 +1002,9 @@ impl<'a> StructuredReader<'a> {
             .ok_or_else(|| BlfError::Format(format!("dynamic field length {name} is unavailable")))
     }
 
-    fn push(&mut self, name: &str, value: FieldValue, size: usize) -> Result<()> {
+    fn push(&mut self, name: &'static str, value: FieldValue, size: usize) -> Result<()> {
         let next_offset = checked_offset(self.offset, size)?;
-        self.fields.push((name.to_string(), value));
+        self.fields.push((name, value));
         self.offset = next_offset;
         Ok(())
     }
@@ -1175,7 +1175,7 @@ fn parse_schema(
     data: &[u8],
     start: usize,
     schema: &[FieldSpec],
-) -> Result<(Vec<(String, FieldValue)>, usize)> {
+) -> Result<(Vec<(&'static str, FieldValue)>, usize)> {
     let mut reader = StructuredReader::new(data, start);
     for spec in schema {
         reader.apply(*spec)?;
@@ -1207,7 +1207,10 @@ fn parse_structured_object(data: &[u8], base: ObjectHeaderBase) -> Result<Struct
 /// the C struct into the file leaves four bytes of padding in front of the
 /// timestamp. The documented layout is packed; accept both, keyed on the
 /// declared object size.
-fn parse_data_lost_end(data: &[u8], start: usize) -> Result<(Vec<(String, FieldValue)>, usize)> {
+fn parse_data_lost_end(
+    data: &[u8],
+    start: usize,
+) -> Result<(Vec<(&'static str, FieldValue)>, usize)> {
     let padded = data.len() >= start + 24;
     let mut reader = StructuredReader::new(data, start);
     reader.u32("queueIdentifier")?;
@@ -1222,7 +1225,10 @@ fn parse_data_lost_end(data: &[u8], start: usize) -> Result<(Vec<(String, FieldV
     Ok((fields, reader.offset))
 }
 
-fn parse_serial_event(data: &[u8], start: usize) -> Result<(Vec<(String, FieldValue)>, usize)> {
+fn parse_serial_event(
+    data: &[u8],
+    start: usize,
+) -> Result<(Vec<(&'static str, FieldValue)>, usize)> {
     let mut reader = StructuredReader::new(data, start);
     reader.u32("flags")?;
     reader.u32("port")?;
@@ -1259,7 +1265,7 @@ fn parse_serial_event(data: &[u8], start: usize) -> Result<(Vec<(String, FieldVa
         )?;
         reader
             .fields
-            .push(("timeStamps".to_string(), FieldValue::I64Vec(timestamps)));
+            .push(("timeStamps", FieldValue::I64Vec(timestamps)));
         let remainder = timestamps_length % 8;
         if remainder != 0 {
             reader.bytes("timeStampsRemainder", remainder)?;
@@ -2687,11 +2693,11 @@ fn is_reserved_type(object_type: ObjectType) -> bool {
 fn push_u8_field(
     data: &[u8],
     offset: &mut usize,
-    fields: &mut Vec<(String, FieldValue)>,
-    name: &str,
+    fields: &mut Vec<(&'static str, FieldValue)>,
+    name: &'static str,
 ) -> Result<()> {
     fields.push((
-        name.to_string(),
+        name,
         FieldValue::U8(*data.get(*offset).ok_or(BlfError::Truncated)?),
     ));
     *offset = checked_offset(*offset, 1)?;
@@ -2701,10 +2707,10 @@ fn push_u8_field(
 fn push_u16_field(
     data: &[u8],
     offset: &mut usize,
-    fields: &mut Vec<(String, FieldValue)>,
-    name: &str,
+    fields: &mut Vec<(&'static str, FieldValue)>,
+    name: &'static str,
 ) -> Result<()> {
-    fields.push((name.to_string(), FieldValue::U16(read_u16(data, *offset)?)));
+    fields.push((name, FieldValue::U16(read_u16(data, *offset)?)));
     *offset = checked_offset(*offset, 2)?;
     Ok(())
 }
@@ -2712,10 +2718,10 @@ fn push_u16_field(
 fn push_u32_field(
     data: &[u8],
     offset: &mut usize,
-    fields: &mut Vec<(String, FieldValue)>,
-    name: &str,
+    fields: &mut Vec<(&'static str, FieldValue)>,
+    name: &'static str,
 ) -> Result<()> {
-    fields.push((name.to_string(), FieldValue::U32(read_u32(data, *offset)?)));
+    fields.push((name, FieldValue::U32(read_u32(data, *offset)?)));
     *offset = checked_offset(*offset, 4)?;
     Ok(())
 }
@@ -2723,10 +2729,10 @@ fn push_u32_field(
 fn push_u64_field(
     data: &[u8],
     offset: &mut usize,
-    fields: &mut Vec<(String, FieldValue)>,
-    name: &str,
+    fields: &mut Vec<(&'static str, FieldValue)>,
+    name: &'static str,
 ) -> Result<()> {
-    fields.push((name.to_string(), FieldValue::U64(read_u64(data, *offset)?)));
+    fields.push((name, FieldValue::U64(read_u64(data, *offset)?)));
     *offset = checked_offset(*offset, 8)?;
     Ok(())
 }
@@ -2734,13 +2740,10 @@ fn push_u64_field(
 fn push_i32_field(
     data: &[u8],
     offset: &mut usize,
-    fields: &mut Vec<(String, FieldValue)>,
-    name: &str,
+    fields: &mut Vec<(&'static str, FieldValue)>,
+    name: &'static str,
 ) -> Result<()> {
-    fields.push((
-        name.to_string(),
-        FieldValue::I32(read_u32(data, *offset)? as i32),
-    ));
+    fields.push((name, FieldValue::I32(read_u32(data, *offset)? as i32)));
     *offset = checked_offset(*offset, 4)?;
     Ok(())
 }
@@ -2748,12 +2751,12 @@ fn push_i32_field(
 fn push_f64_field(
     data: &[u8],
     offset: &mut usize,
-    fields: &mut Vec<(String, FieldValue)>,
-    name: &str,
+    fields: &mut Vec<(&'static str, FieldValue)>,
+    name: &'static str,
 ) -> Result<()> {
     let value = data_range(data, *offset, 8)?;
     fields.push((
-        name.to_string(),
+        name,
         FieldValue::F64(f64::from_le_bytes(value.try_into().expect("fixed 8 bytes"))),
     ));
     *offset = checked_offset(*offset, 8)?;
@@ -2764,11 +2767,11 @@ fn push_bytes_field(
     data: &[u8],
     offset: &mut usize,
     len: usize,
-    fields: &mut Vec<(String, FieldValue)>,
-    name: &str,
+    fields: &mut Vec<(&'static str, FieldValue)>,
+    name: &'static str,
 ) -> Result<()> {
     fields.push((
-        name.to_string(),
+        name,
         FieldValue::Bytes(data_range(data, *offset, len)?.to_vec()),
     ));
     *offset = checked_offset(*offset, len)?;
@@ -2779,15 +2782,15 @@ fn push_u16_vec_field(
     data: &[u8],
     offset: &mut usize,
     len: usize,
-    fields: &mut Vec<(String, FieldValue)>,
-    name: &str,
+    fields: &mut Vec<(&'static str, FieldValue)>,
+    name: &'static str,
 ) -> Result<()> {
     let mut values = Vec::with_capacity(len);
     for index in 0..len {
         let byte_offset = index.checked_mul(2).ok_or(BlfError::Truncated)?;
         values.push(read_u16(data, checked_offset(*offset, byte_offset)?)?);
     }
-    fields.push((name.to_string(), FieldValue::U16Vec(values)));
+    fields.push((name, FieldValue::U16Vec(values)));
     *offset = checked_offset(*offset, len.checked_mul(2).ok_or(BlfError::Truncated)?)?;
     Ok(())
 }
@@ -2796,15 +2799,15 @@ fn push_u64_vec_field(
     data: &[u8],
     offset: &mut usize,
     len: usize,
-    fields: &mut Vec<(String, FieldValue)>,
-    name: &str,
+    fields: &mut Vec<(&'static str, FieldValue)>,
+    name: &'static str,
 ) -> Result<()> {
     let mut values = Vec::with_capacity(len);
     for index in 0..len {
         let byte_offset = index.checked_mul(8).ok_or(BlfError::Truncated)?;
         values.push(read_u64(data, checked_offset(*offset, byte_offset)?)?);
     }
-    fields.push((name.to_string(), FieldValue::U64Vec(values)));
+    fields.push((name, FieldValue::U64Vec(values)));
     *offset = checked_offset(*offset, len.checked_mul(8).ok_or(BlfError::Truncated)?)?;
     Ok(())
 }
@@ -2812,7 +2815,7 @@ fn push_u64_vec_field(
 fn read_lin_bus_event(
     data: &[u8],
     offset: &mut usize,
-    fields: &mut Vec<(String, FieldValue)>,
+    fields: &mut Vec<(&'static str, FieldValue)>,
 ) -> Result<()> {
     push_u64_field(data, offset, fields, "sof")?;
     push_u32_field(data, offset, fields, "eventBaudrate")?;
@@ -2823,7 +2826,7 @@ fn read_lin_bus_event(
 fn read_lin_synch_field_event(
     data: &[u8],
     offset: &mut usize,
-    fields: &mut Vec<(String, FieldValue)>,
+    fields: &mut Vec<(&'static str, FieldValue)>,
 ) -> Result<()> {
     read_lin_bus_event(data, offset, fields)?;
     push_u64_field(data, offset, fields, "synchBreakLength")?;
@@ -2833,7 +2836,7 @@ fn read_lin_synch_field_event(
 fn read_lin_message_descriptor(
     data: &[u8],
     offset: &mut usize,
-    fields: &mut Vec<(String, FieldValue)>,
+    fields: &mut Vec<(&'static str, FieldValue)>,
 ) -> Result<()> {
     read_lin_synch_field_event(data, offset, fields)?;
     push_u16_field(data, offset, fields, "supplierId")?;
@@ -2847,7 +2850,7 @@ fn read_lin_message_descriptor(
 fn read_lin_databyte_timestamp_event(
     data: &[u8],
     offset: &mut usize,
-    fields: &mut Vec<(String, FieldValue)>,
+    fields: &mut Vec<(&'static str, FieldValue)>,
 ) -> Result<()> {
     read_lin_message_descriptor(data, offset, fields)?;
     push_u64_vec_field(data, offset, 9, fields, "databyteTimestamps")

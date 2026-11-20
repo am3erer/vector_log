@@ -311,7 +311,7 @@ fn parses_p0_objects() {
             assert!(frame
                 .fields
                 .iter()
-                .any(|(name, value)| name == "id" && value == &blf_core::FieldValue::U8(0x10)));
+                .any(|(name, value)| *name == "id" && value == &blf_core::FieldValue::U8(0x10)));
         }
         _ => panic!("wrong object"),
     }
@@ -583,7 +583,7 @@ fn parses_structured_and_unknown_objects() {
         Object::Structured(value) => {
             assert_eq!(value.object_type, ObjectType::CanOverload);
             assert!(value.extensions.is_empty());
-            assert!(value.fields.iter().any(|(name, _)| name == "channel"));
+            assert!(value.fields.iter().any(|(name, _)| *name == "channel"));
         }
         _ => panic!("expected structured CAN object"),
     }
@@ -717,7 +717,7 @@ fn uses_var_object_header_for_variable_objects() {
                 _ => panic!("expected VarObjectHeader"),
             }
             assert!(value.fields.iter().any(|(name, value)| {
-                name == "nameLength" && value == &blf_core::FieldValue::U32(3)
+                *name == "nameLength" && value == &blf_core::FieldValue::U32(3)
             }));
         }
         _ => panic!("expected structured FunctionBus object"),
@@ -779,18 +779,18 @@ fn preserves_file_statistics_and_lin_extensions() {
     match reader.read().unwrap().unwrap() {
         Object::Lin(value) => {
             assert_eq!(value.extensions, vec![0xA1]);
-            assert!(!value.fields.iter().any(|(name, _)| name == "respBaudrate"));
+            assert!(!value.fields.iter().any(|(name, _)| *name == "respBaudrate"));
         }
         _ => panic!("expected LinMessage2"),
     }
     match reader.read().unwrap().unwrap() {
         Object::Lin(value) => {
             assert_eq!(value.extensions, vec![]);
-            assert!(value.fields.iter().any(|(name, _)| name == "respBaudrate"));
+            assert!(value.fields.iter().any(|(name, _)| *name == "respBaudrate"));
             assert!(value
                 .fields
                 .iter()
-                .any(|(name, _)| name == "exactHeaderBaudrate"));
+                .any(|(name, _)| *name == "exactHeaderBaudrate"));
         }
         _ => panic!("expected LinMessage2"),
     }
@@ -813,7 +813,7 @@ fn recovers_upstream_global_marker_size_bug() {
             assert_eq!(value.data.len(), 595);
             assert!(value.extensions.is_empty());
             assert!(value.fields.iter().any(|(name, value)| {
-                name == "groupNameLength" && value == &blf_core::FieldValue::U32(131)
+                *name == "groupNameLength" && value == &blf_core::FieldValue::U32(131)
             }));
         }
         _ => panic!("expected GlobalMarker"),
@@ -930,7 +930,7 @@ fn parses_serial_event_union_variants_and_can_setting_timings() {
             assert_eq!(value.object_type, ObjectType::SerialEvent);
             assert_eq!(value.extensions, vec![]);
             assert!(value.fields.iter().any(|(name, value)| {
-                name == "byte" && value == &blf_core::FieldValue::U8(0xA5)
+                *name == "byte" && value == &blf_core::FieldValue::U8(0xA5)
             }));
         }
         _ => panic!("expected single-byte serial event"),
@@ -938,10 +938,10 @@ fn parses_serial_event_union_variants_and_can_setting_timings() {
     match reader.read().unwrap().unwrap() {
         Object::Structured(value) => {
             assert!(value.fields.iter().any(|(name, value)| {
-                name == "compactLength" && value == &blf_core::FieldValue::U8(3)
+                *name == "compactLength" && value == &blf_core::FieldValue::U8(3)
             }));
             assert!(value.fields.iter().any(|(name, value)| {
-                name == "compactData"
+                *name == "compactData"
                     && value
                         == &blf_core::FieldValue::Bytes(vec![
                             1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -953,10 +953,10 @@ fn parses_serial_event_union_variants_and_can_setting_timings() {
     match reader.read().unwrap().unwrap() {
         Object::Structured(value) => {
             assert!(value.fields.iter().any(|(name, value)| {
-                name == "data" && value == &blf_core::FieldValue::Bytes(vec![9, 8, 7])
+                *name == "data" && value == &blf_core::FieldValue::Bytes(vec![9, 8, 7])
             }));
             assert!(value.fields.iter().any(|(name, value)| {
-                name == "timeStamps" && value == &blf_core::FieldValue::I64Vec(vec![11, -22])
+                *name == "timeStamps" && value == &blf_core::FieldValue::I64Vec(vec![11, -22])
             }));
         }
         _ => panic!("expected general serial event"),
@@ -964,10 +964,10 @@ fn parses_serial_event_union_variants_and_can_setting_timings() {
     match reader.read().unwrap().unwrap() {
         Object::Structured(value) => {
             assert!(value.fields.iter().any(|(name, value)| {
-                name == "btrExtArb" && value == &blf_core::FieldValue::U32(0x1122_3344)
+                *name == "btrExtArb" && value == &blf_core::FieldValue::U32(0x1122_3344)
             }));
             assert!(value.fields.iter().any(|(name, value)| {
-                name == "btrExtData" && value == &blf_core::FieldValue::U32(0x5566_7788)
+                *name == "btrExtData" && value == &blf_core::FieldValue::U32(0x5566_7788)
             }));
         }
         _ => panic!("expected CAN setting changed event"),
@@ -1091,7 +1091,7 @@ fn parses_ethernet_status_and_phy_state() {
         status
             .fields
             .iter()
-            .find(|(field, _)| field == name)
+            .find(|(field, _)| *field == name)
             .map(|(_, value)| value.clone())
     };
     assert_eq!(field("channel"), Some(blf_core::FieldValue::U16(4)));
@@ -1112,7 +1112,7 @@ fn parses_ethernet_status_and_phy_state() {
     let field = |name: &str| {
         phy.fields
             .iter()
-            .find(|(field, _)| field == name)
+            .find(|(field, _)| *field == name)
             .map(|(_, value)| value.clone())
     };
     assert_eq!(field("channel"), Some(blf_core::FieldValue::U16(4)));

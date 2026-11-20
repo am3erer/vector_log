@@ -1002,7 +1002,7 @@ fn field_u64_vec(object: &LinObject, name: &str) -> Vec<u64> {
         .fields
         .iter()
         .find_map(|(field, value)| {
-            if field != name {
+            if *field != name {
                 return None;
             }
             match value {
@@ -1015,7 +1015,7 @@ fn field_u64_vec(object: &LinObject, name: &str) -> Vec<u64> {
 
 fn field_u16(object: &LinObject, name: &str) -> Option<u16> {
     object.fields.iter().find_map(|(field, value)| {
-        if field != name {
+        if *field != name {
             return None;
         }
         match value {

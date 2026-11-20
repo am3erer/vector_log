@@ -36,10 +36,18 @@ fn fields(object: &Object) -> BTreeMap<String, FieldValue> {
     };
     match object {
         Object::Structured(value) => {
-            return value.fields.iter().cloned().collect();
+            return value
+                .fields
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), value.clone()))
+                .collect();
         }
         Object::Lin(value) => {
-            return value.fields.iter().cloned().collect();
+            return value
+                .fields
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), value.clone()))
+                .collect();
         }
         // The CAN records are typed structs rather than schema-driven bodies.
         Object::CanMessage(value) => {

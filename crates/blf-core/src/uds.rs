@@ -550,8 +550,8 @@ mod service_coverage {
         let negative = decode_uds(&[0x7F, 0x22, 0x31]).expect("uds");
         assert!(negative.summary().contains("negative response"));
         let fields = negative.fields();
-        assert!(fields.iter().any(|(name, _)| name == "nrc"));
-        assert!(fields.iter().any(|(name, _)| name == "negativeResponseTo"));
+        assert!(fields.iter().any(|(name, _)| *name == "nrc"));
+        assert!(fields.iter().any(|(name, _)| *name == "negativeResponseTo"));
 
         // A negative answer to an unknown service still names both sides.
         assert_eq!(decode_uds(&[0x99, 0x00]), None);

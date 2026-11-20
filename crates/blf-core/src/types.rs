@@ -525,7 +525,7 @@ pub struct StructuredObject {
     pub object_type: ObjectType,
     pub header: RawObjectHeader,
     pub class_name: String,
-    pub fields: Vec<(String, FieldValue)>,
+    pub fields: Vec<(&'static str, FieldValue)>,
     pub extensions: Vec<u8>,
     pub data: Vec<u8>,
 }
@@ -723,7 +723,7 @@ pub enum FieldValue {
 pub struct LinObject {
     pub object_type: ObjectType,
     pub header: ObjectHeader,
-    pub fields: Vec<(String, FieldValue)>,
+    pub fields: Vec<(&'static str, FieldValue)>,
     pub extensions: Vec<u8>,
     pub raw_data: Vec<u8>,
 }

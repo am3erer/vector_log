@@ -1961,16 +1961,19 @@ impl App {
                 }
             }
         }
-        let mut header = vec![
-            "timestamp_s".to_string(),
-            "bus".to_string(),
-            "channel".to_string(),
-            "frame_id".to_string(),
-            "direction".to_string(),
-            "dlc".to_string(),
-            "data".to_string(),
-            "status".to_string(),
-        ];
+        let mut header: Vec<String> = [
+            "timestamp_s",
+            "bus",
+            "channel",
+            "frame_id",
+            "direction",
+            "dlc",
+            "data",
+            "status",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
         header.extend(columns.iter().cloned());
         writeln!(writer, "{}", csv_line(&header)).map_err(|error| error.to_string())?;
 
@@ -4141,12 +4144,12 @@ fn object_fields(object: &Object) -> Vec<(String, String)> {
         Object::Lin(value) => value
             .fields
             .iter()
-            .map(|(name, value)| (name.clone(), field_value(value)))
+            .map(|(name, value)| ((*name).to_string(), field_value(value)))
             .collect(),
         Object::Structured(value) => value
             .fields
             .iter()
-            .map(|(name, value)| (name.clone(), field_value(value)))
+            .map(|(name, value)| ((*name).to_string(), field_value(value)))
             .collect(),
         _ => Vec::new(),
     }
@@ -4355,7 +4358,7 @@ fn reassemble_trace(objects: &[Object], summaries: &[MessageSummary]) -> HashMap
 
 fn lin_frame_id(object: &blf_core::LinObject) -> Option<u32> {
     object.fields.iter().find_map(|(name, value)| {
-        if name != "id" {
+        if *name != "id" {
             return None;
         }
         match value {
@@ -4391,7 +4394,7 @@ fn count_lost_objects(objects: &[Object]) -> (u64, u64) {
             return None;
         };
         value.fields.iter().find_map(|(field, value)| {
-            if field != name {
+            if *field != name {
                 return None;
             }
             match value {
@@ -4673,7 +4676,7 @@ fn bus_event(object: &Object) -> Option<BusEvent> {
 fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
     let field = |name: &str| -> Option<u64> {
         object.fields.iter().find_map(|(field, value)| {
-            if field != name {
+            if *field != name {
                 return None;
             }
             match value {
@@ -4821,7 +4824,7 @@ fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
         }
         blf_core::ObjectType::EthernetStatistic => {
             let sqi = object.fields.iter().find_map(|(name, value)| {
-                if name == "sqi" {
+                if *name == "sqi" {
                     match value {
                         FieldValue::I16(number) => Some(*number),
                         _ => None,
@@ -4892,7 +4895,7 @@ fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
             if object.object_type == blf_core::ObjectType::MostSpy {
                 text.push_str(&format!(", {state}"));
             }
-            if object.fields.iter().any(|(name, _)| name == "ackNack") {
+            if object.fields.iter().any(|(name, _)| *name == "ackNack") {
                 let ack = blf_core::most_ack_text(field("ackNack").unwrap_or(0) as u8);
                 if ack != "-" {
                     text.push_str(&format!(", {ack}"));
@@ -5396,7 +5399,7 @@ fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
             let text = object
                 .fields
                 .iter()
-                .find_map(|(name, value)| match (name.as_str(), value) {
+                .find_map(|(name, value)| match (*name, value) {
                     ("errorText", FieldValue::String(text)) => Some(text.as_str()),
                     _ => None,
                 })
@@ -5449,7 +5452,7 @@ fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
             let text = object
                 .fields
                 .iter()
-                .find_map(|(name, value)| match (name.as_str(), value) {
+                .find_map(|(name, value)| match (*name, value) {
                     ("errorText", FieldValue::String(text)) => Some(text.as_str()),
                     _ => None,
                 })
@@ -5515,7 +5518,7 @@ fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
             let data = object
                 .fields
                 .iter()
-                .find_map(|(name, value)| match (name.as_str(), value) {
+                .find_map(|(name, value)| match (*name, value) {
                     ("data", FieldValue::Bytes(bytes)) => Some(bytes.as_slice()),
                     _ => None,
                 })
@@ -5586,12 +5589,12 @@ fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
         | blf_core::ObjectType::EnvDouble
         | blf_core::ObjectType::EnvString
         | blf_core::ObjectType::EnvData => {
-            let text_of = |name: &str| {
+            let text_of = |_name: &str| {
                 object
                     .fields
                     .iter()
-                    .find_map(|(field, value)| match (field.as_str(), value) {
-                        ("name", FieldValue::String(text)) if name == "name" => Some(text.as_str()),
+                    .find_map(|(field, value)| match (*field, value) {
+                        ("name", FieldValue::String(text)) => Some(text.as_str()),
                         _ => None,
                     })
                     .unwrap_or("")
@@ -5599,7 +5602,7 @@ fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
             let data = object
                 .fields
                 .iter()
-                .find_map(|(name, value)| match (name.as_str(), value) {
+                .find_map(|(name, value)| match (*name, value) {
                     ("data", FieldValue::Bytes(bytes)) => Some(bytes.as_slice()),
                     _ => None,
                 })
@@ -5640,7 +5643,7 @@ fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
                 object
                     .fields
                     .iter()
-                    .find_map(|(field, value)| match (field.as_str(), value) {
+                    .find_map(|(field, value)| match (*field, value) {
                         (name, FieldValue::String(text)) if name == wanted => Some(text.as_str()),
                         _ => None,
                     })
@@ -5662,7 +5665,7 @@ fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
                 object
                     .fields
                     .iter()
-                    .find_map(|(field, value)| match (field.as_str(), value) {
+                    .find_map(|(field, value)| match (*field, value) {
                         (name, FieldValue::String(text)) if name == wanted => Some(text.as_str()),
                         _ => None,
                     })
@@ -5677,7 +5680,7 @@ fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
                             object
                                 .fields
                                 .iter()
-                                .find_map(|(name, value)| match (name.as_str(), value) {
+                                .find_map(|(name, value)| match (*name, value) {
                                     ("data", FieldValue::Bytes(bytes)) => Some(bytes.as_slice()),
                                     _ => None,
                                 })
@@ -5693,7 +5696,7 @@ fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
                 object
                     .fields
                     .iter()
-                    .find_map(|(field, value)| match (field.as_str(), value) {
+                    .find_map(|(field, value)| match (*field, value) {
                         (name, FieldValue::String(text)) if name == wanted => Some(text.as_str()),
                         _ => None,
                     })
@@ -5715,7 +5718,7 @@ fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
                 object
                     .fields
                     .iter()
-                    .find_map(|(field, value)| match (field.as_str(), value) {
+                    .find_map(|(field, value)| match (*field, value) {
                         (name, FieldValue::String(text)) if name == wanted => Some(text.as_str()),
                         _ => None,
                     })
@@ -5780,7 +5783,7 @@ fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
             let port = field("port").unwrap_or(0);
             let baudrate = field("baudrate").unwrap_or(0);
             let mut text = format!("ch {port} at {baudrate} bit/s");
-            if object.fields.iter().any(|(name, _)| name == "byte") {
+            if object.fields.iter().any(|(name, _)| *name == "byte") {
                 text.push_str(&format!(
                     ", single byte 0x{:02X}",
                     field("byte").unwrap_or(0)
@@ -5788,7 +5791,7 @@ fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
             } else if object
                 .fields
                 .iter()
-                .any(|(name, _)| name == "compactLength")
+                .any(|(name, _)| *name == "compactLength")
             {
                 let length = field("compactLength").unwrap_or(0);
                 text.push_str(&format!(", compact {length} bytes"));
@@ -5806,7 +5809,7 @@ fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
             let name = object
                 .fields
                 .iter()
-                .find_map(|(name, value)| match (name.as_str(), value) {
+                .find_map(|(name, value)| match (*name, value) {
                     ("name", FieldValue::String(text)) => Some(text.as_str()),
                     _ => None,
                 })
@@ -5814,7 +5817,7 @@ fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
             let data = object
                 .fields
                 .iter()
-                .find_map(|(name, value)| match (name.as_str(), value) {
+                .find_map(|(name, value)| match (*name, value) {
                     ("data", FieldValue::Bytes(bytes)) => Some(bytes.as_slice()),
                     _ => None,
                 })
@@ -5848,7 +5851,7 @@ fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
             let marker = object
                 .fields
                 .iter()
-                .find_map(|(name, value)| match (name.as_str(), value) {
+                .find_map(|(name, value)| match (*name, value) {
                     ("markerName", FieldValue::String(text)) => Some(text.as_str()),
                     _ => None,
                 })
@@ -5856,7 +5859,7 @@ fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
             let group = object
                 .fields
                 .iter()
-                .find_map(|(name, value)| match (name.as_str(), value) {
+                .find_map(|(name, value)| match (*name, value) {
                     ("groupName", FieldValue::String(text)) => Some(text.as_str()),
                     _ => None,
                 })
@@ -5871,7 +5874,7 @@ fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
             let text = object
                 .fields
                 .iter()
-                .find_map(|(name, value)| match (name.as_str(), value) {
+                .find_map(|(name, value)| match (*name, value) {
                     ("text", FieldValue::String(text)) => Some(text.as_str()),
                     _ => None,
                 })
@@ -5889,7 +5892,7 @@ fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
             let name = object
                 .fields
                 .iter()
-                .find_map(|(name, value)| match (name.as_str(), value) {
+                .find_map(|(name, value)| match (*name, value) {
                     ("name", FieldValue::String(text)) if !text.is_empty() => Some(text.as_str()),
                     _ => None,
                 })
@@ -5897,7 +5900,7 @@ fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
             let text = object
                 .fields
                 .iter()
-                .find_map(|(name, value)| match (name.as_str(), value) {
+                .find_map(|(name, value)| match (*name, value) {
                     ("text", FieldValue::String(text)) if !text.is_empty() => Some(text.as_str()),
                     _ => None,
                 })
@@ -5928,7 +5931,7 @@ fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
                 object
                     .fields
                     .iter()
-                    .find_map(|(name, value)| match (name.as_str(), value) {
+                    .find_map(|(name, value)| match (*name, value) {
                         (name, FieldValue::String(text)) if name == field_name => {
                             Some(text.as_str())
                         }
@@ -5956,7 +5959,7 @@ fn lin_event(object: &blf_core::LinObject) -> Option<BusEvent> {
     use blf_core::ObjectType;
     let field = |name: &str| -> Option<u64> {
         object.fields.iter().find_map(|(field, value)| {
-            if field != name {
+            if *field != name {
                 return None;
             }
             match value {
@@ -5991,7 +5994,7 @@ fn lin_event(object: &blf_core::LinObject) -> Option<BusEvent> {
                 field("signal").unwrap_or(0)
             );
             if let Some((_, FieldValue::U8(length))) =
-                object.fields.iter().find(|(name, _)| name == "lengthInfo")
+                object.fields.iter().find(|(name, _)| *name == "lengthInfo")
             {
                 text.push_str(&format!(", {}", blf_core::lin_wakeup_length_name(*length)));
             }
@@ -6072,7 +6075,7 @@ fn lin_event(object: &blf_core::LinObject) -> Option<BusEvent> {
             let load = object
                 .fields
                 .iter()
-                .find_map(|(name, value)| match (name.as_str(), value) {
+                .find_map(|(name, value)| match (*name, value) {
                     ("busLoad", FieldValue::F64(load)) => Some(*load),
                     _ => None,
                 })
@@ -6126,7 +6129,7 @@ fn structured_frame_hints(object: &Object) -> (Option<u16>, Option<&'static str>
     let mut channel = None;
     let mut direction = None;
     for (field, value) in &value.fields {
-        match field.as_str() {
+        match *field {
             "channel" | "hardwareChannel" if channel.is_none() => {
                 channel = match value {
                     FieldValue::U8(number) => Some(u16::from(*number)),
@@ -7471,7 +7474,7 @@ fn normalize_can_id(raw: u32) -> (u32, bool) {
 
 fn field_u16(object: &blf_core::LinObject, name: &str) -> Option<u16> {
     object.fields.iter().find_map(|(field, value)| {
-        if field != name {
+        if *field != name {
             return None;
         }
         match value {
@@ -7485,7 +7488,7 @@ fn field_u16(object: &blf_core::LinObject, name: &str) -> Option<u16> {
 
 fn field_u8(object: &blf_core::LinObject, name: &str) -> Option<u8> {
     object.fields.iter().find_map(|(field, value)| {
-        if field != name {
+        if *field != name {
             return None;
         }
         match value {
@@ -8547,13 +8550,10 @@ Schedule_tables {
             ByteOrder::LittleEndian,
             SignalType::Unsigned,
         );
-        speed.receivers = vec![
-            "TCM".to_string(),
-            "Vector__XXX".to_string(),
-            "TCM".to_string(),
-            "Gateway".to_string(),
-            String::new(),
-        ];
+        speed.receivers = vec!["TCM", "Vector__XXX", "TCM", "Gateway", ""]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         let message = blf_core::DbcMessage {
             id: CanMessageId::new(0x123, false),
             name: "VehicleStatus".to_string(),
@@ -8595,11 +8595,10 @@ Schedule_tables {
             start_bit: 0,
             bit_length: 1,
             publisher: Some("BCM".to_string()),
-            subscribers: vec![
-                "TCM".to_string(),
-                "Vector__XXX".to_string(),
-                "Gateway".to_string(),
-            ],
+            subscribers: vec!["TCM", "Vector__XXX", "Gateway"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
             initial_value: None,
             factor: 1.0,
             offset: 0.0,
@@ -8637,13 +8636,10 @@ Schedule_tables {
             start_bit: 0,
             bit_length: 1,
             publisher: Some("BCM".to_string()),
-            subscribers: vec![
-                "TCM".to_string(),
-                "Vector__XXX".to_string(),
-                "TCM".to_string(),
-                "Gateway".to_string(),
-                String::new(),
-            ],
+            subscribers: vec!["TCM", "Vector__XXX", "TCM", "Gateway", ""]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
             initial_value: None,
             factor: 1.0,
             offset: 0.0,
@@ -9991,23 +9987,23 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
             class_name: "EthernetFrame".to_string(),
             fields: vec![
                 (
-                    "sourceAddress".to_string(),
+                    "sourceAddress",
                     blf_core::FieldValue::Bytes(vec![2, 0, 0, 0, 0, 1]),
                 ),
                 (
-                    "destinationAddress".to_string(),
+                    "destinationAddress",
                     blf_core::FieldValue::Bytes(vec![2, 0, 0, 0, 0, 2]),
                 ),
-                ("channel".to_string(), blf_core::FieldValue::U16(2)),
-                ("dir".to_string(), blf_core::FieldValue::U16(0)),
-                ("type".to_string(), blf_core::FieldValue::U16(0x0800)),
-                ("tpid".to_string(), blf_core::FieldValue::U16(0)),
-                ("tci".to_string(), blf_core::FieldValue::U16(0)),
+                ("channel", blf_core::FieldValue::U16(2)),
+                ("dir", blf_core::FieldValue::U16(0)),
+                ("type", blf_core::FieldValue::U16(0x0800)),
+                ("tpid", blf_core::FieldValue::U16(0)),
+                ("tci", blf_core::FieldValue::U16(0)),
                 (
-                    "payLoadLength".to_string(),
+                    "payLoadLength",
                     blf_core::FieldValue::U16(payload.len() as u16),
                 ),
-                ("payLoad".to_string(), blf_core::FieldValue::Bytes(payload)),
+                ("payLoad", blf_core::FieldValue::Bytes(payload)),
             ],
             extensions: Vec::new(),
             data: Vec::new(),
@@ -10175,11 +10171,11 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
                 object_time_stamp: timestamp,
             },
             fields: vec![
-                ("channel".to_string(), FieldValue::U16(1)),
-                ("id".to_string(), FieldValue::U8(frame_id)),
-                ("dlc".to_string(), FieldValue::U8(data.len() as u8)),
-                ("data".to_string(), FieldValue::Bytes(payload.to_vec())),
-                ("dir".to_string(), FieldValue::U8(0)),
+                ("channel", FieldValue::U16(1)),
+                ("id", FieldValue::U8(frame_id)),
+                ("dlc", FieldValue::U8(data.len() as u8)),
+                ("data", FieldValue::Bytes(payload.to_vec())),
+                ("dir", FieldValue::U8(0)),
             ],
             extensions: Vec::new(),
             raw_data: Vec::new(),
@@ -10220,7 +10216,7 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
             frame
                 .fields
                 .iter()
-                .find(|(name, _)| name == "data")
+                .find(|(name, _)| *name == "data")
                 .map(|(_, value)| value.as_str()),
             Some("11 22 33 44 55")
         );
@@ -10290,11 +10286,11 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
             }),
             class_name: "EthernetPhyState".to_string(),
             fields: vec![
-                ("channel".to_string(), FieldValue::U16(ch)),
-                ("flags".to_string(), FieldValue::U16(flags)),
-                ("phyState".to_string(), FieldValue::U8(payload[4])),
-                ("phyEvent".to_string(), FieldValue::U8(payload[5])),
-                ("hardwareChannel".to_string(), FieldValue::U8(payload[6])),
+                ("channel", FieldValue::U16(ch)),
+                ("flags", FieldValue::U16(flags)),
+                ("phyState", FieldValue::U8(payload[4])),
+                ("phyEvent", FieldValue::U8(payload[5])),
+                ("hardwareChannel", FieldValue::U8(payload[6])),
             ],
             extensions: Vec::new(),
             data: Vec::new(),
@@ -10666,31 +10662,25 @@ mod bus_event_tests {
         })
     }
 
-    fn structured(object_type: ObjectType, fields: Vec<(&str, FieldValue)>) -> Object {
+    fn structured(object_type: ObjectType, fields: Vec<(&'static str, FieldValue)>) -> Object {
         Object::Structured(StructuredObject {
             object_type,
             header: header(object_type),
             class_name: object_type.name().to_string(),
-            fields: fields
-                .into_iter()
-                .map(|(name, value)| (name.to_string(), value))
-                .collect(),
+            fields,
             extensions: Vec::new(),
             data: Vec::new(),
         })
     }
 
-    fn lin(object_type: ObjectType, fields: Vec<(&str, FieldValue)>) -> Object {
+    fn lin(object_type: ObjectType, fields: Vec<(&'static str, FieldValue)>) -> Object {
         Object::Lin(LinObject {
             header: match header(object_type) {
                 RawObjectHeader::Object(header) => header,
                 _ => unreachable!(),
             },
             object_type,
-            fields: fields
-                .into_iter()
-                .map(|(name, value)| (name.to_string(), value))
-                .collect(),
+            fields,
             extensions: Vec::new(),
             raw_data: Vec::new(),
         })
@@ -11040,15 +11030,9 @@ mod text_record_tests {
                 }),
                 class_name: "DataLostEnd".to_string(),
                 fields: vec![
-                    ("queueIdentifier".to_string(), FieldValue::U32(1)),
-                    (
-                        "firstObjectLostTimeStamp".to_string(),
-                        FieldValue::U64(since),
-                    ),
-                    (
-                        "numberOfLostEvents".to_string(),
-                        FieldValue::U32(lost as u32),
-                    ),
+                    ("queueIdentifier", FieldValue::U32(1)),
+                    ("firstObjectLostTimeStamp", FieldValue::U64(since)),
+                    ("numberOfLostEvents", FieldValue::U32(lost as u32)),
                 ],
                 extensions: Vec::new(),
                 data: Vec::new(),
@@ -11092,15 +11076,12 @@ mod record_display_tests {
         })
     }
 
-    fn structured(object_type: ObjectType, fields: Vec<(&str, FieldValue)>) -> Object {
+    fn structured(object_type: ObjectType, fields: Vec<(&'static str, FieldValue)>) -> Object {
         Object::Structured(StructuredObject {
             object_type,
             header: header(object_type, object_type.as_u32()),
             class_name: object_type.name().to_string(),
-            fields: fields
-                .into_iter()
-                .map(|(name, value)| (name.to_string(), value))
-                .collect(),
+            fields,
             extensions: Vec::new(),
             data: Vec::new(),
         })
@@ -11311,15 +11292,12 @@ mod bus_family_tests {
         })
     }
 
-    fn structured(object_type: ObjectType, fields: Vec<(&str, FieldValue)>) -> Object {
+    fn structured(object_type: ObjectType, fields: Vec<(&'static str, FieldValue)>) -> Object {
         Object::Structured(StructuredObject {
             object_type,
             header: header2(object_type),
             class_name: object_type.name().to_string(),
-            fields: fields
-                .into_iter()
-                .map(|(name, value)| (name.to_string(), value))
-                .collect(),
+            fields,
             extensions: Vec::new(),
             data: Vec::new(),
         })

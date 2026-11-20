@@ -1599,7 +1599,7 @@ fn object_to_dict(py: Python<'_>, object: &blf_core::Object) -> PyResult<PyObjec
             if value.object_type == blf_core::ObjectType::SysVariable {
                 let type_of = |name: &str| {
                     value.fields.iter().find_map(|(field, value)| {
-                        if field != name {
+                        if *field != name {
                             return None;
                         }
                         match value {
@@ -1609,7 +1609,7 @@ fn object_to_dict(py: Python<'_>, object: &blf_core::Object) -> PyResult<PyObjec
                     })
                 };
                 let data = value.fields.iter().find_map(|(field, value)| {
-                    if field != "data" {
+                    if *field != "data" {
                         return None;
                     }
                     match value {
