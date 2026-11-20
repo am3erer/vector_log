@@ -47,6 +47,9 @@ diagnostic objects, including:
 - A capture that reports lost objects says so in the list header
   (`⚠ LOST n objects`), because `DataLostEnd` and `OverrunError` mean the trace
   is incomplete.
+- `doc/blf-object-support.md` lists every object type with whether its fields are
+  parsed and whether it produces a decoded row; `tools/gen-support-matrix.py`
+  regenerates it and a test fails if the table drifts from the code.
 - Every object type of the format has a decoded row, including the buses this
   project does not analyse deeply: MOST (`allocate` / `remote read` sub types,
   addressing modes, net state, register operations, lost-message counts),
