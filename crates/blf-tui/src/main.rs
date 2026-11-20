@@ -43,9 +43,14 @@ const ANSI_RED: &str = "\x1b[31m";
 const ANSI_MAGENTA: &str = "\x1b[35m";
 const ANSI_CYAN: &str = "\x1b[36m";
 const ANSI_WHITE: &str = "\x1b[37m";
+const ANSI_GREEN: &str = "\x1b[32m";
+const ANSI_YELLOW: &str = "\x1b[33m";
+const ANSI_BRIGHT_RED: &str = "\x1b[91m";
 const ANSI_BRIGHT_GREEN: &str = "\x1b[92m";
 const ANSI_BRIGHT_CYAN: &str = "\x1b[96m";
 const ANSI_BRIGHT_YELLOW: &str = "\x1b[93m";
+const ANSI_BRIGHT_BLUE: &str = "\x1b[94m";
+const ANSI_BRIGHT_MAGENTA: &str = "\x1b[95m";
 const ANSI_SELECTED: &str = "\x1b[1;97;44m";
 
 fn paint(value: impl AsRef<str>, color: &str) -> String {
@@ -148,6 +153,9 @@ struct SignalRow {
     choice: Option<String>,
     error: Option<String>,
 }
+
+/// Below this width a two-pane layout leaves neither half readable.
+const PREVIEW_MIN_WIDTH: usize = 100;
 
 /// Which bus a list view shows in its own columns.
 ///
@@ -2437,41 +2445,48 @@ impl App {
 
     fn render_messages(&self, lines: &mut Vec<String>, width: usize, height: usize) {
         let indices = &self.filtered;
+        // A preview pane needs room to be useful; below this width the list gets
+        // the whole screen instead of two unreadable halves.
+        let show_preview = width >= PREVIEW_MIN_WIDTH;
         // Bus views need wider columns than the mixed view.
         let list_share = if self.view.is_all() { 43 } else { 55 };
-        let split = (width * list_share / 100)
-            .max(24)
-            .min(width.saturating_sub(3));
+        let split = if show_preview {
+            (width * list_share / 100)
+                .max(24)
+                .min(width.saturating_sub(3))
+        } else {
+            width
+        };
         let preview_width = width.saturating_sub(split + 3);
         let view = self.view;
         let foreign_hidden = !self.show_foreign;
+        let heading = format!(
+            "Messages ({}/{})  view={}{}{}",
+            indices.len(),
+            self.summaries.len(),
+            view.label(),
+            if foreign_hidden {
+                "  foreign=hidden"
+            } else {
+                ""
+            },
+            // A capture that lost objects is not a complete record; the list
+            // header is where that has to stay visible.
+            if self.lost_objects > 0 {
+                format!(
+                    "  ⚠ LOST {} objects ({} events)",
+                    self.lost_objects, self.lost_events
+                )
+            } else {
+                String::new()
+            }
+        );
         lines.push(paint_bold(
-            two_column(
-                &format!(
-                    "Messages ({}/{})  view={}{}{}",
-                    indices.len(),
-                    self.summaries.len(),
-                    view.label(),
-                    if foreign_hidden {
-                        "  foreign=hidden"
-                    } else {
-                        ""
-                    },
-                    // A capture that lost objects is not a complete record; the
-                    // list header is where that has to stay visible.
-                    if self.lost_objects > 0 {
-                        format!(
-                            "  ⚠ LOST {} objects ({} events)",
-                            self.lost_objects, self.lost_events
-                        )
-                    } else {
-                        String::new()
-                    }
-                ),
-                "Preview",
-                split,
-                width,
-            ),
+            if show_preview {
+                two_column(&heading, "Preview", split, width)
+            } else {
+                truncate(&heading, width)
+            },
             ANSI_BRIGHT_CYAN,
         ));
         // Column header for the current view; the selection marker keeps the
@@ -2487,11 +2502,15 @@ impl App {
             ANSI_CYAN,
         ));
         lines.push(paint(
-            format!(
-                "{}─┼{}",
-                "─".repeat(split),
-                "─".repeat(width.saturating_sub(split + 1))
-            ),
+            if show_preview {
+                format!(
+                    "{}─┼{}",
+                    "─".repeat(split),
+                    "─".repeat(width.saturating_sub(split + 1))
+                )
+            } else {
+                "─".repeat(width)
+            },
             ANSI_CYAN,
         ));
         let available = height.saturating_sub(7);
@@ -2546,7 +2565,11 @@ impl App {
                 })
                 .unwrap_or_default();
             let right = preview.get(row).cloned().unwrap_or_default();
-            let line = two_column(&left, &right, split, width);
+            let line = if show_preview {
+                two_column(&left, &right, split, width)
+            } else {
+                pad_to_width(&truncate(&left, width), width)
+            };
             lines.push(if selected {
                 paint_selected(line)
             } else if let Some(summary) = summary {
@@ -2562,7 +2585,12 @@ impl App {
             lines.push("No message selected".to_string());
             return;
         };
-        let split = (width * 43 / 100).max(24).min(width.saturating_sub(3));
+        let show_preview = width >= PREVIEW_MIN_WIDTH;
+        let split = if show_preview {
+            (width * 43 / 100).max(24).min(width.saturating_sub(3))
+        } else {
+            width
+        };
         let right_width = width.saturating_sub(split + 3);
         let mut left = summary_detail_lines(
             summary,
@@ -2608,12 +2636,19 @@ impl App {
             let (signal, right_text) = right
                 .get(row)
                 .map_or((None, ""), |(index, text)| (*index, text.as_str()));
-            let line = two_column(
-                left.get(row).map_or("", String::as_str),
-                right_text,
-                split,
-                width,
-            );
+            let line = if show_preview {
+                two_column(
+                    left.get(row).map_or("", String::as_str),
+                    right_text,
+                    split,
+                    width,
+                )
+            } else {
+                pad_to_width(
+                    &truncate(left.get(row).map_or("", String::as_str), width),
+                    width,
+                )
+            };
             let signal_selected = signal == Some(self.selected_signal);
             lines.push(if signal_selected {
                 paint_selected(line)
@@ -4528,7 +4563,10 @@ impl BusEvent {
     }
 
     fn done(mut self) -> Self {
-        self.search = self.summary.to_lowercase();
+        // The kind is shown in its own column, so it has to be part of the
+        // search text as well: `/sv:` finds system variables, `/lost` finds
+        // dropped data.
+        self.search = format!("{} {}", self.kind.to_lowercase(), self.summary).to_lowercase();
         self
     }
 }
@@ -4832,6 +4870,881 @@ fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
                     .done(),
             )
         }
+        // ---- MOST: the format leaves several fields "to be determined", so
+        // only the values the specification names are decoded. ----
+        blf_core::ObjectType::MostSpy | blf_core::ObjectType::MostCtrl => {
+            let dir = match field("dir").unwrap_or(0) {
+                0 => "Rx",
+                1 => "Tx",
+                _ => "TxRq",
+            };
+            let sub_type = blf_core::most_control_sub_type_name(
+                u16::try_from(field("rTyp").unwrap_or(0)).unwrap_or(0),
+            );
+            let address = blf_core::most_addressing_mode_name(field("rTypAdr").unwrap_or(0) as u8);
+            let state = blf_core::most25_state_text(field("state").unwrap_or(0) as u8);
+            let mut text = format!(
+                "ch {} {dir} 0x{:03X} -> 0x{:03X} {sub_type} ({address})",
+                channel.unwrap_or(0),
+                field("sourceAdr").unwrap_or(0),
+                field("destAdr").unwrap_or(0)
+            );
+            if object.object_type == blf_core::ObjectType::MostSpy {
+                text.push_str(&format!(", {state}"));
+            }
+            if object.fields.iter().any(|(name, _)| name == "ackNack") {
+                let ack = blf_core::most_ack_text(field("ackNack").unwrap_or(0) as u8);
+                if ack != "-" {
+                    text.push_str(&format!(", {ack}"));
+                }
+            }
+            Some(
+                BusEvent::new("most", "ctrl")
+                    .channel(channel)
+                    .text(text)
+                    .done(),
+            )
+        }
+        blf_core::ObjectType::MostLightlock => Some(
+            BusEvent::new("most", "light")
+                .channel(channel)
+                .text(format!(
+                    "ch {} light lock state {}",
+                    channel.unwrap_or(0),
+                    field("state").unwrap_or(0)
+                ))
+                .done(),
+        ),
+        blf_core::ObjectType::MostStatistic => Some(
+            BusEvent::new("most", "stat")
+                .channel(channel)
+                .text(format!(
+                    "ch {} {} packets, {} frames, {} light events, buffer level {}",
+                    channel.unwrap_or(0),
+                    field("pktCnt").unwrap_or(0),
+                    field("frmCnt").unwrap_or(0),
+                    field("lightCnt").unwrap_or(0),
+                    field("bufferLevel").unwrap_or(0)
+                ))
+                .done(),
+        ),
+        blf_core::ObjectType::MostStatisticex => Some(
+            BusEvent::new("most", "stat")
+                .channel(channel)
+                .text(format!(
+                    "ch {} {} frames, {} coding errors",
+                    channel.unwrap_or(0),
+                    field("frameCounter").unwrap_or(0),
+                    field("codingErrors").unwrap_or(0)
+                ))
+                .done(),
+        ),
+        blf_core::ObjectType::MostPkt | blf_core::ObjectType::MostPkt2 => {
+            let dir = match field("dir").unwrap_or(0) {
+                0 => "Rx",
+                1 => "Tx",
+                _ => "TxRq",
+            };
+            let transfer =
+                blf_core::most_transfer_type_name(field("transferType").unwrap_or(0) as u8);
+            let state = blf_core::most50_state_text(field("state").unwrap_or(0) as u8);
+            Some(
+                BusEvent::new("most", "packet")
+                    .channel(channel)
+                    .text(format!(
+                        "ch {} {dir} 0x{:03X} -> 0x{:03X} {transfer}, {} bytes, {state}",
+                        channel.unwrap_or(0),
+                        field("sourceAdr").unwrap_or(0),
+                        field("destAdr").unwrap_or(0),
+                        field("pktDataLength").unwrap_or(0)
+                    ))
+                    .done(),
+            )
+        }
+        blf_core::ObjectType::Most150Message => {
+            let dir = match field("dir").unwrap_or(0) {
+                0 => "Rx",
+                1 => "Tx",
+                _ => "TxRq",
+            };
+            let transfer =
+                blf_core::most_transfer_type_name(field("transferType").unwrap_or(0) as u8);
+            let priority = blf_core::most_priority_name(
+                u32::try_from(field("priority").unwrap_or(0)).unwrap_or(0),
+            );
+            Some(
+                BusEvent::new("most", "ctrl150")
+                    .channel(channel)
+                    .text(format!(
+                        "ch {} {dir} 0x{:03X} -> 0x{:03X} {transfer}, {} bytes, {priority} priority",
+                        channel.unwrap_or(0),
+                        field("sourceAdr").unwrap_or(0),
+                        field("destAdr").unwrap_or(0),
+                        field("msgLen").unwrap_or(0)
+                    ))
+                    .done(),
+            )
+        }
+        blf_core::ObjectType::Most150Pkt => {
+            let dir = match field("dir").unwrap_or(0) {
+                0 => "Rx",
+                1 => "Tx",
+                _ => "TxRq",
+            };
+            let transfer =
+                blf_core::most_transfer_type_name(field("transferType").unwrap_or(0) as u8);
+            Some(
+                BusEvent::new("most", "pkt150")
+                    .channel(channel)
+                    .text(format!(
+                        "ch {} {dir} 0x{:03X} -> 0x{:03X} {transfer}, {} bytes",
+                        channel.unwrap_or(0),
+                        field("sourceAdr").unwrap_or(0),
+                        field("destAdr").unwrap_or(0),
+                        field("pktDataLength").unwrap_or(0)
+                    ))
+                    .done(),
+            )
+        }
+        blf_core::ObjectType::MostEthernetPkt => {
+            let dir = match field("dir").unwrap_or(0) {
+                0 => "Rx",
+                1 => "Tx",
+                _ => "TxRq",
+            };
+            let transfer =
+                blf_core::most_transfer_type_name(field("transferType").unwrap_or(0) as u8);
+            Some(
+                BusEvent::new("most", "ethernet")
+                    .channel(channel)
+                    .text(format!(
+                        "ch {} {dir} ethernet packet {transfer}, {} bytes",
+                        channel.unwrap_or(0),
+                        field("pktDataLength").unwrap_or(0)
+                    ))
+                    .done(),
+            )
+        }
+        blf_core::ObjectType::Most150MessageFragment
+        | blf_core::ObjectType::Most150PktFragment
+        | blf_core::ObjectType::MostEthernetPktFragment => Some(
+            BusEvent::new("most", "fragment")
+                .channel(channel)
+                .text(format!(
+                    "ch {} {} fragment, {} bytes",
+                    channel.unwrap_or(0),
+                    object.object_type.name(),
+                    field("dataLength").unwrap_or(0)
+                ))
+                .done(),
+        ),
+        blf_core::ObjectType::MostHwmode => Some(
+            BusEvent::new("most", "hw")
+                .channel(channel)
+                .text(format!(
+                    "ch {} hardware mode 0x{:X} (mask 0x{:X})",
+                    channel.unwrap_or(0),
+                    field("hwMode").unwrap_or(0),
+                    field("hwModeMask").unwrap_or(0)
+                ))
+                .done(),
+        ),
+        blf_core::ObjectType::MostReg => Some(
+            BusEvent::new("most", "register")
+                .channel(channel)
+                .text(format!(
+                    "ch {} {} register 0x{:X} offset {}, {} bytes",
+                    channel.unwrap_or(0),
+                    blf_core::most_register_sub_type_name(
+                        u32::try_from(field("subType").unwrap_or(0)).unwrap_or(0)
+                    ),
+                    field("regId").or_else(|| field("handle")).unwrap_or(0),
+                    field("offset").unwrap_or(0),
+                    field("regDataLen").unwrap_or(0)
+                ))
+                .done(),
+        ),
+        blf_core::ObjectType::MostGenreg => Some(
+            BusEvent::new("most", "register")
+                .channel(channel)
+                .text(format!(
+                    "ch {} {} {} = 0x{:X}",
+                    channel.unwrap_or(0),
+                    blf_core::most_register_sub_type_name(
+                        u32::try_from(field("subType").unwrap_or(0)).unwrap_or(0)
+                    ),
+                    blf_core::most_register_id_name(
+                        u32::try_from(field("regId").unwrap_or(0)).unwrap_or(0)
+                    ),
+                    field("regValue").unwrap_or(0)
+                ))
+                .done(),
+        ),
+        blf_core::ObjectType::MostNetstate => Some(
+            BusEvent::new("most", "netstate")
+                .channel(channel)
+                .text(format!(
+                    "ch {} {} -> {}",
+                    channel.unwrap_or(0),
+                    blf_core::most_net_state_name(
+                        u16::try_from(field("stateOld").unwrap_or(0)).unwrap_or(0)
+                    ),
+                    blf_core::most_net_state_name(
+                        u16::try_from(field("stateNew").unwrap_or(0)).unwrap_or(0)
+                    )
+                ))
+                .done(),
+        ),
+        blf_core::ObjectType::MostDatalost => {
+            let lost = field("lostMsgsCtrl").unwrap_or(0) + field("lostMsgsAsync").unwrap_or(0);
+            Some(
+                BusEvent::new("most", "LOST")
+                    .channel(channel)
+                    .text(format!(
+                        "ch {} lost {lost} messages ({} control, {} async) between {} and {} ns",
+                        channel.unwrap_or(0),
+                        field("lostMsgsCtrl").unwrap_or(0),
+                        field("lostMsgsAsync").unwrap_or(0),
+                        field("lastGoodTimeStampNs").unwrap_or(0),
+                        field("nextGoodTimeStampNs").unwrap_or(0)
+                    ))
+                    .done(),
+            )
+        }
+        blf_core::ObjectType::MostTrigger => Some(
+            BusEvent::new("most", "trigger")
+                .channel(channel)
+                .text(format!(
+                    "ch {} trigger mode {} {} -> {}",
+                    channel.unwrap_or(0),
+                    field("mode").unwrap_or(0),
+                    field("previousTriggerValue").unwrap_or(0),
+                    field("currentTriggerValue").unwrap_or(0)
+                ))
+                .done(),
+        ),
+        blf_core::ObjectType::MostTxlight => Some(
+            BusEvent::new("most", "txlight")
+                .channel(channel)
+                .text(format!(
+                    "ch {} transmit light state {}",
+                    channel.unwrap_or(0),
+                    field("state").unwrap_or(0)
+                ))
+                .done(),
+        ),
+        blf_core::ObjectType::MostAlloctab | blf_core::ObjectType::Most150Alloctab => Some(
+            BusEvent::new("most", "alloctab")
+                .channel(channel)
+                .text(format!(
+                    "ch {} allocation table, {} entries",
+                    channel.unwrap_or(0),
+                    field("length").unwrap_or(0)
+                ))
+                .done(),
+        ),
+        blf_core::ObjectType::MostStress => Some(
+            BusEvent::new("most", "stress")
+                .channel(channel)
+                .text(format!(
+                    "ch {} stress test state {} mode {}",
+                    channel.unwrap_or(0),
+                    field("state").unwrap_or(0),
+                    field("mode").unwrap_or(0)
+                ))
+                .done(),
+        ),
+        blf_core::ObjectType::MostEcl => Some(
+            BusEvent::new("most", "ecl")
+                .channel(channel)
+                .text(format!(
+                    "ch {} electrical control line state {} mode {}",
+                    channel.unwrap_or(0),
+                    field("eclState").unwrap_or(0),
+                    field("mode").unwrap_or(0)
+                ))
+                .done(),
+        ),
+        blf_core::ObjectType::MostSystemEvent => Some(
+            BusEvent::new("most", "system")
+                .channel(channel)
+                .text(format!(
+                    "ch {} system event {} = {} (was {})",
+                    channel.unwrap_or(0),
+                    field("id").unwrap_or(0),
+                    field("value").unwrap_or(0),
+                    field("valueOld").unwrap_or(0)
+                ))
+                .done(),
+        ),
+
+        // ---- FlexRay ----
+        blf_core::ObjectType::FlexrayMessage => {
+            let channel_name = blf_core::flexray_channel_name(
+                u16::try_from(field("channel").unwrap_or(0)).unwrap_or(0),
+            );
+            let flags = blf_core::flexray_frame_flags_text(
+                u32::try_from(field("frameFlags").unwrap_or(0)).unwrap_or(0),
+            );
+            let state = blf_core::flexray_frame_state_text(field("frameState").unwrap_or(0) as u8);
+            Some(
+                BusEvent::new("flexray", "frame")
+                    .channel(channel)
+                    .text(format!(
+                        "ch {channel_name} slot {} cycle {} {} bytes, {flags}; state {state}",
+                        field("frameId").unwrap_or(0),
+                        field("cycle").unwrap_or(0),
+                        field("length").unwrap_or(0)
+                    ))
+                    .done(),
+            )
+        }
+        blf_core::ObjectType::FlexrayData | blf_core::ObjectType::FlexraySync => {
+            let channel_name = blf_core::flexray_channel_name(
+                u16::try_from(field("channel").unwrap_or(0)).unwrap_or(0),
+            );
+            Some(
+                BusEvent::new("flexray", "frame")
+                    .channel(channel)
+                    .text(format!(
+                        "ch {channel_name} id 0x{:X} {} bytes, mux {}",
+                        field("messageId").unwrap_or(0),
+                        field("len").unwrap_or(0),
+                        field("mux").unwrap_or(0)
+                    ))
+                    .done(),
+            )
+        }
+        blf_core::ObjectType::FlexrayCycle => Some(
+            BusEvent::new("flexray", "cycle")
+                .channel(channel)
+                .text(format!(
+                    "ch {} start of cycle {}, {} bytes",
+                    blf_core::flexray_channel_name(
+                        u16::try_from(field("channel").unwrap_or(0)).unwrap_or(0)
+                    ),
+                    field("cycle").unwrap_or(0),
+                    field("length").unwrap_or(0)
+                ))
+                .done(),
+        ),
+        blf_core::ObjectType::FrRcvmessage | blf_core::ObjectType::FrRcvmessageEx => {
+            let channel_name = blf_core::flexray_channel_name(
+                u16::try_from(field("channelMask").unwrap_or(0)).unwrap_or(0),
+            );
+            let flags = blf_core::flexray_frame_flags_text(
+                u32::try_from(field("frameFlags").unwrap_or(0)).unwrap_or(0),
+            );
+            Some(
+                BusEvent::new("flexray", "frame")
+                    .channel(channel)
+                    .text(format!(
+                        "ch {channel_name} slot {} cycle {} {} bytes, {flags}",
+                        field("frameId").unwrap_or(0),
+                        field("cycle").unwrap_or(0),
+                        field("byteCount").unwrap_or(0)
+                    ))
+                    .done(),
+            )
+        }
+        blf_core::ObjectType::FrStartcycle => {
+            let channel_name = blf_core::flexray_channel_name(
+                u16::try_from(field("channelMask").unwrap_or(0)).unwrap_or(0),
+            );
+            Some(
+                BusEvent::new("flexray", "cycle")
+                    .channel(channel)
+                    .text(format!(
+                        "ch {channel_name} start of cycle {}, NM vector {} bytes, {}",
+                        field("cycle").unwrap_or(0),
+                        field("nmSize").unwrap_or(0),
+                        blf_core::flexray_cc_type_name(
+                            u32::try_from(field("tag").unwrap_or(0)).unwrap_or(0)
+                        )
+                    ))
+                    .done(),
+            )
+        }
+        blf_core::ObjectType::FrError => {
+            let channel_name = blf_core::flexray_channel_name(
+                u16::try_from(field("channelMask").unwrap_or(0)).unwrap_or(0),
+            );
+            Some(
+                BusEvent::new("flexray", "error")
+                    .channel(channel)
+                    .text(format!(
+                        "ch {channel_name} error in cycle {}, {}",
+                        field("cycle").unwrap_or(0),
+                        blf_core::flexray_cc_type_name(
+                            u32::try_from(field("tag").unwrap_or(0)).unwrap_or(0)
+                        )
+                    ))
+                    .done(),
+            )
+        }
+        blf_core::ObjectType::FrStatus | blf_core::ObjectType::FlexrayStatus => {
+            let channel_name = blf_core::flexray_channel_name(
+                u16::try_from(field("channelMask").unwrap_or(0)).unwrap_or(0),
+            );
+            Some(
+                BusEvent::new("flexray", "status")
+                    .channel(channel)
+                    .text(format!(
+                        "ch {channel_name} status type {}, wakeup state {}, sync state {}",
+                        field("statusType").unwrap_or(0),
+                        field("wus").unwrap_or(0),
+                        field("ccSyncState").unwrap_or(0)
+                    ))
+                    .done(),
+            )
+        }
+        // ---- AFDX ----
+        blf_core::ObjectType::AfdxFrame => {
+            let protocol = field("type")
+                .and_then(|value| u16::try_from(value).ok())
+                .unwrap_or(0);
+            Some(
+                BusEvent::new("afdx", "frame")
+                    .channel(channel)
+                    .text(format!(
+                        "ch {} ethertype 0x{protocol:04X}, {} bytes, BAG {} us, flags 0x{:X}",
+                        channel.unwrap_or(0),
+                        field("payLoadLength").unwrap_or(0),
+                        field("bagUsec").unwrap_or(0),
+                        field("afdxFlags").unwrap_or(0)
+                    ))
+                    .done(),
+            )
+        }
+        blf_core::ObjectType::AfdxStatistic => Some(
+            BusEvent::new("afdx", "stat")
+                .channel(channel)
+                .text(format!(
+                    "ch {} rx {} / tx {} packets, {} / {} bytes, {} collisions, {} errors, VL {}",
+                    channel.unwrap_or(0),
+                    field("rxPacketCount").unwrap_or(0),
+                    field("txPacketCount").unwrap_or(0),
+                    field("rxByteCount").unwrap_or(0),
+                    field("txByteCount").unwrap_or(0),
+                    field("collisionCount").unwrap_or(0),
+                    field("errorCount").unwrap_or(0),
+                    field("vlid").unwrap_or(0)
+                ))
+                .done(),
+        ),
+        blf_core::ObjectType::AfdxStatus => {
+            let line = |prefix: &str| {
+                let name = |suffix: &str| {
+                    object.fields.iter().find_map(|(name, value)| {
+                        if name != &format!("{prefix}{suffix}") {
+                            return None;
+                        }
+                        match value {
+                            FieldValue::U8(number) => Some(u64::from(*number)),
+                            FieldValue::U16(number) => Some(u64::from(*number)),
+                            FieldValue::U32(number) => Some(u64::from(*number)),
+                            _ => None,
+                        }
+                    })
+                };
+                (
+                    name("linkStatus").unwrap_or(0),
+                    name("bitrate").unwrap_or(0),
+                )
+            };
+            let (a_status, a_rate) = line("statusA_");
+            let (b_status, b_rate) = line("statusB_");
+            Some(
+                BusEvent::new("afdx", "status")
+                    .channel(channel)
+                    .text(format!(
+                        "ch {} line A {} at {} kbit/s, line B {} at {} kbit/s",
+                        channel.unwrap_or(0),
+                        blf_core::ethernet_link_status_name(a_status as u8),
+                        a_rate / 1000,
+                        blf_core::ethernet_link_status_name(b_status as u8),
+                        b_rate / 1000
+                    ))
+                    .done(),
+            )
+        }
+        blf_core::ObjectType::AfdxBusStatistic => Some(
+            BusEvent::new("afdx", "stat")
+                .channel(channel)
+                .text(format!(
+                    "ch {} line {}, {} / {}, {} rx packets, {} tx packets, {} dropped, {} lost",
+                    channel.unwrap_or(0),
+                    match field("line").unwrap_or(0) {
+                        0 => "A",
+                        _ => "B",
+                    },
+                    blf_core::ethernet_link_status_name(field("linkStatus").unwrap_or(0) as u8),
+                    blf_core::afdx_link_speed_name(field("linkSpeed").unwrap_or(0) as u16),
+                    field("statRxPacketCount").unwrap_or(0),
+                    field("statTxPacketCount").unwrap_or(0),
+                    field("statDroppedPacketCount").unwrap_or(0),
+                    field("statLostPacketCount").unwrap_or(0)
+                ))
+                .done(),
+        ),
+        blf_core::ObjectType::AfdxErrorEvent => {
+            let level = match field("errorLevel").unwrap_or(0) {
+                0 => "error",
+                1 => "warning",
+                _ => "info",
+            };
+            let text = object
+                .fields
+                .iter()
+                .find_map(|(name, value)| match (name.as_str(), value) {
+                    ("errorText", FieldValue::String(text)) => Some(text.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("");
+            Some(
+                BusEvent::new("afdx", "error")
+                    .channel(channel)
+                    .text(format!("ch {} {level}: {text}", channel.unwrap_or(0)))
+                    .done(),
+            )
+        }
+        // ---- A429 ----
+        blf_core::ObjectType::A429Message => Some(
+            BusEvent::new("a429", "word")
+                .channel(channel)
+                .text(format!(
+                    "ch {} {} bits, bitrate {}, {}",
+                    channel.unwrap_or(0),
+                    field("bitLenOfLastBit").unwrap_or(0),
+                    field("bitrate").unwrap_or(0),
+                    blf_core::flexray_direction_name(field("dir").unwrap_or(0) as u8)
+                ))
+                .done(),
+        ),
+        blf_core::ObjectType::A429Status => Some(
+            BusEvent::new("a429", "status")
+                .channel(channel)
+                .text(format!(
+                    "ch {} parity {}, bitrate {}, gap floor {}",
+                    channel.unwrap_or(0),
+                    blf_core::a429_parity_name(field("parity").unwrap_or(0) as u16),
+                    field("bitrate").unwrap_or(0),
+                    field("minGap").unwrap_or(0)
+                ))
+                .done(),
+        ),
+        blf_core::ObjectType::A429BusStatistic => Some(
+            BusEvent::new("a429", "stat")
+                .channel(channel)
+                .text(format!(
+                    "ch {} bus load {:.2} %, {} words, {} errors",
+                    channel.unwrap_or(0),
+                    f64::from(u32::try_from(field("busload").unwrap_or(0)).unwrap_or(0)) / 100.0,
+                    field("dataTotal").unwrap_or(0),
+                    field("errorTotal").unwrap_or(0)
+                ))
+                .done(),
+        ),
+        blf_core::ObjectType::A429Error => {
+            let text = object
+                .fields
+                .iter()
+                .find_map(|(name, value)| match (name.as_str(), value) {
+                    ("errorText", FieldValue::String(text)) => Some(text.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("");
+            Some(
+                BusEvent::new("a429", "error")
+                    .channel(channel)
+                    .text(format!(
+                        "ch {} {}: {text}",
+                        channel.unwrap_or(0),
+                        blf_core::a429_error_type_name(field("errorType").unwrap_or(0) as u16)
+                    ))
+                    .done(),
+            )
+        }
+        // ---- WLAN, K-Line, J1708 ----
+        blf_core::ObjectType::WlanFrame => Some(
+            BusEvent::new("wlan", "frame")
+                .channel(channel)
+                .text(format!(
+                    "ch {} radio {} {} bytes, signal {} / quality {}, {}",
+                    channel.unwrap_or(0),
+                    field("radioChannel").unwrap_or(0),
+                    field("frameLength").unwrap_or(0),
+                    field("signalStrength").unwrap_or(0),
+                    field("signalQuality").unwrap_or(0),
+                    blf_core::wlan_frame_flags_text(
+                        u32::try_from(field("flags").unwrap_or(0)).unwrap_or(0)
+                    )
+                ))
+                .done(),
+        ),
+        blf_core::ObjectType::WlanStatistic => Some(
+            BusEvent::new("wlan", "stat")
+                .channel(channel)
+                .text(format!(
+                    "ch {} rx {} / tx {} packets, {} / {} bytes, {} collisions, {} errors",
+                    channel.unwrap_or(0),
+                    field("rxPacketCount").unwrap_or(0),
+                    field("txPacketCount").unwrap_or(0),
+                    field("rxByteCount").unwrap_or(0),
+                    field("txByteCount").unwrap_or(0),
+                    field("collisionCount").unwrap_or(0),
+                    field("errorCount").unwrap_or(0)
+                ))
+                .done(),
+        ),
+        blf_core::ObjectType::KlineStatusEvent => Some(
+            BusEvent::new("kline", "status")
+                .channel(channel)
+                .text(format!(
+                    "port {} {} ({} bytes)",
+                    field("port").unwrap_or(0),
+                    blf_core::kline_status_name(
+                        u32::try_from(field("type").unwrap_or(0)).unwrap_or(0)
+                    ),
+                    field("dataLen").unwrap_or(0)
+                ))
+                .done(),
+        ),
+        blf_core::ObjectType::J1708Message | blf_core::ObjectType::J1708VirtualMsg => {
+            let length = field("size").unwrap_or(0).min(21);
+            let data = object
+                .fields
+                .iter()
+                .find_map(|(name, value)| match (name.as_str(), value) {
+                    ("data", FieldValue::Bytes(bytes)) => Some(bytes.as_slice()),
+                    _ => None,
+                })
+                .unwrap_or(&[]);
+            let body: String = data
+                .iter()
+                .take(length as usize)
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            Some(
+                BusEvent::new("j1708", "message")
+                    .channel(channel)
+                    .text(format!(
+                        "ch {} {} bytes{}{body}",
+                        channel.unwrap_or(0),
+                        length,
+                        if field("error").unwrap_or(0) != 0 {
+                            " (error)"
+                        } else {
+                            ""
+                        }
+                    ))
+                    .done(),
+            )
+        }
+
+        blf_core::ObjectType::Most50Message | blf_core::ObjectType::Most50Pkt => {
+            let dir = match field("dir").unwrap_or(0) {
+                0 => "Rx",
+                1 => "Tx",
+                _ => "TxRq",
+            };
+            let transfer =
+                blf_core::most_transfer_type_name(field("transferType").unwrap_or(0) as u8);
+            let state = blf_core::most50_state_text(field("state").unwrap_or(0) as u8);
+            let length = if object.object_type == blf_core::ObjectType::Most50Message {
+                field("msgLen").unwrap_or(0)
+            } else {
+                field("pktDataLength").unwrap_or(0)
+            };
+            Some(
+                BusEvent::new("most", "most50")
+                    .channel(channel)
+                    .text(format!(
+                        "ch {} {dir} 0x{:03X} -> 0x{:03X} {transfer}, {length} bytes, {state}",
+                        channel.unwrap_or(0),
+                        field("sourceAdr").unwrap_or(0),
+                        field("destAdr").unwrap_or(0)
+                    ))
+                    .done(),
+            )
+        }
+
+        // ---- remaining records: triggers, variables, marker points ----
+        blf_core::ObjectType::AppTrigger => Some(
+            BusEvent::new("-", "trigger")
+                .channel(channel)
+                .text(format!(
+                    "application trigger ch {}: {} ns before, {} ns after",
+                    channel.unwrap_or(0),
+                    field("preTriggerTime").unwrap_or(0),
+                    field("postTriggerTime").unwrap_or(0)
+                ))
+                .done(),
+        ),
+        blf_core::ObjectType::EnvInteger
+        | blf_core::ObjectType::EnvDouble
+        | blf_core::ObjectType::EnvString
+        | blf_core::ObjectType::EnvData => {
+            let text_of = |name: &str| {
+                object
+                    .fields
+                    .iter()
+                    .find_map(|(field, value)| match (field.as_str(), value) {
+                        ("name", FieldValue::String(text)) if name == "name" => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("")
+            };
+            let data = object
+                .fields
+                .iter()
+                .find_map(|(name, value)| match (name.as_str(), value) {
+                    ("data", FieldValue::Bytes(bytes)) => Some(bytes.as_slice()),
+                    _ => None,
+                })
+                .unwrap_or(&[]);
+            let value = String::from_utf8_lossy(data)
+                .trim_end_matches('\0')
+                .to_string();
+            Some(
+                BusEvent::new("-", "var")
+                    .text(format!("{} = {value}", text_of("name")))
+                    .done(),
+            )
+        }
+        blf_core::ObjectType::GpsEvent => {
+            // Coordinates arrive as scaled integers in the format.
+            Some(
+                BusEvent::new("-", "gps")
+                    .channel(channel)
+                    .text(format!(
+                        "ch {} position {:.6} / {:.6}, altitude {} m, speed {} km/h, course {}",
+                        channel.unwrap_or(0),
+                        (field("latitude").unwrap_or(0) as i64) as f64 / 1e7,
+                        (field("longitude").unwrap_or(0) as i64) as f64 / 1e7,
+                        field("altitude").unwrap_or(0),
+                        field("speed").unwrap_or(0),
+                        field("course").unwrap_or(0)
+                    ))
+                    .done(),
+            )
+        }
+        blf_core::ObjectType::WaterMarkEvent => Some(
+            BusEvent::new("-", "watermark")
+                .text(format!("queue state {}", field("queueState").unwrap_or(0)))
+                .done(),
+        ),
+        blf_core::ObjectType::TriggerCondition => {
+            let text_of = |wanted: &str| {
+                object
+                    .fields
+                    .iter()
+                    .find_map(|(field, value)| match (field.as_str(), value) {
+                        (name, FieldValue::String(text)) if name == wanted => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("")
+            };
+            Some(
+                BusEvent::new("-", "trigger")
+                    .text(format!(
+                        "trigger condition state {}, block {}: {}",
+                        field("state").unwrap_or(0),
+                        text_of("triggerBlockName"),
+                        text_of("triggerCondition")
+                    ))
+                    .done(),
+            )
+        }
+        blf_core::ObjectType::FunctionBus => {
+            let text_of = |wanted: &str| {
+                object
+                    .fields
+                    .iter()
+                    .find_map(|(field, value)| match (field.as_str(), value) {
+                        (name, FieldValue::String(text)) if name == wanted => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("")
+            };
+            Some(
+                BusEvent::new("func", "bus")
+                    .text(format!(
+                        "{} = {}",
+                        text_of("name"),
+                        String::from_utf8_lossy(
+                            object
+                                .fields
+                                .iter()
+                                .find_map(|(name, value)| match (name.as_str(), value) {
+                                    ("data", FieldValue::Bytes(bytes)) => Some(bytes.as_slice()),
+                                    _ => None,
+                                })
+                                .unwrap_or(&[])
+                        )
+                        .trim_end_matches('\0')
+                    ))
+                    .done(),
+            )
+        }
+        blf_core::ObjectType::DistributedObjectMember => {
+            let text_of = |wanted: &str| {
+                object
+                    .fields
+                    .iter()
+                    .find_map(|(field, value)| match (field.as_str(), value) {
+                        (name, FieldValue::String(text)) if name == wanted => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("")
+            };
+            Some(
+                BusEvent::new("-", "member")
+                    .text(format!(
+                        "distributed member {} (type {} detail {})",
+                        text_of("path"),
+                        field("memberType").unwrap_or(0),
+                        field("detailType").unwrap_or(0)
+                    ))
+                    .done(),
+            )
+        }
+        blf_core::ObjectType::AttributeEvent => {
+            let text_of = |wanted: &str| {
+                object
+                    .fields
+                    .iter()
+                    .find_map(|(field, value)| match (field.as_str(), value) {
+                        (name, FieldValue::String(text)) if name == wanted => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("")
+            };
+            Some(
+                BusEvent::new("-", "attribute")
+                    .text(format!(
+                        "attribute {} of {}{} changed",
+                        text_of("attributeDefinitionPath"),
+                        text_of("mainAttributableObjectPath"),
+                        if text_of("memberPath").is_empty() {
+                            String::new()
+                        } else {
+                            format!(".{}", text_of("memberPath"))
+                        }
+                    ))
+                    .done(),
+            )
+        }
+        blf_core::ObjectType::DistributedObjectChange => Some(
+            BusEvent::new("-", "change")
+                .text(format!(
+                    "distributed object change, {} bytes",
+                    field("dataLength").unwrap_or(0)
+                ))
+                .done(),
+        ),
+
         // ---- data integrity: a lost frame or an overrun means the capture is
         // not complete, so these must never be silent rows. ----
         blf_core::ObjectType::DataLostBegin => Some(
@@ -5637,6 +6550,15 @@ fn foreign_row(summary: &MessageSummary, axis: TimeAxis, pool: &TextPool) -> Str
     let description = if let Some(info) = &summary.ethernet {
         let text = pool.get(info.summary);
         format!("eth 0x{:04X} {}", info.ether_type, short_summary(text))
+    } else if let Some(event) = &summary.event {
+        // A record without payload has no frame columns; keep its decoded text
+        // so a foreign bus row still says what happened.
+        format!(
+            "{} {}: {}",
+            summary.bus_label,
+            event.kind,
+            short_summary(&event.summary)
+        )
     } else {
         format!(
             "{} {} {}",
@@ -5689,10 +6611,30 @@ fn message_color(summary: &MessageSummary, text: String) -> String {
         return match summary.bus {
             Some(BusKind::Can) => paint(text, ANSI_BRIGHT_GREEN),
             Some(BusKind::Lin) => paint(text, ANSI_MAGENTA),
-            None => paint(text, ANSI_WHITE),
+            None => match summary.bus_label {
+                "eth" => paint(text, ANSI_BRIGHT_BLUE),
+                // The remaining buses each get their own hue so a mixed trace
+                // stays scannable without reading every label.
+                "most" => paint(text, ANSI_BRIGHT_MAGENTA),
+                "flexray" => paint(text, ANSI_BRIGHT_YELLOW),
+                "afdx" => paint(text, ANSI_CYAN),
+                "a429" => paint(text, ANSI_BRIGHT_CYAN),
+                "wlan" => paint(text, ANSI_GREEN),
+                "kline" | "j1708" => paint(text, ANSI_YELLOW),
+                _ => paint(text, ANSI_WHITE),
+            },
         };
     }
     match summary.status {
+        // A lost-object record is the one thing the user must not miss.
+        "event"
+            if matches!(
+                summary.event.as_ref().map(|event| event.kind),
+                Some("LOST" | "OVERRUN")
+            ) =>
+        {
+            paint(text, ANSI_BRIGHT_RED)
+        }
         "event" => paint(text, ANSI_CYAN),
         "header_only" | "no_response" | "unsupported" => paint(text, ANSI_BRIGHT_YELLOW),
         _ => paint(text, ANSI_RED),
@@ -8463,7 +9405,8 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
         app.selected = 0;
 
         let mut lines = Vec::new();
-        app.render_messages(&mut lines, 80, 24);
+        // A preview pane only exists above the minimum width.
+        app.render_messages(&mut lines, 120, 24);
         // Strip the message list column so only the preview text remains.
         let preview = lines
             .iter()
@@ -10322,5 +11265,268 @@ mod record_display_tests {
         assert!(event.summary.contains("lost 9 objects"), "{event:?}");
         // The header warning is driven by the same total.
         assert_eq!(count_lost_objects(&[lost]), (9, 1));
+    }
+}
+
+#[cfg(test)]
+mod bus_family_tests {
+    use super::*;
+    use blf_core::{
+        ObjectHeader2, ObjectHeaderBase, ObjectType, RawObjectHeader, StructuredObject,
+    };
+
+    fn strip_ansi(value: &str) -> String {
+        let mut out = String::with_capacity(value.len());
+        let mut chars = value.chars();
+        while let Some(character) = chars.next() {
+            if character != '\x1b' {
+                out.push(character);
+                continue;
+            }
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    fn header2(object_type: ObjectType) -> RawObjectHeader {
+        RawObjectHeader::Object2(ObjectHeader2 {
+            base: ObjectHeaderBase {
+                signature: blf_core::OBJECT_SIGNATURE,
+                header_size: 40,
+                header_version: 2,
+                object_size: 96,
+                object_type,
+                raw_object_type: object_type.as_u32(),
+            },
+            object_flags: 2,
+            time_stamp_status: 0,
+            reserved_object_header: 0,
+            object_version: 0,
+            object_time_stamp: 1_000_000,
+            original_time_stamp: 0,
+        })
+    }
+
+    fn structured(object_type: ObjectType, fields: Vec<(&str, FieldValue)>) -> Object {
+        Object::Structured(StructuredObject {
+            object_type,
+            header: header2(object_type),
+            class_name: object_type.name().to_string(),
+            fields: fields
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value))
+                .collect(),
+            extensions: Vec::new(),
+            data: Vec::new(),
+        })
+    }
+
+    /// Every bus family must produce a readable line and carry its own label.
+    #[test]
+    fn each_bus_family_decodes_a_representative_record() {
+        let cases: Vec<(Object, &str, &str)> = vec![
+            (
+                structured(
+                    ObjectType::MostCtrl,
+                    vec![
+                        ("channel", FieldValue::U16(1)),
+                        ("dir", FieldValue::U8(1)),
+                        ("sourceAdr", FieldValue::U32(0x400)),
+                        ("destAdr", FieldValue::U32(0x401)),
+                        ("rTyp", FieldValue::U16(3)),
+                        ("rTypAdr", FieldValue::U8(0x20)),
+                        ("state", FieldValue::U8(0x11)),
+                        ("ackNack", FieldValue::U8(0x10)),
+                    ],
+                ),
+                "most",
+                "allocate",
+            ),
+            (
+                structured(
+                    ObjectType::MostNetstate,
+                    vec![
+                        ("channel", FieldValue::U16(1)),
+                        ("stateNew", FieldValue::U16(5)),
+                        ("stateOld", FieldValue::U16(2)),
+                    ],
+                ),
+                "most",
+                "configuration ok",
+            ),
+            (
+                structured(
+                    ObjectType::FlexrayMessage,
+                    vec![
+                        ("channel", FieldValue::U16(3)),
+                        ("frameId", FieldValue::U16(12)),
+                        ("cycle", FieldValue::U8(7)),
+                        ("length", FieldValue::U16(16)),
+                        ("frameFlags", FieldValue::U32(0x06)),
+                        ("frameState", FieldValue::U8(0x20)),
+                    ],
+                ),
+                "flexray",
+                "A+B",
+            ),
+            (
+                structured(
+                    ObjectType::AfdxBusStatistic,
+                    vec![
+                        ("channel", FieldValue::U16(2)),
+                        ("line", FieldValue::U8(1)),
+                        ("linkStatus", FieldValue::U8(2)),
+                        ("linkSpeed", FieldValue::U16(1)),
+                        ("statRxPacketCount", FieldValue::U32(10)),
+                        ("statTxPacketCount", FieldValue::U32(20)),
+                    ],
+                ),
+                "afdx",
+                "100 Mbit/s",
+            ),
+            (
+                structured(
+                    ObjectType::A429Status,
+                    vec![
+                        ("channel", FieldValue::U16(4)),
+                        ("parity", FieldValue::U16(3)),
+                        ("bitrate", FieldValue::U32(100_000)),
+                    ],
+                ),
+                "a429",
+                "even",
+            ),
+            (
+                structured(
+                    ObjectType::WlanFrame,
+                    vec![
+                        ("channel", FieldValue::U16(1)),
+                        ("flags", FieldValue::U32(0x01)),
+                        ("frameLength", FieldValue::U16(64)),
+                    ],
+                ),
+                "wlan",
+                "beacon",
+            ),
+            (
+                structured(
+                    ObjectType::KlineStatusEvent,
+                    vec![
+                        ("port", FieldValue::U16(2)),
+                        ("type", FieldValue::U32(0)),
+                        ("dataLen", FieldValue::U16(0)),
+                    ],
+                ),
+                "kline",
+                "wake-up pattern",
+            ),
+            (
+                structured(
+                    ObjectType::J1708Message,
+                    vec![
+                        ("channel", FieldValue::U16(1)),
+                        ("size", FieldValue::U8(2)),
+                        ("data", FieldValue::Bytes(vec![0xAA, 0xBB])),
+                    ],
+                ),
+                "j1708",
+                "AA BB",
+            ),
+            (
+                structured(
+                    ObjectType::GpsEvent,
+                    vec![
+                        ("channel", FieldValue::U16(1)),
+                        ("latitude", FieldValue::U32(486_000_000)),
+                        ("longitude", FieldValue::U32(90_000_000)),
+                    ],
+                ),
+                "-",
+                "48.600000",
+            ),
+        ];
+        let axis = TimeAxis {
+            mode: TimeMode::Absolute,
+            base: 0,
+        };
+        for (object, expected_bus, expected_text) in cases {
+            let mut pool = TextPool::default();
+            let summary = summary_for(0, &object, &mut pool);
+            let event = summary
+                .event
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} has no event", summary.class_name));
+            assert_eq!(
+                event.bus_label, expected_bus,
+                "{} label",
+                summary.class_name
+            );
+            assert!(
+                event.summary.contains(expected_text),
+                "{}: {}",
+                summary.class_name,
+                event.summary
+            );
+            // The row renders without the frame columns and keeps the text.
+            let row = view_row(&summary, View::All, axis, &pool, 120);
+            assert!(row.contains(&summary.class_name[..1]) || !row.is_empty());
+            let line = summary_line(&summary, axis, &pool);
+            assert!(!line.is_empty(), "{} row", summary.class_name);
+        }
+    }
+
+    #[test]
+    fn lost_object_rows_are_marked_for_attention() {
+        let object = structured(
+            ObjectType::MostDatalost,
+            vec![
+                ("channel", FieldValue::U16(1)),
+                ("lostMsgsCtrl", FieldValue::U32(3)),
+                ("lostMsgsAsync", FieldValue::U32(4)),
+            ],
+        );
+        let mut pool = TextPool::default();
+        let summary = summary_for(0, &object, &mut pool);
+        let event = summary.event.as_ref().expect("event");
+        assert_eq!(event.kind, "LOST");
+        assert!(event.summary.contains("lost 7 messages"), "{event:?}");
+        // The header warning counts these too.
+        assert_eq!(count_lost_objects(&[object]), (0, 0));
+    }
+
+    #[test]
+    fn narrow_terminals_drop_the_preview_pane() {
+        let mut app = App::new(None, Vec::new(), Vec::new()).expect("build app");
+        app.mode = Mode::Messages;
+        app.viewport_width = 80;
+        app.viewport_height = 24;
+        let mut lines = Vec::new();
+        app.render_messages(&mut lines, 80, 24);
+        let plain = lines
+            .iter()
+            .map(|line| strip_ansi(line))
+            .collect::<Vec<_>>();
+        // No pane divider and no preview heading below the threshold.
+        assert!(
+            !plain.iter().any(|line| line.contains("Preview")),
+            "preview heading should be hidden: {plain:?}"
+        );
+        assert!(
+            !plain.iter().any(|line| line.contains('│')),
+            "pane divider should be hidden: {plain:?}"
+        );
+
+        // A wide terminal keeps both panes.
+        let mut lines = Vec::new();
+        app.render_messages(&mut lines, 140, 24);
+        let plain = lines
+            .iter()
+            .map(|line| strip_ansi(line))
+            .collect::<Vec<_>>();
+        assert!(plain.iter().any(|line| line.contains("Preview")));
     }
 }

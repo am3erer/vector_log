@@ -423,6 +423,346 @@ pub fn app_text_trace_line(flags: u32) -> String {
     )
 }
 
+/// Control-message sub type of a MOST25 message, `VBLMOSTCtrl::mRTyp`.
+pub fn most_control_sub_type_name(value: u16) -> &'static str {
+    match value {
+        0 => "normal",
+        1 => "remote read",
+        2 => "remote write",
+        3 => "allocate",
+        4 => "deallocate",
+        5 => "get source",
+        _ => "unused",
+    }
+}
+
+/// Addressing mode of a MOST25 control message, `VBLMOSTCtrl::mRTypAdr`.
+pub fn most_addressing_mode_name(value: u8) -> &'static str {
+    match value {
+        0x00 => "device",
+        0x10 => "node position",
+        0x20 => "broadcast",
+        0x30 => "group cast",
+        _ => "unknown",
+    }
+}
+
+/// Transmission state of a MOST25 record, `VBLMOSTSpy::mState`.
+pub fn most25_state_text(value: u8) -> String {
+    let mut parts = vec![if value & 0x01 != 0 {
+        "bus active"
+    } else {
+        "bus inactive"
+    }];
+    if value & 0x02 != 0 {
+        parts.push("unlock");
+    }
+    if value & 0x10 != 0 {
+        parts.push("ack");
+    }
+    if value & 0x20 != 0 {
+        parts.push("nack");
+    }
+    if value & 0x40 != 0 {
+        parts.push("send ok");
+    } else {
+        parts.push("send error");
+    }
+    parts.join(", ")
+}
+
+/// Transmission state of a MOST50/150 record.
+pub fn most50_state_text(value: u8) -> String {
+    let mut parts = vec![if value & 0x01 != 0 {
+        "bus active"
+    } else {
+        "bus inactive"
+    }];
+    if value & 0x10 != 0 {
+        parts.push("ack");
+    }
+    if value & 0x20 != 0 {
+        parts.push("nack");
+    }
+    if value & 0x40 != 0 {
+        parts.push("send ok");
+    } else {
+        parts.push("send error");
+    }
+    parts.join(", ")
+}
+
+/// Acknowledge code of a control message, `mAckNack`.
+pub fn most_ack_text(value: u8) -> String {
+    let mut parts = Vec::new();
+    if value & 0x01 != 0 {
+        parts.push("no response");
+    }
+    if value & 0x02 != 0 {
+        parts.push("valid");
+    }
+    if value & 0x04 != 0 {
+        parts.push("CRC error");
+    }
+    if value & 0x08 != 0 {
+        parts.push("rx buffer full");
+    }
+    if value & 0x10 != 0 {
+        parts.push("ack");
+    }
+    if value & 0x20 != 0 {
+        parts.push("nack");
+    }
+    if parts.is_empty() {
+        "-".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// Network state of the MOST supervisor, `VBLMOSTNetState::mStateNew`.
+pub fn most_net_state_name(value: u16) -> &'static str {
+    match value {
+        0 => "undefined",
+        1 => "ring break diagnostics",
+        2 => "power off",
+        3 => "net interface init",
+        4 => "configuration not ok",
+        5 => "configuration ok",
+        6 => "net on / init ready",
+        _ => "unknown state",
+    }
+}
+
+/// Operation of a register event, `VBLMOSTReg::mSubType`.
+pub fn most_register_sub_type_name(value: u32) -> &'static str {
+    match value {
+        0 => "unspecified",
+        1 => "notify",
+        2 => "read request",
+        3 => "write request",
+        4 => "read result",
+        5 => "write result",
+        6 => "read failed",
+        7 => "write failed",
+        _ => "unknown operation",
+    }
+}
+
+/// Register identifier of a `VBLMOSTGenReg` record.
+pub fn most_register_id_name(value: u32) -> &'static str {
+    match value {
+        0x0 => "empty",
+        0x87 => "node position",
+        0x89 => "group address",
+        0x8A => "node address",
+        0x8F => "node delay",
+        0x90 => "open bypass count",
+        _ => "other register",
+    }
+}
+
+/// Transfer type of a MOST packet, `VBLMOSTPkt::mTransferType`.
+pub fn most_transfer_type_name(value: u8) -> &'static str {
+    match value {
+        0 => "node",
+        1 => "spy",
+        2 => "error",
+        _ => "unknown",
+    }
+}
+
+/// Asynchronous-channel priority, `VBLMOSTPkt::mPriority`.
+pub fn most_priority_name(value: u32) -> &'static str {
+    match value {
+        0 => "low",
+        1 => "high",
+        2 => "system",
+        _ => "unknown",
+    }
+}
+
+/// FlexRay channel selection, `mChannelMask`.
+pub fn flexray_channel_name(value: u16) -> &'static str {
+    match value {
+        0 => "invalid",
+        1 => "A",
+        2 => "B",
+        3 => "A+B",
+        _ => "unknown",
+    }
+}
+
+/// Communication controller type, `mTag`.
+pub fn flexray_cc_type_name(value: u32) -> &'static str {
+    match value {
+        0 => "architecture independent",
+        2 => "Cyclone I",
+        3 => "BUSDOCTOR",
+        4 => "Cyclone II",
+        5 => "Vector VN interface",
+        6 => "VN sync pulse",
+        _ => "unknown controller",
+    }
+}
+
+/// Declared flags of a FlexRay frame, `mFrameFlags` bits 0-6.
+pub fn flexray_frame_flags_text(flags: u32) -> String {
+    let mut parts = Vec::new();
+    if flags & 0x01 != 0 {
+        parts.push("null frame");
+    }
+    if flags & 0x02 != 0 {
+        parts.push("valid data");
+    }
+    if flags & 0x04 != 0 {
+        parts.push("sync");
+    }
+    if flags & 0x08 != 0 {
+        parts.push("startup");
+    }
+    if flags & 0x10 != 0 {
+        parts.push("payload preamble");
+    }
+    if flags & 0x20 != 0 {
+        parts.push("reserved bit");
+    }
+    if flags & 0x40 != 0 {
+        parts.push("error");
+    }
+    if parts.is_empty() {
+        "-".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// Frame state of a FlexRay V6 message, `mFrameState`, for the VN interface.
+pub fn flexray_frame_state_text(value: u8) -> String {
+    let mut parts = Vec::new();
+    if value & 0x01 != 0 {
+        parts.push("syntax error");
+    }
+    if value & 0x02 != 0 {
+        parts.push("content error");
+    }
+    if value & 0x04 != 0 {
+        parts.push("slot boundary violation");
+    }
+    if value & 0x08 != 0 {
+        parts.push("empty slot");
+    }
+    if value & 0x10 != 0 {
+        parts.push("message lost");
+    }
+    if value & 0x20 != 0 {
+        parts.push("valid");
+    }
+    if value & 0x40 != 0 {
+        parts.push("tx conflict");
+    }
+    if value & 0x80 != 0 {
+        parts.push("framing error");
+    }
+    if parts.is_empty() {
+        "-".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// Direction of a FlexRay record, `mDir`.
+pub fn flexray_direction_name(value: u8) -> &'static str {
+    match value {
+        0 => "Rx",
+        1 => "Tx",
+        2 => "TxRq",
+        _ => "unknown",
+    }
+}
+
+/// Link speed of an AFDX adapter, `VBLAfdxBusStatistic::mLinkSpeed`.
+pub fn afdx_link_speed_name(value: u16) -> &'static str {
+    match value {
+        0 => "10 Mbit/s",
+        1 => "100 Mbit/s",
+        2 => "1000 Mbit/s",
+        _ => "unknown",
+    }
+}
+
+/// Protocol parity of an A429 channel, `VBLA429Status::mParity`.
+pub fn a429_parity_name(value: u16) -> &'static str {
+    match value {
+        0 => "hardware default",
+        1 => "disabled",
+        2 => "odd",
+        3 => "even",
+        4 => "mark",
+        5 => "space",
+        _ => "unknown parity",
+    }
+}
+
+/// Severity of an A429 error event, `VBLA429ErrorEvent::mErrorType`.
+pub fn a429_error_type_name(value: u16) -> &'static str {
+    match value {
+        0 => "error",
+        1 => "warning",
+        2 => "informational",
+        _ => "unknown severity",
+    }
+}
+
+/// Category of a WLAN frame, from `VBLWlanFrame::mFlags`.
+pub fn wlan_frame_flags_text(flags: u32) -> String {
+    let mut parts = Vec::new();
+    if flags & 0x01 != 0 {
+        parts.push("beacon");
+    }
+    if flags & 0x02 != 0 {
+        parts.push("management");
+    }
+    if flags & 0x04 != 0 {
+        parts.push("data");
+    }
+    if flags & 0x08 != 0 {
+        parts.push("control");
+    }
+    if flags & 0x10 != 0 {
+        parts.push("retry");
+    }
+    if flags & 0x20 != 0 {
+        parts.push("tx");
+    }
+    if parts.is_empty() {
+        "-".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+/// State reported by a K-Line status event, `VBLKLineStatusEvent::mType`.
+pub fn kline_status_name(value: u32) -> &'static str {
+    match value {
+        0 => "wake-up pattern",
+        1 => "wake-up pattern finished",
+        2 => "communication started",
+        3 => "communication stopped",
+        _ => "unknown status",
+    }
+}
+
+/// Kind of a J1708 payload, from `VBLJ1708Message::mType`.
+pub fn j1708_type_name(value: u8) -> &'static str {
+    match value {
+        0 => "MID",
+        1 => "PID",
+        2 => "data",
+        _ => "unknown",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

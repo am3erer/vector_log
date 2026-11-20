@@ -17,3 +17,5 @@ __pycache__/
 /.venv-cm/
 # Official Vector BLF_Dump sample: local reference build, not part of the crate
 /blf_dump/
+/.venv-m/
+/.venv-ref/

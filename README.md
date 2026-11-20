@@ -47,6 +47,16 @@ diagnostic objects, including:
 - A capture that reports lost objects says so in the list header
   (`⚠ LOST n objects`), because `DataLostEnd` and `OverrunError` mean the trace
   is incomplete.
+- Every object type of the format has a decoded row, including the buses this
+  project does not analyse deeply: MOST (`allocate` / `remote read` sub types,
+  addressing modes, net state, register operations, lost-message counts),
+  FlexRay (channel A+B, slot/cycle, frame flags and VN frame state), AFDX
+  (line A/B link state, BAG, packet counters), A429 (parity, bitrate, word
+  errors), WLAN, K-Line and J1708. A mixed trace therefore never shows a blank
+  line, and each bus family has its own colour.
+- A narrow terminal drops the preview pane instead of squeezing both halves:
+  below 100 columns the list takes the whole width, so the frame columns stay
+  readable on an 80-column window.
 - Records that are not frames are decoded as well, with the names from the
   logging format documents: CAN driver errors (`chip state bus off`, `receive
   queue overrun`, ...), CAN error frames (Vector CAN core codes such as `CRC
@@ -60,6 +70,11 @@ diagnostic objects, including:
 - Every object type of the logging format is decoded: all 123 type ids of the
   official `binlog` header map to a field schema, a typed struct or a LIN
   record, and a unit test walks the enum to keep it that way.
+- Three independent readers cross-check one another: Vector's own `binlog`
+  library (`blf_dump/`), the C++ `Technica-Engineering/vector_blf` reader and
+  the Python `python-can` BLF reader. All agree with this implementation on the
+  sample capture — object counts, every CAN frame (channel, identifier,
+  direction, DLC and payload) and the identifier histogram.
 - The layouts are checked against Vector's own `binlog` library. Two fixtures
   written through its `BLWriteObject` API hold one instance of each writable
   type with every scalar field set to a distinctive value (87 types with a

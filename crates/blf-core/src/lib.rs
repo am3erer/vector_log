@@ -33,12 +33,18 @@ pub use ethernet::{
     EthernetField, EthernetHeader,
 };
 pub use events::{
-    app_text_channel_info, app_text_source_name, app_text_text, app_text_trace_line,
-    can_driver_error_name, can_error_code_name, can_error_direction_name, can_fd_flags_text,
-    can_message_direction_name, can_message_flags_text, ethernet_rx_error_name, ethernet_sqi_name,
-    lin_checksum_model_name, lin_disturbance_type_name, lin_long_dom_signal_type_name,
-    lin_sleep_flags_text, lin_sleep_reason_name, lin_spike_origin_name, lin_wakeup_length_name,
-    sysvar_type_name, sysvar_value_text, trace_line_source_name,
+    a429_error_type_name, a429_parity_name, afdx_link_speed_name, app_text_channel_info,
+    app_text_source_name, app_text_text, app_text_trace_line, can_driver_error_name,
+    can_error_code_name, can_error_direction_name, can_fd_flags_text, can_message_direction_name,
+    can_message_flags_text, ethernet_rx_error_name, ethernet_sqi_name, flexray_cc_type_name,
+    flexray_channel_name, flexray_direction_name, flexray_frame_flags_text,
+    flexray_frame_state_text, j1708_type_name, kline_status_name, lin_checksum_model_name,
+    lin_disturbance_type_name, lin_long_dom_signal_type_name, lin_sleep_flags_text,
+    lin_sleep_reason_name, lin_spike_origin_name, lin_wakeup_length_name, most25_state_text,
+    most50_state_text, most_ack_text, most_addressing_mode_name, most_control_sub_type_name,
+    most_net_state_name, most_priority_name, most_register_id_name, most_register_sub_type_name,
+    most_transfer_type_name, sysvar_type_name, sysvar_value_text, trace_line_source_name,
+    wlan_frame_flags_text,
 };
 pub use ldf::{
     decode_lin_frame, decode_lin_object, decode_lin_signal, protected_identifier,

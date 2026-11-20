@@ -357,3 +357,156 @@ fn real_capture_driver_errors_and_statistics_decode() {
     }
     assert_eq!(statistics, 5_022);
 }
+
+/// Map a CAN FD payload length back to its DLC code.
+///
+/// python-can reports the byte count, the BLF stores the four-bit code; both
+/// describe the same frame and only the encoding differs.
+fn len_to_dlc(bytes: u8) -> u8 {
+    match bytes {
+        0..=8 => bytes,
+        12 => 9,
+        16 => 10,
+        20 => 11,
+        24 => 12,
+        32 => 13,
+        48 => 14,
+        64 => 15,
+        other => other,
+    }
+}
+
+/// Payload length of a CAN FD DLC code.
+fn dlc_to_len(code: u8) -> usize {
+    match code {
+        0..=8 => usize::from(code),
+        9 => 12,
+        10 => 16,
+        11 => 20,
+        12 => 24,
+        13 => 32,
+        14 => 48,
+        15 => 64,
+        _ => usize::from(code),
+    }
+}
+
+#[test]
+fn real_capture_can_frames_match_python_can() {
+    // python-can is an independent Python implementation; the channel it
+    // reports is zero-based, ours is one-based.
+    let Some(path) = capture_path() else {
+        eprintln!("skipping: capture not present");
+        return;
+    };
+    let golden = golden("can_frames.python-can.txt");
+    let mut expected_frames: Vec<String> = Vec::new();
+    let mut expected_total = None;
+    let mut expected_ids = BTreeMap::new();
+    for line in golden.lines() {
+        if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = line.split_whitespace().collect();
+        match f[0] {
+            // frame <channel> <id> <extended> <remote> <rx> <dlc> <data>
+            "frame" => {
+                let bytes: u8 = f[6].parse().unwrap();
+                let data = &f[7][..usize::from(bytes) * 2];
+                expected_frames.push(format!(
+                    "{} 0x{} {} {} {} {} {data}",
+                    f[1].parse::<u32>().unwrap() + 1,
+                    f[2].trim_start_matches("0x"),
+                    f[3],
+                    f[4],
+                    f[5],
+                    len_to_dlc(bytes),
+                ));
+            }
+            "total" => expected_total = Some(f[1].parse::<i64>().unwrap()),
+            "distinct_ids" => {}
+            // count <id> <n>
+            "count" => {
+                expected_ids.insert(f[1].to_string(), f[2].parse::<i64>().unwrap());
+            }
+            other => panic!("unexpected golden kind {other}"),
+        }
+    }
+
+    let mut reader = File::open(&path).unwrap();
+    let mut frames: Vec<String> = Vec::new();
+    let mut total = 0_i64;
+    let mut counts: BTreeMap<String, i64> = BTreeMap::new();
+    while let Some(object) = reader.read().unwrap() {
+        let (channel, raw_id, flags, dlc, data): (u16, u32, u8, u8, Vec<u8>) = match &object {
+            Object::CanMessage(value) => (
+                value.channel,
+                value.id,
+                value.flags,
+                value.dlc,
+                value.data.to_vec(),
+            ),
+            Object::CanMessage2(value) => (
+                value.channel,
+                value.id,
+                value.flags,
+                value.dlc,
+                value.data.clone(),
+            ),
+            Object::CanFdMessage(value) => (
+                value.channel,
+                value.id,
+                value.flags,
+                value.dlc,
+                value.data.to_vec(),
+            ),
+            Object::CanFdMessage64(value) => (
+                u16::from(value.channel),
+                value.id,
+                // The direction lives in `dir`, not in the FD flag word.
+                value.dir,
+                value.dlc,
+                value.data.clone(),
+            ),
+            _ => continue,
+        };
+        total += 1;
+        let extended = raw_id & 0x8000_0000 != 0;
+        let id = raw_id & 0x1FFF_FFFF;
+        *counts.entry(format!("0x{id:03X}")).or_default() += 1;
+        if frames.len() < expected_frames.len() {
+            let length = dlc_to_len(dlc).min(data.len());
+            frames.push(format!(
+                "{} 0x{:X} {} {} {} {} {}",
+                channel,
+                id,
+                u8::from(extended),
+                u8::from(flags & 0x80 != 0),
+                u8::from(flags & 0x0F == 0),
+                dlc,
+                data[..length]
+                    .iter()
+                    .map(|byte| format!("{byte:02X}"))
+                    .collect::<String>()
+            ));
+        }
+    }
+
+    assert_eq!(Some(total), expected_total, "frame count");
+    assert_eq!(
+        counts.len(),
+        expected_ids.len(),
+        "distinct identifier count"
+    );
+    for (id, want) in &expected_ids {
+        assert_eq!(
+            counts.get(id).copied().unwrap_or(0),
+            *want,
+            "frames of {id}"
+        );
+    }
+    assert_eq!(frames.len(), expected_frames.len());
+    for (index, (ours, theirs)) in frames.iter().zip(expected_frames.iter()).enumerate() {
+        assert_eq!(ours, theirs, "frame {index}");
+    }
+}
