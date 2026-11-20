@@ -3,6 +3,7 @@ use std::env;
 use std::fmt::Write as _;
 use std::fs::{File as StdFile, OpenOptions};
 use std::io::{self, BufWriter, IsTerminal, Read, Write};
+use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -579,6 +580,12 @@ impl RawTerminal {
     }
 
     fn size(&self) -> (usize, usize) {
+        use std::os::fd::AsRawFd;
+        // The ioctl is the authoritative answer; `stty` is only a fallback and
+        // the last resort is a size no test ever wants to hit.
+        if let Some(size) = terminal_size_from_kernel(self.tty.as_raw_fd()) {
+            return size;
+        }
         command_output_with_stdin("stty", &["size"], &self.tty)
             .ok()
             .and_then(|value| parse_terminal_size(&value))
@@ -2615,11 +2622,7 @@ impl App {
         ));
         lines.push(paint(
             if show_preview {
-                format!(
-                    "{}─┼{}",
-                    "─".repeat(split),
-                    "─".repeat(width.saturating_sub(split + 1))
-                )
+                two_column_separator(split, width)
             } else {
                 "─".repeat(width)
             },
@@ -2677,17 +2680,23 @@ impl App {
                 })
                 .unwrap_or_default();
             let right = preview.get(row).cloned().unwrap_or_default();
+            // The highlight covers the list pane only; the preview stays plain
+            // so a selected row cannot be mistaken for two selected columns.
+            if selected {
+                lines.push(if show_preview {
+                    two_column_selected(&left, &right, split, width)
+                } else {
+                    paint_selected(pad_to_width(&strip_ansi(&truncate(&left, width)), width))
+                });
+                continue;
+            }
             let line = if show_preview {
                 two_column(&left, &right, split, width)
             } else {
                 pad_to_width(&truncate(&left, width), width)
             };
-            // A selected row is reverse video over plain text: the per-column
-            // colours would reset the attribute mid-row, so they are dropped
-            // first. A record that failed to decode keeps one alarming colour.
-            lines.push(if selected {
-                paint_selected(strip_ansi(&line))
-            } else if let Some(summary) = summary {
+            // A record that failed to decode keeps one alarming colour.
+            lines.push(if let Some(summary) = summary {
                 if summary.status == "ok" {
                     line
                 } else {
@@ -6574,7 +6583,7 @@ fn view_row(
         .channel
         .map_or_else(|| "-".to_string(), |value| value.to_string());
     match view {
-        View::All => summary_line(summary, axis, pool),
+        View::All => summary_line(summary, axis, pool, width),
         View::Can => {
             if summary.event.is_some() {
                 return event_row(summary, View::Can, axis);
@@ -6637,7 +6646,7 @@ fn view_row(
                 if summary.event.is_some() {
                     return event_row(summary, View::Ethernet, axis);
                 }
-                return summary_line(summary, axis, pool);
+                return summary_line(summary, axis, pool, width);
             };
             let summary_text = pool.get(info.summary);
             let short = ethernet_info_text(summary_text, info.protocol);
@@ -6784,7 +6793,7 @@ fn short_summary(summary: &str) -> String {
         .join(" ")
 }
 
-fn summary_line(summary: &MessageSummary, axis: TimeAxis, pool: &TextPool) -> String {
+fn summary_line(summary: &MessageSummary, axis: TimeAxis, pool: &TextPool, width: usize) -> String {
     let time = axis.format(summary.timestamp_ns);
     let bus = summary.bus_label;
     let channel = summary
@@ -6804,8 +6813,10 @@ fn summary_line(summary: &MessageSummary, axis: TimeAxis, pool: &TextPool) -> St
     // Each column keeps its own colour so the list stays scannable; the width
     // check runs on the visible text, before the escape codes are added.
     let plain = format!("{time:>12} {bus:<3} {channel:>3} {id:>6} {direction:<3} {payload}");
-    if display_width(&plain) > 120 {
-        return truncate(&plain, 120);
+    // The row has to fit the pane it is drawn in; a fixed limit left the
+    // separator further right than the terminal on a narrow window.
+    if display_width(&plain) > width {
+        return truncate(&plain, width);
     }
     format!(
         "{} {} {} {} {} {}",
@@ -7975,6 +7986,49 @@ fn split_first_word(value: &str) -> (&str, &str) {
     }
 }
 
+/// Terminal size straight from the kernel.
+///
+/// `stty size` needs a working child process and a PATH, and when it fails the
+/// viewer silently assumed 120x40, which breaks every column width on any other
+/// terminal. The `TIOCGWINSZ` ioctl is the authoritative answer; `stty` stays as
+/// a fallback for platforms where the call is unavailable.
+#[cfg(unix)]
+fn terminal_size_from_kernel(fd: RawFd) -> Option<(usize, usize)> {
+    #[repr(C)]
+    struct WinSize {
+        rows: u16,
+        cols: u16,
+        x_pixels: u16,
+        y_pixels: u16,
+    }
+    extern "C" {
+        fn ioctl(fd: i32, request: std::ffi::c_ulong, ...) -> i32;
+    }
+    // Linux and the BSDs differ; both values are the ones their headers define.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const TIOCGWINSZ: std::ffi::c_ulong = 0x5413;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    const TIOCGWINSZ: std::ffi::c_ulong = 0x4008_7468;
+
+    let mut size = WinSize {
+        rows: 0,
+        cols: 0,
+        x_pixels: 0,
+        y_pixels: 0,
+    };
+    // SAFETY: `size` is a correctly sized `winsize` and the fd is a live tty.
+    let result = unsafe { ioctl(fd, TIOCGWINSZ, &mut size as *mut WinSize) };
+    if result != 0 || size.rows == 0 || size.cols == 0 {
+        return None;
+    }
+    Some((usize::from(size.cols), usize::from(size.rows)))
+}
+
+#[cfg(not(unix))]
+fn terminal_size_from_kernel(_fd: RawFd) -> Option<(usize, usize)> {
+    None
+}
+
 fn command_output_with_stdin(
     program: &str,
     args: &[&str],
@@ -8166,8 +8220,31 @@ fn char_width(character: char) -> usize {
     }
 }
 
+/// Visible width of `value`, skipping escape sequences.
+///
+/// A coloured row carries four or five bytes per column, and counting those as
+/// printable made `truncate` cut the row short: the payload disappeared and the
+/// selection highlight ran into the preview pane.
 fn display_width(value: &str) -> usize {
-    value.chars().map(char_width).sum()
+    if !value.contains('\x1b') {
+        return value.chars().map(char_width).sum();
+    }
+    let mut width = 0;
+    let mut chars = value.chars();
+    while let Some(character) = chars.next() {
+        if character == '\x1b' {
+            if chars.next() == Some('[') {
+                for code in chars.by_ref() {
+                    if ('@'..='~').contains(&code) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        width += char_width(character);
+    }
+    width
 }
 
 fn truncate(value: &str, width: usize) -> String {
@@ -8176,6 +8253,11 @@ fn truncate(value: &str, width: usize) -> String {
     }
     if display_width(value) <= width {
         return value.to_string();
+    }
+    // A coloured row must be cut on a character boundary that is outside an
+    // escape sequence, which `truncate_ansi` already handles.
+    if value.contains('\x1b') {
+        return truncate_ansi(value, width);
     }
     if width <= 3 {
         return ".".repeat(width);
@@ -8341,6 +8423,34 @@ fn two_column(left: &str, right: &str, split: usize, width: usize) -> String {
     format!(
         "{} │ {}",
         pad_to_width(&truncate(left, split), split),
+        truncate(right, width.saturating_sub(split + 3))
+    )
+}
+
+/// Separator row whose `┼` sits exactly under the row divider.
+///
+/// A row is `left(padded to split) │ right`, so the divider is at `split + 1`.
+/// The previous formula put `┼` at `split` and made the row one column too wide.
+fn two_column_separator(split: usize, width: usize) -> String {
+    let split = split.min(width.saturating_sub(3));
+    format!(
+        "{}┼{}",
+        "─".repeat(split + 1),
+        "─".repeat(width.saturating_sub(split + 2))
+    )
+}
+
+/// Two panes with the left one highlighted.
+///
+/// The highlight stops at the divider: reversing the whole line made the
+/// selection look like it belonged to the preview column as well.
+fn two_column_selected(left: &str, right: &str, split: usize, width: usize) -> String {
+    let split = split.min(width.saturating_sub(3));
+    let plain = strip_ansi(&truncate(left, split));
+    format!(
+        "{}{} │ {}",
+        paint_selected(pad_to_width(&plain, split)),
+        ANSI_RESET,
         truncate(right, width.saturating_sub(split + 3))
     )
 }
@@ -10022,6 +10132,7 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
                 base: 0,
             },
             &pool,
+            120,
         );
         assert!(display_width(&line) <= 120);
         assert!(line.ends_with("..."));
@@ -10488,6 +10599,7 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
                 base: 0,
             },
             &pool,
+            120,
         );
         assert!(line.contains("eth"), "{line}");
         assert!(line.contains("0x0800"), "{line}");
@@ -11928,7 +12040,7 @@ mod bus_family_tests {
             // The row renders without the frame columns and keeps the text.
             let row = view_row(&summary, View::All, axis, &pool, 120);
             assert!(row.contains(&summary.class_name[..1]) || !row.is_empty());
-            let line = summary_line(&summary, axis, &pool);
+            let line = summary_line(&summary, axis, &pool, 120);
             assert!(!line.is_empty(), "{} row", summary.class_name);
         }
     }
@@ -12023,15 +12135,16 @@ mod layout_alignment {
                     continue;
                 }
                 let row = two_column("left", "right", split, width);
-                let separator = format!(
-                    "{}─┼{}",
-                    "─".repeat(split),
-                    "─".repeat(width.saturating_sub(split + 1))
-                );
+                let separator = two_column_separator(split, width);
                 assert_eq!(
                     bar_columns(&row),
                     bar_columns(&separator),
                     "width {width} split {split}"
+                );
+                assert_eq!(
+                    display_width(&separator),
+                    width,
+                    "separator should span width {width}"
                 );
             }
         }
@@ -12352,5 +12465,145 @@ mod theme_tests {
         let error = parse_args(&args).unwrap_err();
         assert!(error.contains("invalid theme"), "{error}");
         assert!(error.contains("light"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod render_width_tests {
+    use super::*;
+
+    fn app_with_rows(count: usize) -> App {
+        let mut app = App::new(None, Vec::new(), Vec::new()).expect("app");
+        app.mode = Mode::Messages;
+        for index in 0..count {
+            app.summaries.push(MessageSummary {
+                object_index: index,
+                timestamp_ns: Some(1_000_000_000 + index as u64 * 100_000_000),
+                timestamp_source: None,
+                bus: Some(BusKind::Can),
+                bus_label: "can",
+                ethernet: None,
+                event: None,
+                can_flags: 0,
+                channel: Some(1),
+                frame_id: Some(0x123),
+                object_type_raw: 1,
+                class_name: "CanMessage",
+                direction: Some("Tx"),
+                dlc: Some(8),
+                payload: (0..8).map(|byte| byte as u8).collect(),
+                status: "ok",
+            });
+        }
+        app.filtered = (0..count).collect();
+        app.selected = 0;
+        app
+    }
+
+    /// Every row the list draws must fit the pane it is given.
+    ///
+    /// A fixed limit in `summary_line` used to draw rows wider than the
+    /// terminal, which pushed the separator past the right edge.
+    #[test]
+    fn rows_never_exceed_the_requested_width() {
+        for width in [40usize, 60, 80, 100, 120, 160] {
+            for height in [16usize, 24, 40] {
+                let app = app_with_rows(8);
+                let mut lines = Vec::new();
+                app.render_messages(&mut lines, width, height);
+                for line in &lines {
+                    assert!(
+                        display_width(line) <= width,
+                        "width {width} height {height}: row is {} wide: {:?}",
+                        display_width(line),
+                        strip_ansi(line)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn titles_and_rules_follow_the_terminal_width() {
+        for width in [40usize, 60, 80, 100, 120, 160] {
+            let app = app_with_rows(3);
+            let mut lines = Vec::new();
+            app.render_messages(&mut lines, width, 24);
+            let plain: Vec<String> = lines.iter().map(|line| strip_ansi(line)).collect();
+            // The heading and the separator are the first two rows.
+            assert!(
+                display_width(&plain[0]) <= width,
+                "heading wider than {width}: {:?}",
+                plain[0]
+            );
+            let rule = &plain[2];
+            assert!(
+                rule.chars().all(|c| c == '─' || c == '┼'),
+                "second row is not a rule: {rule:?}"
+            );
+            assert_eq!(
+                display_width(rule),
+                width,
+                "rule should span the terminal at width {width}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_selected_row_highlights_only_the_list_pane() {
+        let app = app_with_rows(4);
+        let mut lines = Vec::new();
+        app.render_messages(&mut lines, 100, 24);
+        // Row 3 is the first data row (after heading, columns and rule).
+        let selected = &lines[3];
+        assert!(selected.contains(ANSI_SELECTED), "row is not highlighted");
+        // The highlight must be closed before the pane divider.
+        let after_highlight = selected
+            .split(ANSI_SELECTED)
+            .nth(1)
+            .expect("highlight start");
+        let inside = after_highlight
+            .split(ANSI_RESET)
+            .next()
+            .expect("highlight end");
+        let inside_plain = strip_ansi(inside);
+        assert!(
+            !inside_plain.contains('│'),
+            "highlight covers the divider: {inside_plain:?}"
+        );
+        assert!(
+            !inside_plain.contains("time:"),
+            "highlight covers the preview: {inside_plain:?}"
+        );
+    }
+
+    #[test]
+    fn width_measurement_ignores_escape_sequences() {
+        assert_eq!(display_width("abc"), 3);
+        assert_eq!(display_width("\x1b[32mabc\x1b[0m"), 3);
+        assert_eq!(display_width("\x1b[1m\x1b[96mabc\x1b[0m"), 3);
+        assert_eq!(display_width("\x1b[38;5;196mab\x1b[0m"), 2);
+        // Truncating a coloured string keeps the escape sequences intact.
+        let cut = truncate("\x1b[32mabcdef\x1b[0m", 4);
+        assert!(display_width(&cut) <= 4, "{cut:?}");
+        assert!(cut.contains("\x1b[32m"), "{cut:?}");
+        assert!(cut.contains(ANSI_RESET), "{cut:?}");
+        // A plain string keeps the old behaviour.
+        assert_eq!(truncate("abcdef", 4), "a...");
+    }
+
+    #[test]
+    fn the_terminal_size_ioctl_matches_a_known_pty() {
+        // The kernel answer is what the layout relies on; `stty` is only a
+        // fallback, so a wrong reading here breaks every column width.
+        let fd = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null");
+        // /dev/null is not a terminal, so the call must decline rather than lie.
+        if let Ok(file) = fd {
+            use std::os::fd::AsRawFd;
+            assert_eq!(terminal_size_from_kernel(file.as_raw_fd()), None);
+        }
     }
 }
