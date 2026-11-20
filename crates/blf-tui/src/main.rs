@@ -252,6 +252,27 @@ struct SignalRow {
     error: Option<String>,
 }
 
+/// Which column of the detail view the keys act on.
+///
+/// The frame details on the left can be longer than the screen, and the signal
+/// list on the right scrolls independently, so one of them has to be focused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailPane {
+    /// Frame attributes, timing and raw bytes.
+    Details,
+    /// Decoded signals, where `p` and `a` plot a curve.
+    Signals,
+}
+
+impl DetailPane {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Details => Self::Signals,
+            Self::Signals => Self::Details,
+        }
+    }
+}
+
 /// Rows below the body: the status line with the key hints.
 const STATUS_ROWS: usize = 1;
 
@@ -394,6 +415,12 @@ struct CurveData {
     /// Visible time window; `end` is exclusive.
     window_start: u64,
     window_end: u64,
+    /// Scale every series to its own range.
+    ///
+    /// Two signals with very different units otherwise force the smaller one
+    /// into a flat line at the bottom; normalising makes both shapes readable
+    /// at the cost of a shared value axis.
+    normalize: bool,
 }
 
 /// Symbols handed to the series of a curve, in plot order.
@@ -513,6 +540,8 @@ enum InputKind {
     DatabaseFilter,
     Goto,
     TimeRange,
+    /// Filter the help overlay entries.
+    HelpFilter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -661,6 +690,13 @@ struct App {
     list_offset: usize,
     selected_signal: usize,
     detail_offset: usize,
+    /// Which detail column the keys act on.
+    detail_pane: DetailPane,
+    /// First visible line of the frame-detail column, counted after wrapping.
+    detail_left_offset: usize,
+    /// Wrapped height of the frame-detail column, and the rows it is drawn in.
+    detail_left_total: usize,
+    detail_left_rows: usize,
     status: String,
     detail_rows: Vec<SignalRow>,
     curve: Option<CurveData>,
@@ -700,6 +736,43 @@ struct App {
 struct HelpState {
     offset: usize,
     previous_status: String,
+    /// Case-insensitive substring the entries are filtered by.
+    filter: String,
+}
+
+impl HelpState {
+    /// Entries to show: everything, or what the filter matches.
+    fn entries(&self, width: usize) -> Vec<(bool, String)> {
+        let all = help_lines(width);
+        if self.filter.trim().is_empty() {
+            return all;
+        }
+        let needle = self.filter.to_lowercase();
+        // A heading stays when any of its entries matches, so the result keeps
+        // its structure instead of becoming a list of loose lines.
+        let mut kept: Vec<(bool, String)> = Vec::new();
+        let mut pending_heading: Option<(bool, String)> = None;
+        let mut heading_used = false;
+        for (heading, text) in all {
+            if heading {
+                pending_heading = Some((true, text));
+                heading_used = false;
+                continue;
+            }
+            if text.to_lowercase().contains(&needle) {
+                if let Some(heading) = pending_heading.take() {
+                    kept.push(heading);
+                    heading_used = true;
+                }
+                let _ = heading_used;
+                kept.push((false, text));
+            }
+        }
+        if kept.is_empty() {
+            return vec![(true, format!("no key matches \"{}\"", self.filter))];
+        }
+        kept
+    }
 }
 
 impl App {
@@ -804,6 +877,10 @@ impl App {
             list_offset: 0,
             selected_signal: 0,
             detail_offset: 0,
+            detail_pane: DetailPane::Signals,
+            detail_left_offset: 0,
+            detail_left_total: 0,
+            detail_left_rows: 0,
             status: "Ready".to_string(),
             detail_rows: Vec::new(),
             curve: None,
@@ -837,6 +914,38 @@ impl App {
     ///
     /// The record itself only holds one fragment of a split XML document, so the
     /// detail pane shows every complete document rebuilt from the fragments.
+    /// What to say when the list has no rows.
+    ///
+    /// An empty screen is ambiguous: the filter may be too narrow, the view may
+    /// hide every bus, or the trace may be empty. Each case says how to undo it.
+    fn empty_list_hint(&self) -> Vec<String> {
+        if self.summaries.is_empty() {
+            return vec!["The trace has no objects".to_string()];
+        }
+        let mut lines = vec![format!(
+            "No message matches {}{}",
+            display_filter(&self.filter),
+            if self.view.is_all() {
+                String::new()
+            } else {
+                format!(" in view {}", self.view.label())
+            }
+        )];
+        if !self.filter.trim().is_empty() {
+            lines.push("  Esc clears the filter  ·  / edits it".to_string());
+        }
+        if !self.view.is_all() {
+            lines.push(format!(
+                "  v or 1 switches view  ·  H {} other buses",
+                if self.show_foreign { "hides" } else { "shows" }
+            ));
+        }
+        if self.time_range.is_some() {
+            lines.push("  t edits the time range".to_string());
+        }
+        lines
+    }
+
     fn metadata_lines(&self, object_index: usize) -> Vec<String> {
         if self.metadata.is_empty() {
             return Vec::new();
@@ -949,12 +1058,14 @@ impl App {
         if matches!(event, InputEvent::CtrlC | InputEvent::Eof) {
             return Ok(true);
         }
-        if self.input.is_some() {
-            return self.handle_input_event(event);
-        }
+        // The help overlay is modal: while it is open every key belongs to it,
+        // including the characters typed into its filter.
         if self.help.is_some() {
             self.handle_help_event(event);
             return Ok(false);
+        }
+        if self.input.is_some() {
+            return self.handle_input_event(event);
         }
         match self.mode {
             Mode::Messages => match event {
@@ -995,12 +1106,21 @@ impl App {
             },
             Mode::Detail => match event {
                 InputEvent::Char('q') => return Ok(true),
-                InputEvent::Up | InputEvent::Char('k') => self.move_signal(-1),
-                InputEvent::Down | InputEvent::Char('j') => self.move_signal(1),
-                InputEvent::PageUp => self.move_signal(-self.page_step()),
-                InputEvent::PageDown => self.move_signal(self.page_step()),
-                InputEvent::Home => self.select_first_signal(),
-                InputEvent::End => self.select_last_signal(),
+                InputEvent::Tab => {
+                    self.detail_pane = self.detail_pane.toggled();
+                    self.status = match self.detail_pane {
+                        DetailPane::Details => {
+                            "Detail pane: attributes (Tab to switch)".to_string()
+                        }
+                        DetailPane::Signals => "Detail pane: signals (Tab to switch)".to_string(),
+                    };
+                }
+                InputEvent::Up | InputEvent::Char('k') => self.scroll_detail(-1),
+                InputEvent::Down | InputEvent::Char('j') => self.scroll_detail(1),
+                InputEvent::PageUp => self.scroll_detail(-self.detail_page_step()),
+                InputEvent::PageDown => self.scroll_detail(self.detail_page_step()),
+                InputEvent::Home => self.detail_home(),
+                InputEvent::End => self.detail_end(),
                 InputEvent::Char('p') => self.open_curve(),
                 InputEvent::Char('a') => self.add_curve_series(),
                 InputEvent::Char('i') => self.open_inspector(),
@@ -1098,6 +1218,7 @@ impl App {
                 InputEvent::Home => self.curve_home(),
                 InputEvent::End => self.curve_end(),
                 InputEvent::Char('x') => self.remove_curve_series(),
+                InputEvent::Char('n') => self.toggle_curve_normalize(),
                 InputEvent::Char('?') => self.open_help(),
                 InputEvent::Mouse(mouse) => self.handle_curve_mouse(mouse),
                 _ => {}
@@ -1155,6 +1276,8 @@ impl App {
                                 self.input_buffer = value;
                             }
                         }
+                        // Handled by the help overlay itself.
+                        InputKind::HelpFilter => {}
                         InputKind::DatabaseFilter => {
                             self.database_filter = value;
                             self.database_object_selected = 0;
@@ -1237,6 +1360,45 @@ impl App {
         self.selected = move_index(self.selected, count, delta);
         self.selected_signal = 0;
         self.keep_selection_visible();
+    }
+
+    /// Rows the detail column scrolls per page.
+    fn detail_page_step(&self) -> isize {
+        list_page_size(self.viewport_height, 5) as isize
+    }
+
+    /// Move the keys' effect to whichever column is focused.
+    fn scroll_detail(&mut self, delta: isize) {
+        match self.detail_pane {
+            DetailPane::Signals => self.move_signal(delta),
+            DetailPane::Details => {
+                let max = self.detail_left_limit();
+                self.detail_left_offset = self
+                    .detail_left_offset
+                    .saturating_add_signed(delta)
+                    .min(max);
+            }
+        }
+    }
+
+    fn detail_home(&mut self) {
+        match self.detail_pane {
+            DetailPane::Signals => self.select_first_signal(),
+            DetailPane::Details => self.detail_left_offset = 0,
+        }
+    }
+
+    fn detail_end(&mut self) {
+        match self.detail_pane {
+            DetailPane::Signals => self.select_last_signal(),
+            DetailPane::Details => self.detail_left_offset = self.detail_left_limit(),
+        }
+    }
+
+    /// Last scroll position that still shows content.
+    fn detail_left_limit(&self) -> usize {
+        self.detail_left_total
+            .saturating_sub(self.detail_left_rows.max(1))
     }
 
     fn move_signal(&mut self, delta: isize) {
@@ -2237,6 +2399,7 @@ impl App {
         }
         if self.curve.is_none() {
             self.curve = Some(CurveData {
+                normalize: false,
                 series: Vec::new(),
                 window_start: 0,
                 window_end: 0,
@@ -2263,6 +2426,23 @@ impl App {
         }
         self.mode = Mode::Curve;
         self.status = format!("Plotted {title}");
+    }
+
+    /// `n` in the curve view: scale every series to its own range.
+    ///
+    /// Signals with different units share one axis by default, so the smaller
+    /// one flattens against zero. Normalising shows both shapes, which is what
+    /// a first look usually needs.
+    fn toggle_curve_normalize(&mut self) {
+        let Some(curve) = self.curve.as_mut() else {
+            return;
+        };
+        curve.normalize = !curve.normalize;
+        self.status = if curve.normalize {
+            "Curve: each signal scaled to its own range".to_string()
+        } else {
+            "Curve: shared value axis".to_string()
+        };
     }
 
     /// `x` in the curve view: drop the series that was added last.
@@ -2440,8 +2620,9 @@ impl App {
         self.help = Some(HelpState {
             offset: 0,
             previous_status: std::mem::take(&mut self.status),
+            filter: String::new(),
         });
-        self.status = "Help: j/k or arrows scroll, ? / q / Esc closes".to_string();
+        self.status = "Help: j/k scroll · / search · ? / q / Esc closes".to_string();
     }
 
     fn close_help(&mut self) {
@@ -2451,7 +2632,11 @@ impl App {
     }
 
     fn scroll_help(&mut self, delta: isize) {
-        let rows = help_lines(self.viewport_width).len();
+        // The scroll range follows the filtered list, not the full one.
+        let rows = self.help.as_ref().map_or_else(
+            || help_lines(self.viewport_width).len(),
+            |help| help.entries(self.viewport_width).len(),
+        );
         let page = help_page_size(self.viewport_height);
         let max_offset = rows.saturating_sub(page) as isize;
         if let Some(help) = &mut self.help {
@@ -2462,10 +2647,48 @@ impl App {
     }
 
     fn handle_help_event(&mut self, event: InputEvent) {
+        // Typing after `/` edits the filter instead of scrolling.
+        if self.input == Some(InputKind::HelpFilter) {
+            match event {
+                InputEvent::Char(character) => {
+                    if let Some(help) = self.help.as_mut() {
+                        help.filter.push(character);
+                        help.offset = 0;
+                    }
+                }
+                InputEvent::Backspace => {
+                    if let Some(help) = self.help.as_mut() {
+                        help.filter.pop();
+                        help.offset = 0;
+                    }
+                }
+                InputEvent::Enter => self.input = None,
+                InputEvent::Esc => {
+                    if let Some(help) = self.help.as_mut() {
+                        help.filter.clear();
+                        help.offset = 0;
+                    }
+                    self.input = None;
+                }
+                _ => {}
+            }
+            return;
+        }
+        if matches!(event, InputEvent::Char('/')) {
+            self.input = Some(InputKind::HelpFilter);
+            return;
+        }
         let page = help_page_size(self.viewport_height) as isize;
         let rows = help_lines(self.viewport_width).len() as isize;
         match event {
             InputEvent::Char('?') | InputEvent::Char('q') | InputEvent::Esc => self.close_help(),
+            InputEvent::Char('f') => {
+                // Clear a filter without leaving the overlay.
+                if let Some(help) = self.help.as_mut() {
+                    help.filter.clear();
+                    help.offset = 0;
+                }
+            }
             InputEvent::Char('j') | InputEvent::Down => self.scroll_help(1),
             InputEvent::Char('k') | InputEvent::Up => self.scroll_help(-1),
             InputEvent::PageDown => self.scroll_help(page),
@@ -2537,7 +2760,10 @@ impl App {
 
     fn render_help(&self, lines: &mut Vec<String>, width: usize, height: usize) {
         let page = help_page_size(height);
-        let entries = help_lines(width);
+        let entries = self
+            .help
+            .as_ref()
+            .map_or_else(|| help_lines(width), |help| help.entries(width));
         let offset = clamp_help_offset(
             self.help.as_ref().map_or(0, |help| help.offset),
             entries.len(),
@@ -2546,10 +2772,15 @@ impl App {
         let end = (offset + page).min(entries.len());
         lines.push(paint_bold(
             format!(
-                "Help  keys {}-{} of {}  (? / q / Esc closes)",
+                "Help  keys {}-{} of {}{}  (? / q / Esc closes)",
                 offset + 1,
                 end,
-                entries.len()
+                entries.len(),
+                self.help
+                    .as_ref()
+                    .filter(|help| !help.filter.trim().is_empty())
+                    .map(|help| format!("  filter=\"{}\"", help.filter))
+                    .unwrap_or_default()
             ),
             slot_color(Slot::Cyan),
         ));
@@ -2645,7 +2876,7 @@ impl App {
                 lines.extend(self.metadata_lines(index));
                 lines
             })
-            .unwrap_or_else(|| vec!["No matching messages".to_string()]);
+            .unwrap_or_else(|| self.empty_list_hint());
         let preview = preview
             .iter()
             .flat_map(|line| wrap(line, preview_width))
@@ -2708,9 +2939,10 @@ impl App {
         }
     }
 
-    fn render_detail(&self, lines: &mut Vec<String>, width: usize, height: usize) {
+    fn render_detail(&mut self, lines: &mut Vec<String>, width: usize, height: usize) {
         let Some(summary) = self.selected_summary() else {
             lines.push("No message selected".to_string());
+            lines.push("  j/k or the arrows pick one  ·  / filters the list".to_string());
             return;
         };
         let show_preview = width >= PREVIEW_MIN_WIDTH;
@@ -2728,6 +2960,7 @@ impl App {
             &self.pool,
         );
         left.extend(timing_lines(self.timing.clone()));
+        left.extend(self.metadata_lines(summary.object_index));
         let left = left
             .iter()
             .flat_map(|line| wrap(line, split))
@@ -2760,30 +2993,39 @@ impl App {
                     .map(|part| (Some(index), part)),
             );
         }
-        for row in 0..height.saturating_sub(5) {
+        let rows = height.saturating_sub(5);
+        self.detail_left_total = left.len();
+        self.detail_left_rows = rows;
+        // Clamp after a resize or a shorter record.
+        self.detail_left_offset = self.detail_left_offset.min(self.detail_left_limit());
+        for row in 0..rows {
+            let left_text = left
+                .get(self.detail_left_offset + row)
+                .map_or("", String::as_str);
             let (signal, right_text) = right
                 .get(row)
                 .map_or((None, ""), |(index, text)| (*index, text.as_str()));
             let line = if show_preview {
-                two_column(
+                two_column(left_text, right_text, split, width)
+            } else {
+                pad_to_width(&truncate(left_text, width), width)
+            };
+            let signal_selected = signal == Some(self.selected_signal);
+            // The highlight belongs to the signal row, so it covers the pane
+            // that row lives in and leaves the frame details readable.
+            lines.push(if signal_selected && show_preview {
+                right_column_selected(
                     left.get(row).map_or("", String::as_str),
                     right_text,
                     split,
                     width,
                 )
-            } else {
-                pad_to_width(
-                    &truncate(left.get(row).map_or("", String::as_str), width),
-                    width,
-                )
-            };
-            let signal_selected = signal == Some(self.selected_signal);
-            lines.push(if signal_selected {
-                paint_selected(line)
+            } else if signal_selected {
+                paint_selected(pad_to_width(&strip_ansi(right_text), width))
             } else if row == 0 {
                 paint_bold(line, slot_color(Slot::Cyan))
             } else {
-                paint(line, ANSI_PLAIN)
+                line
             });
         }
     }
@@ -2822,7 +3064,7 @@ impl App {
         let truncated = curve.series.iter().any(|series| series.truncated);
         lines.push(paint_bold(
             format!(
-                "Curve: {} signal{}  window={}..{}{}  [a] add  [x] remove",
+                "Curve: {} signal{}  window={}..{}{}  [a] add  [x] remove  {mode}",
                 curve.series.len(),
                 if curve.series.len() == 1 { "" } else { "s" },
                 axis.format(Some(window.0)),
@@ -2831,6 +3073,11 @@ impl App {
                     "  (first samples only)"
                 } else {
                     ""
+                },
+                mode = if curve.normalize {
+                    "axis=per-signal"
+                } else {
+                    "axis=shared"
                 }
             ),
             slot_color(Slot::Cyan),
@@ -7063,6 +7310,19 @@ fn tick_label(value: f64) -> String {
     }
 }
 
+/// Lowest and highest finite sample of a series.
+fn series_bounds(series: &CurveSeries) -> (f64, f64) {
+    let mut low = f64::INFINITY;
+    let mut high = f64::NEG_INFINITY;
+    for (_, value) in &series.samples {
+        if value.is_finite() {
+            low = low.min(*value);
+            high = high.max(*value);
+        }
+    }
+    (low, high)
+}
+
 /// Draw the selected series with a value axis, a time axis and connected points.
 ///
 /// Every series shares one value axis, so two signals keep their real
@@ -7074,15 +7334,23 @@ fn plot_series(curve: &CurveData, window: (u64, u64), width: usize, height: usiz
     let plot_width = width.saturating_sub(axis_width + 2).max(1);
     let span = window.1.saturating_sub(window.0).max(1) as f64;
 
-    // One shared value range across every series.
+    // Shared axis by default: two signals keep their real proportions. With
+    // `normalize` every series gets its own range, which is the only way to see
+    // the shape of a signal whose unit is far smaller than its neighbours'.
     let mut value_min = f64::INFINITY;
     let mut value_max = f64::NEG_INFINITY;
     for series in &curve.series {
-        for (_, value) in &series.samples {
-            if value.is_finite() {
-                value_min = value_min.min(*value);
-                value_max = value_max.max(*value);
-            }
+        let (series_min, series_max) = series_bounds(series);
+        if !series_min.is_finite() || !series_max.is_finite() {
+            continue;
+        }
+        if curve.normalize {
+            // 0..1 for every series.
+            value_min = value_min.min(0.0);
+            value_max = value_max.max(1.0);
+        } else {
+            value_min = value_min.min(series_min);
+            value_max = value_max.max(series_max);
         }
     }
     if !value_min.is_finite() || !value_max.is_finite() {
@@ -7102,9 +7370,16 @@ fn plot_series(curve: &CurveData, window: (u64, u64), width: usize, height: usiz
         let ratio = (timestamp - window.0) as f64 / span;
         Some(((ratio * (plot_width - 1) as f64).round() as usize).min(plot_width - 1))
     };
-    let row_of = |value: f64| -> usize {
-        let ratio = (value_max - value) / value_span;
-        ((ratio * (plot_height - 1) as f64).round() as usize).min(plot_height - 1)
+    // Where a value of `series` lands, honouring the normalisation mode.
+    let row_of = |series: &CurveSeries, value: f64| -> usize {
+        let (low, high) = if curve.normalize {
+            series_bounds(series)
+        } else {
+            (value_min, value_max)
+        };
+        let span = (high - low).max(f64::EPSILON);
+        let ratio = (high - value) / span;
+        ((ratio.clamp(0.0, 1.0) * (plot_height - 1) as f64).round() as usize).min(plot_height - 1)
     };
 
     // A column takes the last sample that falls in it, so the line follows the
@@ -7126,7 +7401,7 @@ fn plot_series(curve: &CurveData, window: (u64, u64), width: usize, height: usiz
             let Some(value) = value else {
                 continue;
             };
-            let row = row_of(*value);
+            let row = row_of(series, *value);
             if let Some((last_column, last_row)) = previous {
                 let gap = column - last_column;
                 if gap > 1 {
@@ -7151,10 +7426,25 @@ fn plot_series(curve: &CurveData, window: (u64, u64), width: usize, height: usiz
     }
 
     let ticks = axis_ticks(value_min, value_max, plot_height.saturating_sub(1).max(2));
-    // Which grid row each tick sits on, so the axis can label it.
+    // Which grid row each tick sits on, so the axis can label it. The axis is
+    // shared, so its own bounds decide the row; with normalisation the labels
+    // are fractions of each series' range.
     let mut tick_rows: Vec<(usize, String)> = ticks
         .iter()
-        .map(|tick| (row_of(*tick), tick_label(*tick)))
+        .map(|tick| {
+            let ratio = (value_max - tick) / value_span;
+            let row = ((ratio.clamp(0.0, 1.0) * (plot_height - 1) as f64).round() as usize)
+                .min(plot_height - 1);
+            let label = if curve.normalize {
+                // The axis is a fraction of each series' own range now, so a
+                // percentage is honest where a value would not be.
+                let percent = (value_max - tick) / value_span * 100.0;
+                format!("{percent:.0}%")
+            } else {
+                tick_label(*tick)
+            };
+            (row, label)
+        })
         .filter(|(row, _)| *row < plot_height)
         .collect();
     tick_rows.sort_by_key(|(row, _)| *row);
@@ -7704,6 +7994,7 @@ fn footer_line(input: Option<InputKind>, buffer: &str, status: &str, mode: Mode)
         InputKind::DatabaseFilter => "db /",
         InputKind::Goto => "goto (10.5 | +10 | #1234): ",
         InputKind::TimeRange => "range (10..15 | ..15 | +10..+15): ",
+        InputKind::HelpFilter => "help /",
     };
     format!("{prompt}{buffer}  [Enter] apply  [Esc] cancel")
 }
@@ -7757,8 +8048,8 @@ fn mode_hint(mode: Mode) -> &'static str {
         Mode::Messages => {
             "j/k move · Enter detail · v view · / filter · t range · s stats · e export · ? help"
         }
-        Mode::Detail => "j/k signal · p curve · T time · Esc back · ? help",
-        Mode::Curve => "←/→ pan · +/- zoom · x remove signal · Esc back · ? help",
+        Mode::Detail => "Tab pane · j/k move · p curve · T time · Esc back · ? help",
+        Mode::Curve => "←/→ pan · +/- zoom · n axis · x remove signal · Esc back · ? help",
         Mode::Databases => "Tab panes · j/k move · Enter open · / search · [/] database · ? help",
         Mode::Statistics => "j/k move · Enter jump to frame · s sort · Esc back · ? help",
         Mode::Inspector => "j/k scroll · PgUp/PgDn · Home/End · e export · Esc back · ? help",
@@ -8440,6 +8731,21 @@ fn two_column_separator(split: usize, width: usize) -> String {
     )
 }
 
+/// Two panes with the right one highlighted.
+///
+/// The mirror of `two_column_selected`: the frame details stay plain while the
+/// selected signal inside the right pane is reversed.
+fn right_column_selected(left: &str, right: &str, split: usize, width: usize) -> String {
+    let split = split.min(width.saturating_sub(3));
+    let right_width = width.saturating_sub(split + 3);
+    let plain = strip_ansi(&truncate(right, right_width));
+    format!(
+        "{} │ {}",
+        truncate(left, split),
+        paint_selected(pad_to_width(&plain, right_width))
+    )
+}
+
 /// Two panes with the left one highlighted.
 ///
 /// The highlight stops at the divider: reversing the whole line made the
@@ -8944,6 +9250,7 @@ Schedule_tables {
             ],
             window_start: 0,
             window_end: 10,
+            normalize: false,
         };
         let lines = plot_series(&curve, (0, 10), 20, 6);
         let painted = lines.join("\n");
@@ -11155,6 +11462,7 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
             }],
             window_start: 0,
             window_end: 200,
+            normalize: false,
         };
         let lines = plot_series(&curve, (0, 200), 30, 8);
         let painted = lines.iter().filter(|line| line.contains('━')).count();
@@ -11175,12 +11483,14 @@ CM_ BO_ 291 "Bench harness frame for the narrow details layout.";
             }],
             window_start: 0,
             window_end: 0,
+            normalize: false,
         };
         assert_eq!(curve_bounds(&curve), Some((100, 101)));
         assert_eq!(
             curve_bounds(&CurveData {
                 series: Vec::new(),
                 window_start: 0,
+                normalize: false,
                 window_end: 0,
             }),
             None
@@ -12246,6 +12556,7 @@ mod plot_axis_tests {
             series: vec![series],
             window_start: 0,
             window_end: 400_000_000,
+            normalize: false,
         };
         let lines = plot_series(&curve, (0, 400_000_000), 80, 20);
         assert!(lines.len() >= 4, "{lines:?}");
@@ -12281,6 +12592,7 @@ mod plot_fit_tests {
             }],
             window_start: 0,
             window_end: 19_000_000,
+            normalize: false,
         }
     }
 
@@ -12321,6 +12633,7 @@ mod plot_label_tests {
             }],
             window_start: 0,
             window_end: 19_200_820_000,
+            normalize: false,
         }
     }
 
@@ -12360,10 +12673,19 @@ mod plot_label_tests {
 mod theme_tests {
     use super::*;
 
+    /// The palette lives in a process-wide atomic, so these tests have to run
+    /// one at a time or they would overwrite each other's theme.
+    static THEME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        THEME_LOCK.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
     /// The palette has to follow the background, and the light set must never
     /// use a bright variant: those disappear on a white terminal.
     #[test]
     fn the_light_palette_avoids_bright_foregrounds() {
+        let _guard = lock();
         set_theme(Theme::Light);
         for slot in [
             Slot::Red,
@@ -12390,6 +12712,7 @@ mod theme_tests {
 
     #[test]
     fn the_dark_palette_uses_bright_foregrounds() {
+        let _guard = lock();
         set_theme(Theme::Dark);
         for slot in [Slot::Red, Slot::Green, Slot::Yellow, Slot::Cyan] {
             let code = slot_color(slot);
@@ -12408,6 +12731,7 @@ mod theme_tests {
 
     #[test]
     fn plain_text_carries_no_colour_so_it_follows_the_terminal() {
+        let _guard = lock();
         set_theme(Theme::Light);
         assert_eq!(paint("plain", ANSI_PLAIN), "plain");
         assert_eq!(paint("plain", ""), "plain");
@@ -12605,5 +12929,349 @@ mod render_width_tests {
             use std::os::fd::AsRawFd;
             assert_eq!(terminal_size_from_kernel(file.as_raw_fd()), None);
         }
+    }
+}
+
+#[cfg(test)]
+mod curve_normalize_tests {
+    use super::*;
+
+    fn two_scale_curve(normalize: bool) -> CurveData {
+        CurveData {
+            series: vec![
+                CurveSeries {
+                    title: "Speed".to_string(),
+                    samples: (0..10).map(|i| (i * 1_000_000, i as f64 * 400.0)).collect(),
+                    error: None,
+                    truncated: false,
+                    symbol: '*',
+                    color: slot_color(Slot::Green),
+                },
+                CurveSeries {
+                    title: "Gear".to_string(),
+                    samples: (0..10).map(|i| (i * 1_000_000, (i % 2) as f64)).collect(),
+                    error: None,
+                    truncated: false,
+                    symbol: 'o',
+                    color: slot_color(Slot::Magenta),
+                },
+            ],
+            window_start: 0,
+            window_end: 10_000_000,
+            normalize,
+        }
+    }
+
+    /// With a shared axis the small signal collapses; with per-series scaling it
+    /// has to spread over the plot.
+    #[test]
+    fn normalising_gives_the_small_signal_its_own_height() {
+        let shared = plot_series(&two_scale_curve(false), (0, 10_000_000), 60, 16);
+        let normalized = plot_series(&two_scale_curve(true), (0, 10_000_000), 60, 16);
+
+        let rows_with_magenta = |lines: &[String]| {
+            lines
+                .iter()
+                .filter(|line| line.contains(slot_color(Slot::Magenta)))
+                .count()
+        };
+        let shared_rows = rows_with_magenta(&shared);
+        let normalized_rows = rows_with_magenta(&normalized);
+        assert!(
+            normalized_rows > shared_rows,
+            "normalised series should spread out: shared {shared_rows} rows, \
+             normalised {normalized_rows} rows"
+        );
+        assert!(
+            normalized_rows >= 2,
+            "normalised series drawn on {normalized_rows} rows"
+        );
+    }
+
+    #[test]
+    fn the_axis_labels_follow_the_mode() {
+        let shared = plot_series(&two_scale_curve(false), (0, 10_000_000), 70, 14);
+        let normalized = plot_series(&two_scale_curve(true), (0, 10_000_000), 70, 14);
+        let plain = |lines: &[String]| {
+            lines
+                .iter()
+                .map(|line| strip_ansi(line))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // A shared axis prints real values, a normalised one prints percentages.
+        let has_number = |text: &str| {
+            text.split_whitespace()
+                .any(|token| token.parse::<f64>().is_ok() && token != "0")
+        };
+        assert!(has_number(&plain(&shared)), "{}", plain(&shared));
+        assert!(plain(&normalized).contains('%'), "{}", plain(&normalized));
+        assert!(!plain(&shared).contains('%'), "{}", plain(&shared));
+    }
+
+    #[test]
+    fn both_modes_keep_the_axes_and_the_line() {
+        for normalize in [false, true] {
+            let lines = plot_series(&two_scale_curve(normalize), (0, 10_000_000), 70, 16);
+            let plain: Vec<String> = lines.iter().map(|line| strip_ansi(line)).collect();
+            assert!(plain.iter().any(|line| line.contains('┤')), "value axis");
+            assert!(plain.iter().any(|line| line.contains('┴')), "time axis");
+            assert!(plain.iter().any(|line| line.contains('━')), "line");
+        }
+    }
+}
+
+#[cfg(test)]
+mod detail_pane_tests {
+    use super::*;
+
+    fn app_with_many_fields() -> App {
+        let mut app = App::new(None, Vec::new(), Vec::new()).expect("app");
+        app.mode = Mode::Detail;
+        let object = blf_core::Object::Structured(blf_core::StructuredObject {
+            object_type: blf_core::ObjectType::CanDriverError,
+            header: blf_core::RawObjectHeader::Object(blf_core::ObjectHeader {
+                base: blf_core::ObjectHeaderBase {
+                    signature: blf_core::OBJECT_SIGNATURE,
+                    header_size: 32,
+                    header_version: 1,
+                    object_size: 48,
+                    object_type: blf_core::ObjectType::CanDriverError,
+                    raw_object_type: 31,
+                },
+                object_flags: 2,
+                client_index: 0,
+                object_version: 0,
+                object_time_stamp: 1_000_000,
+            }),
+            class_name: "CanDriverError".to_string(),
+            fields: (0..60)
+                .map(|index| ("channel", blf_core::FieldValue::U16(index as u16)))
+                .collect(),
+            extensions: vec![0; 400],
+            data: Vec::new(),
+        });
+        let mut pool = TextPool::default();
+        app.summaries.push(summary_for(0, &object, &mut pool));
+        app.objects.push(object);
+        app.filtered = vec![0];
+        app.selected = 0;
+        app
+    }
+
+    #[test]
+    fn tab_switches_which_column_the_keys_move() {
+        let mut app = app_with_many_fields();
+        assert_eq!(app.detail_pane, DetailPane::Signals);
+        app.handle_event(InputEvent::Tab).expect("handle");
+        assert_eq!(app.detail_pane, DetailPane::Details);
+        app.handle_event(InputEvent::Tab).expect("handle");
+        assert_eq!(app.detail_pane, DetailPane::Signals);
+    }
+
+    #[test]
+    fn the_attribute_column_scrolls_when_it_is_focused() {
+        let mut app = app_with_many_fields();
+        app.viewport_height = 24;
+        let mut lines = Vec::new();
+        app.render_detail(&mut lines, 100, 24);
+        assert!(
+            app.detail_left_total > app.detail_left_rows,
+            "fixture too short"
+        );
+
+        // Keys do nothing to the attributes while the signals are focused.
+        let before = app.detail_left_offset;
+        app.handle_event(InputEvent::Char('j')).expect("handle");
+        assert_eq!(app.detail_left_offset, before);
+
+        // Focused, they scroll and stop at the end.
+        app.detail_pane = DetailPane::Details;
+        app.handle_event(InputEvent::Char('j')).expect("handle");
+        assert_eq!(app.detail_left_offset, 1);
+        app.handle_event(InputEvent::End).expect("handle");
+        assert_eq!(
+            app.detail_left_offset,
+            app.detail_left_total - app.detail_left_rows
+        );
+        app.handle_event(InputEvent::Char('j')).expect("handle");
+        assert_eq!(
+            app.detail_left_offset,
+            app.detail_left_total - app.detail_left_rows
+        );
+        app.handle_event(InputEvent::Home).expect("handle");
+        assert_eq!(app.detail_left_offset, 0);
+    }
+
+    #[test]
+    fn scrolling_reveals_the_tail_of_the_attributes() {
+        let mut app = app_with_many_fields();
+        app.viewport_height = 24;
+        app.detail_pane = DetailPane::Details;
+        let mut lines = Vec::new();
+        app.render_detail(&mut lines, 100, 24);
+        app.handle_event(InputEvent::End).expect("handle");
+        let mut lines = Vec::new();
+        app.render_detail(&mut lines, 100, 24);
+        // Scrolled to the end, the column no longer starts at the timestamp and
+        // shows content that the first screen had pushed out.
+        let joined = lines
+            .iter()
+            .map(|line| strip_ansi(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !joined.contains("time: 0.001000s"),
+            "still showing the top: {joined}"
+        );
+        assert!(
+            app.detail_left_offset > 0,
+            "offset did not move: {}",
+            app.detail_left_offset
+        );
+    }
+}
+
+#[cfg(test)]
+mod help_filter_tests {
+    use super::*;
+
+    fn app() -> App {
+        App::new(None, Vec::new(), Vec::new()).expect("app")
+    }
+
+    #[test]
+    fn a_filter_keeps_the_matching_entries_and_their_headings() {
+        let mut help = HelpState {
+            offset: 0,
+            previous_status: String::new(),
+            filter: "curve".to_string(),
+        };
+        let entries = help.entries(100);
+        assert!(!entries.is_empty(), "no match for a documented key");
+        let joined = entries
+            .iter()
+            .map(|(_, text)| text.to_lowercase())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("curve"), "{joined}");
+        // At least one heading survived so the result keeps its structure.
+        assert!(entries.iter().any(|(heading, _)| *heading), "{entries:?}");
+
+        help.filter = "zzzznothing".to_string();
+        let empty = help.entries(100);
+        assert_eq!(empty.len(), 1);
+        assert!(empty[0].1.contains("no key matches"), "{empty:?}");
+    }
+
+    #[test]
+    fn the_filter_is_typed_after_a_slash() {
+        let mut app = app();
+        app.open_help();
+        app.handle_help_event(InputEvent::Char('/'));
+        assert_eq!(app.input, Some(InputKind::HelpFilter));
+        for character in "curve".chars() {
+            app.handle_help_event(InputEvent::Char(character));
+        }
+        assert_eq!(app.help.as_ref().unwrap().filter, "curve");
+        // Backspace edits it, Enter leaves the filter active.
+        app.handle_help_event(InputEvent::Backspace);
+        assert_eq!(app.help.as_ref().unwrap().filter, "curv");
+        app.handle_help_event(InputEvent::Enter);
+        assert_eq!(app.input, None);
+        assert_eq!(app.help.as_ref().unwrap().filter, "curv");
+        // Esc inside the input clears the filter without closing the overlay.
+        app.handle_help_event(InputEvent::Char('/'));
+        app.handle_help_event(InputEvent::Esc);
+        assert_eq!(app.help.as_ref().unwrap().filter, "");
+        assert!(app.help.is_some());
+    }
+
+    #[test]
+    fn scrolling_follows_the_filtered_length() {
+        let mut app = app();
+        app.open_help();
+        app.viewport_height = 20;
+        let all = help_lines(100).len();
+        app.scroll_help(all as isize * 4);
+        let bottom_all = app.help.as_ref().unwrap().offset;
+        assert!(bottom_all > 0, "help did not scroll");
+
+        // A one-line filter result cannot scroll at all.
+        app.help.as_mut().unwrap().filter = "zzzznothing".to_string();
+        app.help.as_mut().unwrap().offset = 0;
+        app.scroll_help(10);
+        assert_eq!(app.help.as_ref().unwrap().offset, 0);
+    }
+
+    #[test]
+    fn the_footer_names_the_help_prompt() {
+        let footer = footer_line(Some(InputKind::HelpFilter), "curve", "", Mode::Messages);
+        assert!(footer.contains("help /"), "{footer}");
+        assert!(footer.contains("curve"), "{footer}");
+    }
+}
+
+#[cfg(test)]
+mod empty_state_tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_list_explains_what_to_change() {
+        let mut app = App::new(None, Vec::new(), Vec::new()).expect("app");
+        // No objects at all.
+        assert!(app.empty_list_hint()[0].contains("no objects"));
+
+        // Objects exist but the filter matches none.
+        app.summaries.push(MessageSummary {
+            object_index: 0,
+            timestamp_ns: Some(0),
+            timestamp_source: None,
+            bus: Some(BusKind::Can),
+            bus_label: "can",
+            ethernet: None,
+            event: None,
+            can_flags: 0,
+            channel: Some(1),
+            frame_id: Some(1),
+            object_type_raw: 1,
+            class_name: "CanMessage",
+            direction: Some("Rx"),
+            dlc: Some(1),
+            payload: vec![0],
+            status: "ok",
+        });
+        app.filter = "zzz".to_string();
+        let hint = app.empty_list_hint();
+        let joined = hint.join("\n");
+        assert!(joined.contains("zzz"), "{joined}");
+        assert!(joined.contains("Esc"), "{joined}");
+
+        // A bus view with no rows suggests switching views.
+        app.filter.clear();
+        app.view = View::Ethernet;
+        let joined = app.empty_list_hint().join("\n");
+        assert!(joined.contains("ETHERNET"), "{joined}");
+        assert!(joined.contains('v'), "{joined}");
+
+        // A time range narrows it further, so say how to change that too.
+        app.view = View::All;
+        app.time_range = Some((0, 1));
+        let joined = app.empty_list_hint().join("\n");
+        assert!(joined.contains("time range"), "{joined}");
+    }
+
+    #[test]
+    fn an_empty_detail_pane_names_the_keys() {
+        let mut app = App::new(None, Vec::new(), Vec::new()).expect("app");
+        let mut lines = Vec::new();
+        app.render_detail(&mut lines, 100, 24);
+        let joined = lines
+            .iter()
+            .map(|line| strip_ansi(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("No message selected"), "{joined}");
+        assert!(joined.contains("filters the list"), "{joined}");
     }
 }

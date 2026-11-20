@@ -76,6 +76,18 @@ diagnostic objects, including:
   yellow, direction green for `Rx` / magenta for `Tx`, payload in the terminal
   foreground. A selected row is reverse video over plain text, so the per-column
   colours cannot reset the highlight mid-row.
+- The detail view focuses one column at a time: `Tab` switches between the frame
+  attributes and the decoded signals, so `j`/`k` scroll the attributes when they
+  are longer than the screen instead of only moving the signal selection. The
+  highlight follows the focused column and never crosses the divider.
+- The curve can scale every signal to its own range with `n`; two signals with
+  different units then both show their shape instead of the smaller one
+  flattening against the axis. The title says which mode is active
+  (`axis=shared` or `axis=per-signal`).
+- The help overlay has its own filter: `/` then a word narrows the key list and
+  keeps the matching section headings.
+- An empty list explains why it is empty and how to undo it, naming the filter,
+  the active view and the time range that are in effect.
 - A narrow terminal drops the preview pane instead of squeezing both halves:
   below 100 columns the list takes the whole width, so the frame columns stay
   readable on an 80-column window.
