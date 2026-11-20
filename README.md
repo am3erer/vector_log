@@ -38,9 +38,11 @@ diagnostic objects, including:
   metadata (the XML is split every 2048 bytes, so the fragments are joined back
   into documents and are readable, searchable and scrollable in the inspector),
   attachment and trace line.
-- System variables are shown with their value rendered by type (`long`,
-  `double`, `string`, arrays), so a trace reads `::VTS::M7::RelayComRef78 = 0`
-  instead of an opaque byte string.
+- System variables are shown with their value rendered by type (all seven:
+  `double`, `long`, `string`, `double array`, `long array`, `long long`, `byte
+  array`), honouring `mRepresentation`: 0 means the integer is signed, so a
+  stored `-5` reads as `-5` and not `4294967291`. A trace shows
+  `::VTS::M7::RelayComRef78 = 0 (long)` instead of an opaque byte string.
 - CAN frames report the properties the format defines beyond the identifier:
   remote, wakeup and no-error bits plus the CAN FD `BRS` and `ESI` flags, in a
   dedicated column.

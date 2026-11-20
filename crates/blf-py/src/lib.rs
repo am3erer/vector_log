@@ -1619,8 +1619,13 @@ fn object_to_dict(py: Python<'_>, object: &blf_core::Object) -> PyResult<PyObjec
                 });
                 if let (Some(kind), Some(data)) = (type_of("type"), data) {
                     let kind = u32::try_from(kind).unwrap_or(0);
+                    let representation =
+                        u32::try_from(type_of("representation").unwrap_or(0)).unwrap_or(0);
                     dict.set_item("sysvar_type", blf_core::sysvar_type_name(kind))?;
-                    dict.set_item("sysvar_value", blf_core::sysvar_value_text(kind, &data))?;
+                    dict.set_item(
+                        "sysvar_value",
+                        blf_core::sysvar_value_text(kind, representation, &data),
+                    )?;
                 }
             }
             let fields = PyDict::new(py);

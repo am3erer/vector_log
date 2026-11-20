@@ -1745,29 +1745,31 @@ def test_system_variable_exposes_the_typed_value(tmp_path):
     """A system variable's bytes are interpreted according to its type."""
     inner = bytearray()
 
-    def sysvar(kind, name, data):
+    def sysvar(kind, representation, name, data):
         # type, representation, 8 reserved bytes, name length, data length,
         # 8 more reserved bytes, then the name and the value.
         object_size = 64 + len(name) + len(data)
         header = struct.pack(
             "<IHHIIIHHQ", 0x4A424F4C, 32, 1, object_size, 72, 0, 0, 0, 0
         )
-        body = struct.pack("<II", kind, 0)
+        body = struct.pack("<II", kind, representation)
         body += struct.pack("<Q", 0)
         body += struct.pack("<II", len(name), len(data))
         body += struct.pack("<Q", 0)
         return header + body + name + data
 
-    inner += sysvar(2, b"::a::b", struct.pack("<I", 1234))
-    inner += sysvar(1, b"::a::d", struct.pack("<d", 2.5))
-    inner += sysvar(3, b"::a::s", b"hello\x00")
+    inner += sysvar(2, 1, b"::a::b", struct.pack("<I", 1234))
+    inner += sysvar(1, 0, b"::a::d", struct.pack("<d", 2.5))
+    inner += sysvar(3, 0, b"::a::s", b"hello\x00")
+    # 0 is signed: the same bytes must read as -5, not 4294967291.
+    inner += sysvar(2, 0, b"::a::neg", struct.pack("<i", -5))
 
     path = tmp_path / "sysvar.blf"
-    _write_objects(path, bytes(inner), 3)
+    _write_objects(path, bytes(inner), 4)
 
     with open(str(path)) as reader:
         objects = list(reader)
-    assert [type(obj).__name__ for obj in objects] == ["SystemVariable"] * 3
+    assert [type(obj).__name__ for obj in objects] == ["SystemVariable"] * 4
     assert objects[0].name == "::a::b"
     assert objects[0].sysvar_type == "long"
     assert objects[0].value == "1234"
@@ -1775,3 +1777,4 @@ def test_system_variable_exposes_the_typed_value(tmp_path):
     assert objects[1].value == "2.5"
     assert objects[2].sysvar_type == "string"
     assert objects[2].value.strip('"') == "hello"
+    assert objects[3].value == "-5"

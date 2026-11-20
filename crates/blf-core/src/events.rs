@@ -270,12 +270,23 @@ pub fn can_fd_flags_text(flags: u32) -> String {
     parts.join(" ")
 }
 
+/// Whether a `VBLSystemVariable` carries a signed value.
+///
+/// `mRepresentation` is 0 for signed and 1 for unsigned, and is only defined
+/// for the integer types; every other type is unsigned by definition.
+pub fn sysvar_is_signed(representation: u32) -> bool {
+    representation == 0
+}
+
 /// Render the payload of a `VBLSystemVariable` according to its declared type.
 ///
 /// The data block is a bare C value: a `double`, a 32-bit or 64-bit integer, a
 /// NUL-terminated string, or a run of those for the array types. Anything the
 /// type table does not name falls back to hex so the bytes stay visible.
-pub fn sysvar_value_text(kind: u32, data: &[u8]) -> String {
+///
+/// `representation` follows the format document: 0 means the integer value is
+/// signed, 1 means unsigned. Getting this wrong turns `-5` into `4294967291`.
+pub fn sysvar_value_text(kind: u32, representation: u32, data: &[u8]) -> String {
     let signed = |bytes: &[u8]| -> Option<i64> {
         match bytes.len() {
             4 => Some(i64::from(i32::from_le_bytes([
@@ -298,6 +309,13 @@ pub fn sysvar_value_text(kind: u32, data: &[u8]) -> String {
             _ => None,
         }
     };
+    let integer = |bytes: &[u8]| -> Option<String> {
+        if sysvar_is_signed(representation) {
+            signed(bytes).map(|value| value.to_string())
+        } else {
+            unsigned(bytes).map(|value| value.to_string())
+        }
+    };
     let as_double = |bytes: &[u8]| -> Option<f64> {
         (bytes.len() >= 8).then(|| f64::from_le_bytes(bytes[..8].try_into().unwrap()))
     };
@@ -310,7 +328,7 @@ pub fn sysvar_value_text(kind: u32, data: &[u8]) -> String {
     };
     match kind {
         1 => as_double(data).map_or_else(|| hex_text(data), |value| format!("{value}")),
-        2 => unsigned(data).map_or_else(|| hex_text(data), |value| format!("{value}")),
+        2 => integer(data).unwrap_or_else(|| hex_text(data)),
         3 => format!("{:?}", text_of(data)),
         4 => {
             // A run of doubles; show the count so a long array stays readable.
@@ -334,19 +352,16 @@ pub fn sysvar_value_text(kind: u32, data: &[u8]) -> String {
                 .0
                 .iter()
                 .take(4)
-                .filter_map(|chunk| unsigned(chunk).map(|value| format!("{value}")))
+                .filter_map(|chunk| integer(chunk))
                 .collect();
             if count > parts.len() {
                 parts.push(format!("... ({count} values)"));
             }
             format!("[{}]", parts.join(", "))
         }
-        6 => unsigned(data).map_or_else(|| hex_text(data), |value| format!("{value}")),
+        6 => integer(data).unwrap_or_else(|| hex_text(data)),
         7 => format!("{} bytes {}", data.len(), hex_text(data)),
-        _ => {
-            let _ = signed;
-            hex_text(data)
-        }
+        _ => hex_text(data),
     }
 }
 
@@ -793,6 +808,65 @@ mod tests {
         assert_eq!(lin_sleep_reason_name(7), "unknown reason");
         assert_eq!(ethernet_rx_error_name(9), "unknown error");
         assert_eq!(ethernet_sqi_name(9), "unknown");
+    }
+}
+
+#[cfg(test)]
+mod sysvar_values {
+    use super::*;
+
+    #[test]
+    fn integer_values_honour_the_representation_flag() {
+        let minus_five = (-5i32).to_le_bytes();
+        // 0 is signed, 1 is unsigned, exactly as the format document states.
+        assert_eq!(sysvar_value_text(2, 0, &minus_five), "-5");
+        assert_eq!(sysvar_value_text(2, 1, &minus_five), "4294967291");
+        assert!(sysvar_is_signed(0));
+        assert!(!sysvar_is_signed(1));
+
+        let minus_one_long = (-1i64).to_le_bytes();
+        assert_eq!(sysvar_value_text(6, 0, &minus_one_long), "-1");
+        assert_eq!(
+            sysvar_value_text(6, 1, &minus_one_long),
+            "18446744073709551615"
+        );
+    }
+
+    #[test]
+    fn every_declared_type_renders_something() {
+        assert_eq!(sysvar_value_text(1, 0, &2.5f64.to_le_bytes()), "2.5");
+        assert_eq!(sysvar_value_text(2, 1, &1234u32.to_le_bytes()), "1234");
+        assert_eq!(sysvar_value_text(3, 0, b"hello "), "\"hello\"");
+        assert_eq!(sysvar_value_text(3, 0, b""), "\"\"");
+        let doubles: Vec<u8> = [1.5f64, 2.5]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        assert_eq!(sysvar_value_text(4, 0, &doubles), "[1.5, 2.5]");
+        let longs: Vec<u8> = [10u32, 20]
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        assert_eq!(sysvar_value_text(5, 1, &longs), "[10, 20]");
+        assert_eq!(
+            sysvar_value_text(6, 1, &9_000_000_000u64.to_le_bytes()),
+            "9000000000"
+        );
+        assert_eq!(sysvar_value_text(7, 0, &[0xDE, 0xAD]), "2 bytes DE AD");
+        // An unlisted type and a truncated payload stay readable as hex.
+        assert_eq!(sysvar_value_text(99, 0, &[0xAB, 0xCD]), "AB CD");
+        assert_eq!(sysvar_value_text(1, 0, &[1, 2]), "01 02");
+        assert_eq!(sysvar_value_text(2, 0, &[1]), "01");
+    }
+
+    #[test]
+    fn long_arrays_stay_short_for_wide_payloads() {
+        let values: Vec<u8> = (0..10u32)
+            .flat_map(|value| (value * 100).to_le_bytes())
+            .collect();
+        let text = sysvar_value_text(5, 1, &values);
+        assert!(text.contains("... (10 values)"), "{text}");
+        assert!(text.starts_with("[0, 100, 200, 300"), "{text}");
     }
 }
 

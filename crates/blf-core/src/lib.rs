@@ -43,8 +43,8 @@ pub use events::{
     lin_sleep_reason_name, lin_spike_origin_name, lin_wakeup_length_name, most25_state_text,
     most50_state_text, most_ack_text, most_addressing_mode_name, most_control_sub_type_name,
     most_net_state_name, most_priority_name, most_register_id_name, most_register_sub_type_name,
-    most_transfer_type_name, sysvar_type_name, sysvar_value_text, trace_line_source_name,
-    wlan_frame_flags_text,
+    most_transfer_type_name, sysvar_is_signed, sysvar_type_name, sysvar_value_text,
+    trace_line_source_name, wlan_frame_flags_text,
 };
 pub use ldf::{
     decode_lin_frame, decode_lin_object, decode_lin_signal, protected_identifier,

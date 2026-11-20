@@ -5806,6 +5806,7 @@ fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
         // ---- system variables ----
         blf_core::ObjectType::SysVariable => {
             let kind = u32::try_from(field("type").unwrap_or(0)).unwrap_or(0);
+            let representation = u32::try_from(field("representation").unwrap_or(0)).unwrap_or(0);
             let name = object
                 .fields
                 .iter()
@@ -5826,7 +5827,7 @@ fn structured_event(object: &blf_core::StructuredObject) -> Option<BusEvent> {
                 BusEvent::new("-", "SV")
                     .text(format!(
                         "{name} = {} ({})",
-                        blf_core::sysvar_value_text(kind, data),
+                        blf_core::sysvar_value_text(kind, representation, data),
                         blf_core::sysvar_type_name(kind)
                     ))
                     .done(),
@@ -11118,7 +11119,7 @@ mod record_display_tests {
             ObjectType::SysVariable,
             vec![
                 ("type", FieldValue::U32(2)),
-                ("representation", FieldValue::U32(0)),
+                ("representation", FieldValue::U32(1)),
                 ("nameLength", FieldValue::U32(5)),
                 ("dataLength", FieldValue::U32(4)),
                 ("name", FieldValue::String("::a::b".to_string())),
@@ -11135,6 +11136,22 @@ mod record_display_tests {
         // The variable name is searchable.
         let mut buffer = String::new();
         assert!(summary_matches_in(&summary, "::a::b", &mut buffer, &pool));
+
+        // A signed variable keeps its sign: representation 0 means signed.
+        let signed = structured(
+            ObjectType::SysVariable,
+            vec![
+                ("type", FieldValue::U32(2)),
+                ("representation", FieldValue::U32(0)),
+                ("nameLength", FieldValue::U32(4)),
+                ("dataLength", FieldValue::U32(4)),
+                ("name", FieldValue::String("::c".to_string())),
+                ("data", FieldValue::Bytes((-5i32).to_le_bytes().to_vec())),
+            ],
+        );
+        let summary = summary_for(0, &signed, &mut pool);
+        let event = summary.event.as_ref().expect("event");
+        assert!(event.summary.contains("::c = -5"), "{event:?}");
     }
 
     #[test]
