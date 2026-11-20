@@ -86,6 +86,9 @@ diagnostic objects, including:
   (`axis=shared` or `axis=per-signal`).
 - The help overlay has its own filter: `/` then a word narrows the key list and
   keeps the matching section headings.
+- The database browser keeps two panes below 80 columns instead of splitting a
+  narrow terminal three ways, which left the details column zero wide; `Tab`
+  then opens the details at full width.
 - An empty list explains why it is empty and how to undo it, naming the filter,
   the active view and the time range that are in effect.
 - A narrow terminal drops the preview pane instead of squeezing both halves:

@@ -29,6 +29,11 @@ const MAX_DETAIL_ENTRIES: usize = 500;
 /// Below this width the three database columns leave too few cells for the
 /// details, so a focused details pane takes the whole terminal width.
 const NARROW_DATABASE_WIDTH: usize = 100;
+/// Below this width the database browser itself drops to two panes.
+///
+/// Splitting less than 80 columns three ways leaves the details column at zero,
+/// so the details get a full-width view of their own instead.
+const TWO_PANE_DATABASE_WIDTH: usize = 80;
 /// First list row below the header block, section title and column rule.
 const LIST_FIRST_ROW: u16 = HEADER_ROWS + 2;
 /// First detail row: the header block plus the detail section title.
@@ -2604,11 +2609,24 @@ impl App {
     }
 
     fn database_layout(&self, width: usize) -> (usize, usize, usize) {
+        // Below the narrow threshold the details column moves to a full-width
+        // view of its own (see `details_take_full_width`), so the browser keeps
+        // two panes. Splitting a 60-column terminal three ways left the third
+        // column zero wide, which drew nothing at all.
+        let two_pane = width < TWO_PANE_DATABASE_WIDTH;
         let left = self.database_left_width().min(width.saturating_sub(2));
-        let middle = (width * 32 / 100)
-            .max(30)
-            .min(width.saturating_sub(left + 1));
-        let right = width.saturating_sub(left + middle + 6);
+        let middle = if two_pane {
+            width.saturating_sub(left + 3).max(1)
+        } else {
+            (width * 32 / 100)
+                .max(30)
+                .min(width.saturating_sub(left + 1))
+        };
+        let right = if two_pane {
+            0
+        } else {
+            width.saturating_sub(left + middle + 6)
+        };
         (left, middle, right)
     }
 
@@ -3277,18 +3295,38 @@ impl App {
             "Details".to_string()
         };
         let details_focused = self.database_pane == DatabasePane::Details;
-        lines.push(styled_three_column(
-            (tree_header, pane_header_style(tree_focused)),
-            (object_header.as_str(), pane_header_style(objects_focused)),
-            (detail_header.as_str(), pane_header_style(details_focused)),
-            left,
-            middle,
-            width,
-        ));
-        lines.push(paint(
-            three_column_separator(left, middle, right, width),
-            slot_color(Slot::Cyan),
-        ));
+        if right == 0 {
+            // Two panes: the details have their own full-width view.
+            lines.push(two_column(
+                &paint_cell(
+                    pad_to_width(&truncate(tree_header, left), left),
+                    pane_header_style(tree_focused),
+                ),
+                &paint_cell(
+                    truncate(&object_header, middle),
+                    pane_header_style(objects_focused),
+                ),
+                left,
+                width,
+            ));
+            lines.push(paint(
+                two_column_separator(left, width),
+                slot_color(Slot::Cyan),
+            ));
+        } else {
+            lines.push(styled_three_column(
+                (tree_header, pane_header_style(tree_focused)),
+                (object_header.as_str(), pane_header_style(objects_focused)),
+                (detail_header.as_str(), pane_header_style(details_focused)),
+                left,
+                middle,
+                width,
+            ));
+            lines.push(paint(
+                three_column_separator(left, middle, right, width),
+                slot_color(Slot::Cyan),
+            ));
+        }
         for row in 0..rows {
             let (tree_text, tree_style) = if row == 0 {
                 (format!(" {database_label}"), CellStyle::DatabaseHeader)
@@ -3341,14 +3379,24 @@ impl App {
                 .map_or((String::new(), CellStyle::Normal), |(text, style)| {
                     (text.clone(), *style)
                 });
-            lines.push(styled_three_column(
-                (&tree_text, tree_style),
-                (&object_text, object_style),
-                (detail_text.as_str(), detail_style),
-                left,
-                middle,
-                width,
-            ));
+            lines.push(if right == 0 {
+                // Two-pane layout: no details column in this row.
+                two_column(
+                    &paint_cell(pad_to_width(&truncate(&tree_text, left), left), tree_style),
+                    &paint_cell(truncate(&object_text, middle), object_style),
+                    left,
+                    width,
+                )
+            } else {
+                styled_three_column(
+                    (&tree_text, tree_style),
+                    (&object_text, object_style),
+                    (detail_text.as_str(), detail_style),
+                    left,
+                    middle,
+                    width,
+                )
+            });
         }
     }
 }
@@ -13273,5 +13321,55 @@ mod empty_state_tests {
             .join("\n");
         assert!(joined.contains("No message selected"), "{joined}");
         assert!(joined.contains("filters the list"), "{joined}");
+    }
+}
+
+#[cfg(test)]
+mod database_pane_tests {
+    use super::*;
+
+    fn app() -> App {
+        App::new(None, Vec::new(), Vec::new()).expect("app")
+    }
+
+    #[test]
+    fn a_narrow_browser_keeps_both_panes_usable() {
+        let mut app = app();
+        let mut lines = Vec::new();
+        for width in [40usize, 60, 72] {
+            app.viewport_width = width;
+            lines.clear();
+            app.render_databases(&mut lines, width, 24);
+            let plain: Vec<String> = lines.iter().map(|line| strip_ansi(line)).collect();
+            // Two panes, so exactly one divider per row and no empty third one.
+            for line in &plain {
+                assert!(
+                    display_width(line) <= width,
+                    "width {width}: row too wide: {line:?}"
+                );
+            }
+            let dividers = plain
+                .iter()
+                .map(|line| line.matches('│').count())
+                .max()
+                .unwrap_or(0);
+            assert_eq!(dividers, 1, "width {width}: expected two panes");
+        }
+    }
+
+    #[test]
+    fn a_wide_browser_still_shows_three_panes() {
+        let app = app();
+        for width in [100usize, 140] {
+            let mut lines = Vec::new();
+            app.render_databases(&mut lines, width, 24);
+            let plain: Vec<String> = lines.iter().map(|line| strip_ansi(line)).collect();
+            let dividers = plain
+                .iter()
+                .map(|line| line.matches('│').count())
+                .max()
+                .unwrap_or(0);
+            assert_eq!(dividers, 2, "width {width}: expected three panes");
+        }
     }
 }
