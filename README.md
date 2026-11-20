@@ -38,6 +38,12 @@ diagnostic objects, including:
   metadata (the XML is split every 2048 bytes, so the fragments are joined back
   into documents and are readable, searchable and scrollable in the inspector),
   attachment and trace line.
+- Every name table the reader uses is also a Python function of the same name:
+  `ethernet_phy_event_name(8)` gives `wakeup received`,
+  `can_driver_error_name(102)` gives `chip state bus off`, and 52 more cover
+  CAN/LIN/Ethernet/MOST/FlexRay/AFDX/A429/WLAN/K-Line/J1708 plus object types.
+  A test walks `blf_core::name_table_functions()` so a new table cannot stay
+  Rust-only.
 - System variables are shown with their value rendered by type (all seven:
   `double`, `long`, `string`, `double array`, `long array`, `long long`, `byte
   array`), honouring `mRepresentation`: 0 means the integer is signed, so a

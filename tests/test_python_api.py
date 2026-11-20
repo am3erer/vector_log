@@ -1866,3 +1866,73 @@ def test_file_statistics_are_fully_exported(tmp_path):
         ):
             assert hasattr(statistics, name), name
         assert statistics.object_count == 1
+
+
+def test_name_tables_are_exported():
+    """Every table that lives in `blf-core` is reachable from Python."""
+    from vector_log.blf_rs import (
+        can_driver_error_name,
+        can_fd_flags_text,
+        ethernet_link_status_name,
+        ethernet_phy_event_name,
+        ethernet_phy_state_name,
+        ethernet_sqi_name,
+        lin_sleep_reason_name,
+        most25_state_text,
+        object_type_name,
+        sysvar_value_text,
+    )
+
+    # Ethernet port state: the numbers from the BLF ethernet format document.
+    assert ethernet_link_status_name(1) == "link down"
+    assert ethernet_link_status_name(2) == "link up"
+    assert ethernet_phy_state_name(1) == "normal state"
+    assert ethernet_phy_event_name(8) == "wakeup received"
+    assert ethernet_phy_event_name(4) == "sleep ack received"
+    assert ethernet_sqi_name(5) == "excellent"
+
+    # CAN and LIN tables.
+    assert can_driver_error_name(102) == "chip state bus off"
+    assert lin_sleep_reason_name(1) == "go-to-sleep frame"
+    assert "BRS" in can_fd_flags_text(0x02)
+
+    # MOST bit fields come back as a sentence.
+    assert most25_state_text(0x11) == "bus active, ack, send error"
+
+    # Object type names, including the type that only the official header has.
+    assert object_type_name(133) == "EthernetPhyState"
+    assert object_type_name(1) == "CanMessage"
+
+    # The signed/unsigned distinction follows `mRepresentation`.
+    assert sysvar_value_text(2, 0, b"\xfb\xff\xff\xff") == "-5"
+    assert sysvar_value_text(2, 1, b"\xfb\xff\xff\xff") == "4294967291"
+
+
+def test_every_core_name_table_is_reachable():
+    """No table may exist only on the Rust side."""
+    import vector_log.blf_rs as package
+
+    expected = [
+        "a429_error_type_name", "a429_parity_name", "afdx_link_speed_name",
+        "app_text_channel_info", "app_text_source_name", "app_text_text",
+        "app_text_trace_line", "can_driver_error_name", "can_error_code_name",
+        "can_error_direction_name", "can_fd_flags_text", "can_message_direction_name",
+        "can_message_flags_text", "ethernet_clock_mode_name", "ethernet_connector_name",
+        "ethernet_duplex_name", "ethernet_link_status_name", "ethernet_mdi_name",
+        "ethernet_pairs_name", "ethernet_phy_event_name", "ethernet_phy_state_name",
+        "ethernet_phy_type_name", "ethernet_rx_error_name", "ethernet_sqi_name",
+        "flexray_cc_type_name", "flexray_channel_name", "flexray_direction_name",
+        "flexray_frame_flags_text", "flexray_frame_state_text", "j1708_type_name",
+        "kline_status_name", "lin_checksum_model_name", "lin_disturbance_type_name",
+        "lin_long_dom_signal_type_name", "lin_sleep_flags_text", "lin_sleep_reason_name",
+        "lin_spike_origin_name", "lin_wakeup_length_name", "most25_state_text",
+        "most50_state_text", "most_ack_text", "most_addressing_mode_name",
+        "most_control_sub_type_name", "most_net_state_name", "most_priority_name",
+        "most_register_id_name", "most_register_sub_type_name", "most_transfer_type_name",
+        "object_type_name", "sysvar_is_signed", "sysvar_type_name", "sysvar_value_text",
+        "trace_line_source_name", "wlan_frame_flags_text",
+    ]
+    for name in expected:
+        assert hasattr(package, name), f"{name} is Rust-only"
+        assert name in package.__all__, f"{name} missing from __all__"
+        assert callable(getattr(package, name))

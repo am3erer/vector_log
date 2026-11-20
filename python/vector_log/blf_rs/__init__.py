@@ -58,6 +58,63 @@ from .classes import (
     object_from_data,
 )
 
+# Name tables: the same helpers `blf-core` exposes, so a raw value from a record
+# can be turned into the name the format documents give it.
+a429_error_type_name = _core.a429_error_type_name
+a429_parity_name = _core.a429_parity_name
+afdx_link_speed_name = _core.afdx_link_speed_name
+app_text_channel_info = _core.app_text_channel_info
+app_text_source_name = _core.app_text_source_name
+app_text_text = _core.app_text_text
+app_text_trace_line = _core.app_text_trace_line
+can_driver_error_name = _core.can_driver_error_name
+can_error_code_name = _core.can_error_code_name
+can_error_direction_name = _core.can_error_direction_name
+can_fd_flags_text = _core.can_fd_flags_text
+can_message_direction_name = _core.can_message_direction_name
+can_message_flags_text = _core.can_message_flags_text
+ethernet_clock_mode_name = _core.ethernet_clock_mode_name
+ethernet_connector_name = _core.ethernet_connector_name
+ethernet_duplex_name = _core.ethernet_duplex_name
+ethernet_link_status_name = _core.ethernet_link_status_name
+ethernet_mdi_name = _core.ethernet_mdi_name
+ethernet_pairs_name = _core.ethernet_pairs_name
+ethernet_phy_event_name = _core.ethernet_phy_event_name
+ethernet_phy_state_name = _core.ethernet_phy_state_name
+ethernet_phy_type_name = _core.ethernet_phy_type_name
+ethernet_rx_error_name = _core.ethernet_rx_error_name
+ethernet_sqi_name = _core.ethernet_sqi_name
+flexray_cc_type_name = _core.flexray_cc_type_name
+flexray_channel_name = _core.flexray_channel_name
+flexray_direction_name = _core.flexray_direction_name
+flexray_frame_flags_text = _core.flexray_frame_flags_text
+flexray_frame_state_text = _core.flexray_frame_state_text
+j1708_type_name = _core.j1708_type_name
+kline_status_name = _core.kline_status_name
+lin_checksum_model_name = _core.lin_checksum_model_name
+lin_disturbance_type_name = _core.lin_disturbance_type_name
+lin_long_dom_signal_type_name = _core.lin_long_dom_signal_type_name
+lin_sleep_flags_text = _core.lin_sleep_flags_text
+lin_sleep_reason_name = _core.lin_sleep_reason_name
+lin_spike_origin_name = _core.lin_spike_origin_name
+lin_wakeup_length_name = _core.lin_wakeup_length_name
+most25_state_text = _core.most25_state_text
+most50_state_text = _core.most50_state_text
+most_ack_text = _core.most_ack_text
+most_addressing_mode_name = _core.most_addressing_mode_name
+most_control_sub_type_name = _core.most_control_sub_type_name
+most_net_state_name = _core.most_net_state_name
+most_priority_name = _core.most_priority_name
+most_register_id_name = _core.most_register_id_name
+most_register_sub_type_name = _core.most_register_sub_type_name
+most_transfer_type_name = _core.most_transfer_type_name
+object_type_name = _core.object_type_name
+sysvar_is_signed = _core.sysvar_is_signed
+sysvar_type_name = _core.sysvar_type_name
+sysvar_value_text = _core.sysvar_value_text
+trace_line_source_name = _core.trace_line_source_name
+wlan_frame_flags_text = _core.wlan_frame_flags_text
+
 BlfFormatError = _core.BlfFormatError
 BlfIoError = _core.BlfIoError
 BlfLimitError = _core.BlfLimitError
@@ -535,6 +592,60 @@ __all__ = [
     "decode_uds",
     "decode_isotp",
     "Reassembler",
+    "a429_error_type_name",
+    "a429_parity_name",
+    "afdx_link_speed_name",
+    "app_text_channel_info",
+    "app_text_source_name",
+    "app_text_text",
+    "app_text_trace_line",
+    "can_driver_error_name",
+    "can_error_code_name",
+    "can_error_direction_name",
+    "can_fd_flags_text",
+    "can_message_direction_name",
+    "can_message_flags_text",
+    "ethernet_clock_mode_name",
+    "ethernet_connector_name",
+    "ethernet_duplex_name",
+    "ethernet_link_status_name",
+    "ethernet_mdi_name",
+    "ethernet_pairs_name",
+    "ethernet_phy_event_name",
+    "ethernet_phy_state_name",
+    "ethernet_phy_type_name",
+    "ethernet_rx_error_name",
+    "ethernet_sqi_name",
+    "flexray_cc_type_name",
+    "flexray_channel_name",
+    "flexray_direction_name",
+    "flexray_frame_flags_text",
+    "flexray_frame_state_text",
+    "j1708_type_name",
+    "kline_status_name",
+    "lin_checksum_model_name",
+    "lin_disturbance_type_name",
+    "lin_long_dom_signal_type_name",
+    "lin_sleep_flags_text",
+    "lin_sleep_reason_name",
+    "lin_spike_origin_name",
+    "lin_wakeup_length_name",
+    "most25_state_text",
+    "most50_state_text",
+    "most_ack_text",
+    "most_addressing_mode_name",
+    "most_control_sub_type_name",
+    "most_net_state_name",
+    "most_priority_name",
+    "most_register_id_name",
+    "most_register_sub_type_name",
+    "most_transfer_type_name",
+    "object_type_name",
+    "sysvar_is_signed",
+    "sysvar_type_name",
+    "sysvar_value_text",
+    "trace_line_source_name",
+    "wlan_frame_flags_text",
     "SignalQuery",
     "objects_to_numpy",
     "objects_to_arrow",

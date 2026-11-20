@@ -2247,6 +2247,185 @@ fn reassembly_to_py(py: Python<'_>, outcome: blf_core::Reassembly) -> PyResult<O
     Ok(Some(dict.into_any().unbind()))
 }
 
+/// Name tables for the values stored in BLF records.
+///
+/// Every table in `blf_core::events` and `blf_core::types` is exposed here, so
+/// a Python caller can turn a raw number into the name the format document
+/// gives it without reimplementing the tables.
+mod names {
+    use pyo3::prelude::*;
+
+    /// A table whose values are all `&'static str`.
+    macro_rules! text_table {
+        ($(($name:ident, $arg:ty, $core:path)),* $(,)?) => {
+            $(
+                /// Look a value up in the table of the same name.
+                #[pyfunction]
+                fn $name(value: $arg) -> &'static str {
+                    $core(value)
+                }
+            )*
+        };
+    }
+
+    /// A table that builds a sentence from the raw value.
+    macro_rules! sentence_table {
+        ($(($name:ident, $arg:ty, $core:path)),* $(,)?) => {
+            $(
+                /// Describe a packed value the way the format document does.
+                #[pyfunction]
+                fn $name(value: $arg) -> String {
+                    $core(value)
+                }
+            )*
+        };
+    }
+
+    text_table! {
+        (can_error_code_name, u8, blf_core::can_error_code_name),
+        (can_error_direction_name, u8, blf_core::can_error_direction_name),
+        (can_driver_error_name, u32, blf_core::can_driver_error_name),
+        (can_message_direction_name, u8, blf_core::can_message_direction_name),
+        (lin_sleep_reason_name, u8, blf_core::lin_sleep_reason_name),
+        (lin_wakeup_length_name, u8, blf_core::lin_wakeup_length_name),
+        (lin_checksum_model_name, u8, blf_core::lin_checksum_model_name),
+        (lin_disturbance_type_name, u32, blf_core::lin_disturbance_type_name),
+        (lin_long_dom_signal_type_name, u8, blf_core::lin_long_dom_signal_type_name),
+        (lin_spike_origin_name, u8, blf_core::lin_spike_origin_name),
+        (ethernet_link_status_name, u8, blf_core::ethernet_link_status_name),
+        (ethernet_phy_type_name, u8, blf_core::ethernet_phy_type_name),
+        (ethernet_duplex_name, u8, blf_core::ethernet_duplex_name),
+        (ethernet_mdi_name, u8, blf_core::ethernet_mdi_name),
+        (ethernet_connector_name, u8, blf_core::ethernet_connector_name),
+        (ethernet_clock_mode_name, u8, blf_core::ethernet_clock_mode_name),
+        (ethernet_pairs_name, u8, blf_core::ethernet_pairs_name),
+        (ethernet_phy_state_name, u8, blf_core::ethernet_phy_state_name),
+        (ethernet_phy_event_name, u8, blf_core::ethernet_phy_event_name),
+        (ethernet_rx_error_name, u32, blf_core::ethernet_rx_error_name),
+        (ethernet_sqi_name, i16, blf_core::ethernet_sqi_name),
+        (app_text_source_name, u32, blf_core::app_text_source_name),
+        (trace_line_source_name, u32, blf_core::trace_line_source_name),
+        (sysvar_type_name, u32, blf_core::sysvar_type_name),
+        (most_control_sub_type_name, u16, blf_core::most_control_sub_type_name),
+        (most_addressing_mode_name, u8, blf_core::most_addressing_mode_name),
+        (most_net_state_name, u16, blf_core::most_net_state_name),
+        (most_register_sub_type_name, u32, blf_core::most_register_sub_type_name),
+        (most_register_id_name, u32, blf_core::most_register_id_name),
+        (most_transfer_type_name, u8, blf_core::most_transfer_type_name),
+        (most_priority_name, u32, blf_core::most_priority_name),
+        (flexray_channel_name, u16, blf_core::flexray_channel_name),
+        (flexray_cc_type_name, u32, blf_core::flexray_cc_type_name),
+        (flexray_direction_name, u8, blf_core::flexray_direction_name),
+        (afdx_link_speed_name, u16, blf_core::afdx_link_speed_name),
+        (a429_parity_name, u16, blf_core::a429_parity_name),
+        (a429_error_type_name, u16, blf_core::a429_error_type_name),
+        (kline_status_name, u32, blf_core::kline_status_name),
+        (j1708_type_name, u8, blf_core::j1708_type_name),
+        (object_type_name, u32, blf_core::object_type_name),
+    }
+
+    sentence_table! {
+        (lin_sleep_flags_text, u8, blf_core::lin_sleep_flags_text),
+        (can_message_flags_text, u8, blf_core::can_message_flags_text),
+        (can_fd_flags_text, u32, blf_core::can_fd_flags_text),
+        (most25_state_text, u8, blf_core::most25_state_text),
+        (most50_state_text, u8, blf_core::most50_state_text),
+        (most_ack_text, u8, blf_core::most_ack_text),
+        (flexray_frame_flags_text, u32, blf_core::flexray_frame_flags_text),
+        (flexray_frame_state_text, u8, blf_core::flexray_frame_state_text),
+        (wlan_frame_flags_text, u32, blf_core::wlan_frame_flags_text),
+        (app_text_channel_info, u32, blf_core::app_text_channel_info),
+        (app_text_trace_line, u32, blf_core::app_text_trace_line),
+    }
+
+    /// Decode the text of an `AppText` record, plain or UTF-16LE.
+    #[pyfunction]
+    #[pyo3(name = "app_text_text")]
+    fn app_text_text(bytes: Vec<u8>) -> String {
+        blf_core::app_text_text(&bytes)
+    }
+
+    /// Whether a system variable holds a signed value.
+    #[pyfunction]
+    #[pyo3(name = "sysvar_is_signed")]
+    fn sysvar_is_signed(representation: u32) -> bool {
+        blf_core::sysvar_is_signed(representation)
+    }
+
+    /// Render a system variable payload according to its type.
+    #[pyfunction]
+    #[pyo3(name = "sysvar_value_text")]
+    fn sysvar_value_text(kind: u32, representation: u32, data: Vec<u8>) -> String {
+        blf_core::sysvar_value_text(kind, representation, &data)
+    }
+
+    /// Register every name table on the module.
+    pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+        macro_rules! add {
+            ($(($name:ident, $arg:ty, $core:path)),* $(,)?) => {
+                $(module.add_function(wrap_pyfunction!($name, module)?)?;)*
+            };
+        }
+        add! {
+            (can_error_code_name, u8, blf_core::can_error_code_name),
+            (can_error_direction_name, u8, blf_core::can_error_direction_name),
+            (can_driver_error_name, u32, blf_core::can_driver_error_name),
+            (can_message_direction_name, u8, blf_core::can_message_direction_name),
+            (lin_sleep_reason_name, u8, blf_core::lin_sleep_reason_name),
+            (lin_wakeup_length_name, u8, blf_core::lin_wakeup_length_name),
+            (lin_checksum_model_name, u8, blf_core::lin_checksum_model_name),
+            (lin_disturbance_type_name, u32, blf_core::lin_disturbance_type_name),
+            (lin_long_dom_signal_type_name, u8, blf_core::lin_long_dom_signal_type_name),
+            (lin_spike_origin_name, u8, blf_core::lin_spike_origin_name),
+            (ethernet_link_status_name, u8, blf_core::ethernet_link_status_name),
+            (ethernet_phy_type_name, u8, blf_core::ethernet_phy_type_name),
+            (ethernet_duplex_name, u8, blf_core::ethernet_duplex_name),
+            (ethernet_mdi_name, u8, blf_core::ethernet_mdi_name),
+            (ethernet_connector_name, u8, blf_core::ethernet_connector_name),
+            (ethernet_clock_mode_name, u8, blf_core::ethernet_clock_mode_name),
+            (ethernet_pairs_name, u8, blf_core::ethernet_pairs_name),
+            (ethernet_phy_state_name, u8, blf_core::ethernet_phy_state_name),
+            (ethernet_phy_event_name, u8, blf_core::ethernet_phy_event_name),
+            (ethernet_rx_error_name, u32, blf_core::ethernet_rx_error_name),
+            (ethernet_sqi_name, i16, blf_core::ethernet_sqi_name),
+            (app_text_source_name, u32, blf_core::app_text_source_name),
+            (trace_line_source_name, u32, blf_core::trace_line_source_name),
+            (sysvar_type_name, u32, blf_core::sysvar_type_name),
+            (most_control_sub_type_name, u16, blf_core::most_control_sub_type_name),
+            (most_addressing_mode_name, u8, blf_core::most_addressing_mode_name),
+            (most_net_state_name, u16, blf_core::most_net_state_name),
+            (most_register_sub_type_name, u32, blf_core::most_register_sub_type_name),
+            (most_register_id_name, u32, blf_core::most_register_id_name),
+            (most_transfer_type_name, u8, blf_core::most_transfer_type_name),
+            (most_priority_name, u32, blf_core::most_priority_name),
+            (flexray_channel_name, u16, blf_core::flexray_channel_name),
+            (flexray_cc_type_name, u32, blf_core::flexray_cc_type_name),
+            (flexray_direction_name, u8, blf_core::flexray_direction_name),
+            (afdx_link_speed_name, u16, blf_core::afdx_link_speed_name),
+            (a429_parity_name, u16, blf_core::a429_parity_name),
+            (a429_error_type_name, u16, blf_core::a429_error_type_name),
+            (kline_status_name, u32, blf_core::kline_status_name),
+            (j1708_type_name, u8, blf_core::j1708_type_name),
+        (object_type_name, u32, blf_core::object_type_name),
+        }
+        module.add_function(wrap_pyfunction!(lin_sleep_flags_text, module)?)?;
+        module.add_function(wrap_pyfunction!(can_message_flags_text, module)?)?;
+        module.add_function(wrap_pyfunction!(can_fd_flags_text, module)?)?;
+        module.add_function(wrap_pyfunction!(most25_state_text, module)?)?;
+        module.add_function(wrap_pyfunction!(most50_state_text, module)?)?;
+        module.add_function(wrap_pyfunction!(most_ack_text, module)?)?;
+        module.add_function(wrap_pyfunction!(flexray_frame_flags_text, module)?)?;
+        module.add_function(wrap_pyfunction!(flexray_frame_state_text, module)?)?;
+        module.add_function(wrap_pyfunction!(wlan_frame_flags_text, module)?)?;
+        module.add_function(wrap_pyfunction!(app_text_channel_info, module)?)?;
+        module.add_function(wrap_pyfunction!(app_text_trace_line, module)?)?;
+        module.add_function(wrap_pyfunction!(app_text_text, module)?)?;
+        module.add_function(wrap_pyfunction!(sysvar_is_signed, module)?)?;
+        module.add_function(wrap_pyfunction!(sysvar_value_text, module)?)?;
+        Ok(())
+    }
+}
+
 #[pymodule]
 fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(open, module)?)?;
@@ -2254,6 +2433,7 @@ fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(dissect_ethernet_payload, module)?)?;
     module.add_function(wrap_pyfunction!(decode_uds, module)?)?;
     module.add_function(wrap_pyfunction!(decode_isotp, module)?)?;
+    names::register(module)?;
     module.add_class::<PyFile>()?;
     module.add_class::<PyDbcDatabase>()?;
     module.add_class::<PyLdfDatabase>()?;
@@ -2287,4 +2467,31 @@ fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module.py().get_type::<DatabaseParseError>(),
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod export_surface {
+    /// Every name table in `blf-core` must be registered on the module.
+    ///
+    /// The list is compared against `crates/blf-core/src/events.rs` at build
+    /// time by the `tests/name_tables_are_exported.rs` integration test; this
+    /// unit keeps the registration macro and the module in step.
+    #[test]
+    fn the_registration_lists_every_table() {
+        let source = include_str!("lib.rs");
+        let register = source
+            .split("pub fn register(module: &Bound")
+            .nth(1)
+            .expect("register function");
+        let register = register.split("Ok(())").next().unwrap();
+        for table in blf_core::name_table_functions() {
+            // The text tables go through the `add!` macro, the rest are
+            // registered one by one; both spell the name right after a `(`.
+            assert!(
+                register.contains(&format!("({table},"))
+                    || register.contains(&format!("wrap_pyfunction!({table}")),
+                "{table} is not registered"
+            );
+        }
+    }
 }
